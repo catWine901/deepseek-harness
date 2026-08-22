@@ -8,7 +8,7 @@
 import { readFile } from 'node:fs/promises'
 import { z } from 'zod'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
-import { parseStrict } from './manifest.ts'
+import { assertPageAppSourceNoCredentials, parseStrict } from './manifest.ts'
 import { resolvePageAppProfilePaths } from './paths.ts'
 import type { PageAppRegistryV1 } from './types.ts'
 
@@ -45,11 +45,12 @@ const registrySchema = z.object({
 
 /**
  * Parse and validate registry schema v1. Unknown versions, wrong types,
- * unknown keys, and duplicate package names, page ids, or root entry ids are
- * all rejected; v1 fails closed and never reads a newer format. Entries come
- * back in stable order (`order` ascending, then package name), and every
- * returned level is frozen: the schema applies zod `readonly` at each nested
- * level, and the sorted entry array plus result object are frozen explicitly.
+ * unknown keys, credential-bearing source displays, and duplicate package
+ * names, page ids, or root entry ids are all rejected; v1 fails closed and
+ * never reads a newer format. Entries come back in stable order (`order`
+ * ascending, then package name), and every returned level is frozen: the
+ * schema applies zod `readonly` at each nested level, and the sorted entry
+ * array plus result object are frozen explicitly.
  * @param value - unvalidated registry content from the durable boundary.
  * @returns the immutable parsed registry.
  */
@@ -59,6 +60,7 @@ export function parsePageAppRegistry(value: unknown): PageAppRegistryV1 {
   const pageIds = new Set<string>()
   const rootIds = new Set<string>()
   for (const entry of parsed.entries) {
+    assertPageAppSourceNoCredentials(entry.source.display)
     if (packageNames.has(entry.packageName)) {
       throw new Error(`page-app registry: duplicate package name ${entry.packageName}`)
     }
@@ -99,12 +101,16 @@ export async function readPageAppRegistry(profileDir: string): Promise<PageAppRe
 
 /**
  * Atomically publish the profile registry with owner-only permissions. The
- * caller owns revision incrementing and journaling; this is the single
+ * complete value is re-validated through the full v1 schema — including
+ * credential-bearing display rejection and uniqueness — so no invalid or
+ * secret-bearing registry can reach disk; nothing is written on rejection.
+ * The caller owns revision incrementing and journaling; this is the single
  * write path for the ownership file.
  * @param profileDir - absolute profile directory.
  * @param registry - the complete next registry value.
  */
 export async function writePageAppRegistry(profileDir: string, registry: PageAppRegistryV1): Promise<void> {
+  const validated = parsePageAppRegistry(registry)
   const paths = resolvePageAppProfilePaths(profileDir)
-  await writeFileAtomic(paths.registry, `${JSON.stringify(registry, null, 2)}\n`, { mode: 0o600, dirMode: 0o700 })
+  await writeFileAtomic(paths.registry, `${JSON.stringify(validated, null, 2)}\n`, { mode: 0o600, dirMode: 0o700 })
 }

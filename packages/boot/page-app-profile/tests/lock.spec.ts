@@ -117,7 +117,8 @@ describe('recoverOrphanedPageAppLock', () => {
 
     await recoverOrphanedPageAppLock(profile)
 
-    expect((await readdir(paths.directory)).sort()).toEqual(['operation.lock.token-x.quarantine', 'transaction.json'])
+    expect((await readdir(paths.directory)).sort())
+      .toEqual(['operation.lock.token-x.claim', 'operation.lock.token-x.quarantine', 'transaction.json'])
     await expect(stat(paths.operationKey)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -187,42 +188,105 @@ describe('recoverOrphanedPageAppLock', () => {
     await expect(stat(paths.operationKey)).resolves.toBeDefined()
   })
 
-  it('lets only one of two simultaneous recoverers rename the dead lock', async () => {
+  it('lets only one of two simultaneous recoverers rename the dead lock; the loser fails', async () => {
     const profile = await scratch()
     const paths = resolvePageAppProfilePaths(profile)
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.operationKey, lockPayload('manager', 'token-x', await deadPid()), { flag: 'wx', mode: 0o600 })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
 
-    await Promise.all([recoverOrphanedPageAppLock(profile), recoverOrphanedPageAppLock(profile)])
+    const results = await Promise.allSettled([
+      recoverOrphanedPageAppLock(profile),
+      recoverOrphanedPageAppLock(profile),
+    ])
 
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    const rejected = results.filter(result => result.status === 'rejected')
+    expect(rejected).toHaveLength(1)
+    expect(String((rejected[0] as PromiseRejectedResult).reason)).toMatch(/already claimed|recoverer/i)
     const names = await readdir(paths.directory)
     expect(names.filter(name => name.endsWith('.quarantine'))).toHaveLength(1)
     await expect(stat(paths.operationKey)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('prevents two simultaneous recoverers from both entering recovery work via the fresh wx acquire', async () => {
+  it('runs recovery work exactly once: only the rename winner proceeds to the fresh wx acquire', async () => {
     const profile = await scratch()
     const paths = resolvePageAppProfilePaths(profile)
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.operationKey, lockPayload('manager', 'token-x', await deadPid()), { flag: 'wx', mode: 0o600 })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
 
-    let inside = 0
-    let maxInside = 0
+    let callbackRuns = 0
     const recover = async (): Promise<void> => {
       await recoverOrphanedPageAppLock(profile)
       await withPageAppProfileLock(profile, { kind: 'manager', token: 'recoverer' }, async () => {
-        inside += 1
-        maxInside = Math.max(maxInside, inside)
+        callbackRuns += 1
         await new Promise(resolve => setTimeout(resolve, 30))
-        inside -= 1
       })
     }
 
-    await Promise.all([recover(), recover()])
+    const results = await Promise.allSettled([recover(), recover()])
 
-    expect(maxInside).toBe(1)
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
+    expect(callbackRuns).toBe(1)
     expect((await readdir(paths.directory)).filter(name => name.endsWith('.quarantine'))).toHaveLength(1)
+  })
+
+  it('fails closed for a dead plugin-cli lock even when a journal matches its token', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.operationKey, lockPayload('plugin-cli', 'token-x', await deadPid()), { flag: 'wx', mode: 0o600 })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/plugin-cli|repair/i)
+    await expect(stat(paths.operationKey)).resolves.toBeDefined()
+    expect((await readdir(paths.directory)).filter(name => name.endsWith('.quarantine'))).toHaveLength(0)
+  })
+
+  it('narrows an existing permissive manager directory to owner-only on POSIX', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o755 })
+
+    await withPageAppProfileLock(profile, { kind: 'manager', token: 'token-1' }, async () => {
+      if (process.platform !== 'win32') {
+        expect((await stat(paths.directory)).mode & 0o777).toBe(0o700)
+      }
+    })
+  })
+
+  it('never removes a lock file it no longer owns', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await withPageAppProfileLock(profile, { kind: 'manager', token: 'ours' }, async () => {
+      // Another holder's payload replaces ours while we hold the path; release
+      // must not delete a lock whose owner token it cannot verify.
+      await writeFile(paths.operationKey, lockPayload('manager', 'theirs', process.pid), { mode: 0o600, flag: 'w' })
+    })
+    const payload = JSON.parse(await readFile(paths.operationKey, 'utf8')) as Record<string, unknown>
+    expect(payload.ownerToken).toBe('theirs')
+  })
+
+  it('fails closed when a live claimant already owns recovery', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/already claimed|recoverer/i)
+  })
+
+  it('proceeds to complete recovery when the recorded claimant is provably dead', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).resolves.toBeUndefined()
   })
 })

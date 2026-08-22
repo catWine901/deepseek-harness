@@ -8,7 +8,7 @@
  * @module @deepseek-ai/dsh-page-app-profile/lock
  */
 
-import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { z } from 'zod'
 import { parseStrict } from './manifest.ts'
 import { resolvePageAppProfilePaths } from './paths.ts'
@@ -65,6 +65,10 @@ export async function withPageAppProfileLock<T>(
 ): Promise<T> {
   const paths = resolvePageAppProfilePaths(profileDir)
   await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+  // An existing manager directory keeps whatever mode it was created with, so
+  // narrow it to owner-only on POSIX where the mode bit is enforced; Windows
+  // ACLs own the equivalent decision and are left untouched.
+  if (process.platform !== 'win32') await chmod(paths.directory, 0o700)
   const payload = JSON.stringify({
     schemaVersion: 1,
     ownerKind: owner.kind,
@@ -90,7 +94,17 @@ export async function withPageAppProfileLock<T>(
   try {
     return await operation()
   } finally {
-    await rm(paths.operationKey, { force: true })
+    // Release only the payload this acquisition wrote: a foreign lock that
+    // replaced ours between acquire and release is another holder's file, and
+    // removing it would break their serialization. An unreadable or already
+    // gone path means there is nothing owned left to remove.
+    try {
+      const current = await readFile(paths.operationKey, 'utf8')
+      const parsed = parseStrict(lockPayloadSchema, JSON.parse(current), 'page-app lock')
+      if (parsed.ownerToken === owner.token) await rm(paths.operationKey, { force: true })
+    } catch {
+      // Lock already released or replaced by an unverifiable payload; keep it.
+    }
   }
 }
 
@@ -115,39 +129,84 @@ function processLiveness(pid: number): boolean | 'indeterminate' {
 }
 
 /**
- * Atomically move a dead lock to its token-specific quarantine name. Only one
- * of several simultaneous recoverers can rename the single source; the rest
- * observe the source already gone and return, which is the single-winner gate
- * that pairs with the fresh `wx` acquisition the caller must win afterwards.
+ * Read the recoverer pid recorded in a recovery claim file, or undefined when
+ * the claim is absent or unreadable. An unreadable claim fails closed in the
+ * caller, never authorizing a takeover.
+ * @param claimFile - the claim file path.
+ * @returns the claimant pid, or undefined when absent or invalid.
+ */
+async function readClaimantPid(claimFile: string): Promise<number | undefined> {
+  try {
+    const raw = await readFile(claimFile, 'utf8')
+    const pid = Number(raw.trim())
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Atomically quarantine a dead lock under a token-specific name. The
+ * single-winner gate is an exclusive `wx`-created claim file
+ * (`<operationKey>.<token>.claim`) recording the recoverer pid: only one
+ * recoverer can create it, every loser fails instead of proceeding, and only
+ * the claim winner moves the lock to
+ * `<operationKey>.<token>.quarantine`. A dead claimant's claim is adopted
+ * (removed and re-created) so a recoverer that crashed between claim and move
+ * cannot block recovery forever; a live, indeterminate, or unreadable claim
+ * fails closed. The claim file stays in place during recovery so a later
+ * caller can tell a live claimant from a dead one.
  * @param operationKey - the lock file path.
- * @param token - the lock payload's owner token naming the quarantine file.
+ * @param token - the lock payload's owner token naming the claim and quarantine.
  */
 async function quarantineLock(operationKey: string, token: string): Promise<void> {
-  const quarantine = `${operationKey}.${token}.quarantine`
-  try {
-    await rename(operationKey, quarantine)
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') return // another recoverer already renamed it
-    if (code === 'EEXIST' || (process.platform === 'win32' && code === 'EPERM')) {
-      await rm(quarantine, { force: true })
-      await rename(operationKey, quarantine)
-      return
+  const claimFile = `${operationKey}.${token}.claim`
+  for (;;) {
+    try {
+      await writeFile(claimFile, `${process.pid}\n`, { mode: 0o600, flag: 'wx' })
+      break
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EEXIST') throw error
+      const claimant = await readClaimantPid(claimFile)
+      if (claimant === undefined || processLiveness(claimant) !== false) {
+        throw new Error('page-app lock: recovery was already claimed by another recoverer')
+      }
+      await rm(claimFile, { force: true })
     }
+  }
+  try {
+    await rename(operationKey, `${operationKey}.${token}.quarantine`)
+  } catch (error) {
+    await rm(claimFile, { force: true })
     throw error
   }
 }
 
 /**
+ * Find the recoverer pid that claimed a lock for `token`, from the claim
+ * file the quarantine gate wrote. Returns undefined when no claim exists.
+ * @param operationKey - the lock file path.
+ * @param token - the owner token naming the claim.
+ * @returns the claimant pid, or undefined when absent.
+ */
+function findRecoveryClaimant(operationKey: string, token: string): Promise<number | undefined> {
+  return readClaimantPid(`${operationKey}.${token}.claim`)
+}
+
+/**
  * Startup recovery for an orphaned operation lock. A dead `manager` lock
- * whose token matches the active journal is atomically renamed to a
- * token-specific quarantine name; a dead `manager` lock without a journal is
- * safe to remove because the transaction protocol forbids all mutations
- * before journal publication and removes the journal only after commit. Every
- * other case fails closed for operator repair: a live pid, a mismatched
- * token, an unreadable payload, indeterminate liveness, or a dead `plugin-cli`
- * lock without a journal (generic pnpm may have stopped mid-mutation). The
- * caller must win a fresh exclusive lock acquisition before running recovery.
+ * whose token matches the active journal is quarantined under a token-specific
+ * name by exactly one recoverer — the exclusive claim winner; a simultaneous
+ * loser fails rather than proceeding, so only the claim winner continues to
+ * the fresh `wx` acquisition and runs recovery. A dead `manager` lock without
+ * a journal is safe to remove because the transaction protocol forbids all
+ * mutations before journal publication and removes the journal only after
+ * commit. Every other case fails closed for operator repair: a live pid, a
+ * mismatched token, an unreadable payload, indeterminate liveness, or any
+ * dead `plugin-cli` lock (generic pnpm may have stopped mid-mutation, and
+ * token-correlated quarantine recovery is manager-only). The caller must win
+ * a fresh exclusive lock acquisition before running recovery.
  * @param profileDir - absolute profile directory.
  */
 export async function recoverOrphanedPageAppLock(profileDir: string): Promise<void> {
@@ -156,7 +215,21 @@ export async function recoverOrphanedPageAppLock(profileDir: string): Promise<vo
   try {
     raw = await readFile(paths.operationKey, 'utf8')
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      // No lock is present. When the journal survives, a missing lock can
+      // mean another recoverer just claimed it (the rename winner); a live or
+      // indeterminate claimant owns recovery and this caller must fail rather
+      // than run recovery work a second time. A provably dead claimant
+      // crashed mid-recovery, so this caller proceeds to complete it.
+      const journal = await readPageAppJournal(profileDir)
+      if (journal !== null) {
+        const claimant = await findRecoveryClaimant(paths.operationKey, journal.lockOwnerToken)
+        if (claimant !== undefined && processLiveness(claimant) !== false) {
+          throw new Error('page-app lock: recovery was already claimed by another recoverer')
+        }
+      }
+      return
+    }
     throw error
   }
   let payload: PageAppLockPayloadV1
@@ -174,6 +247,9 @@ export async function recoverOrphanedPageAppLock(profileDir: string): Promise<vo
   }
   const journal = await readPageAppJournal(profileDir)
   if (journal !== null) {
+    if (payload.ownerKind === 'plugin-cli') {
+      throw new Error('page-app lock: dead plugin-cli lock with a journal; operator repair required (token-correlated recovery is manager-only)')
+    }
     if (journal.lockOwnerToken !== payload.ownerToken) {
       throw new Error('page-app lock: journal owner token does not match the lock; operator repair required')
     }

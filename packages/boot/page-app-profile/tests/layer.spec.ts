@@ -45,6 +45,25 @@ describe('renderPageAppRuntimeLayer', () => {
     )
   })
 
+  it('renders enabled roots in a stable sorted order regardless of input order', () => {
+    const alpha = root({
+      packageName: '@scope/alpha-page',
+      pageId: 'alpha.page',
+      rootEntryId: 'alpha-root',
+      entries: [{ id: 'alpha-root', name: '@scope/alpha-page', config: { enabled: true } }],
+    })
+    const beta = root({
+      packageName: '@scope/beta-page',
+      pageId: 'beta.page',
+      rootEntryId: 'beta-root',
+      entries: [{ id: 'beta-root', name: '@scope/beta-page', config: { enabled: true } }],
+    })
+    const forward = renderPageAppRuntimeLayer([alpha, beta])
+    const backward = renderPageAppRuntimeLayer([beta, alpha])
+    expect(backward).toBe(forward)
+    expect(forward.indexOf('@scope/alpha-page')).toBeLessThan(forward.indexOf('@scope/beta-page'))
+  })
+
   it('inserts only enabled roots and renders an empty patch list when none are enabled', () => {
     const disabled = root({ enabled: false })
     expect(renderPageAppRuntimeLayer([disabled])).toBe('[]\n')
@@ -74,6 +93,28 @@ describe('renderPageAppRuntimeLayer', () => {
       })
       expect(() => renderPageAppRuntimeLayer([relative])).toThrow(/relative|specifier/i)
     }
+  })
+
+  it('rejects URL and non-builtin scheme Loader names while allowing cordis: builtins', () => {
+    for (const name of [
+      'https://registry.npmjs.org/@scope/example-page',
+      'data:text/plain,hi',
+      'git+https://github.com/deepseek-ai/example-page.git',
+      'git://github.com/deepseek-ai/example-page.git',
+      'node:fs',
+      'npm:@scope/example-page',
+    ]) {
+      const scheme = root({
+        entries: [{ id: 'example-page-root', name, config: { enabled: true } }],
+      })
+      expect(() => renderPageAppRuntimeLayer([scheme])).toThrow(/builtin|scheme/i)
+    }
+    const builtin = root({
+      entries: [
+        { id: 'group', name: 'cordis:group', insert: [{ id: 'example-page-root', name: '@scope/example-page' }] },
+      ],
+    })
+    expect(renderPageAppRuntimeLayer([builtin])).toContain('name: cordis:group')
   })
 
   it('serializes nested group structure and validates its names recursively', () => {

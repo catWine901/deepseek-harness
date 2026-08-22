@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   advancePageAppJournalPhase,
@@ -105,6 +105,38 @@ describe('journal persistence', () => {
     if (process.platform !== 'win32') {
       expect((await stat(`${paths.registry}.backup`)).mode & 0o777).toBe(0o600)
     }
+  })
+
+  it('refuses traversal and absolute paths and never writes outside the profile', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    const outside = resolve(dirname(profile), 'escaped-secret')
+    await writeFile(outside, 'outside-content', { mode: 0o600 })
+
+    const escaping = join('..', '..', 'outside-target')
+    await expect(snapshotPageAppJournalFiles(profile, [escaping])).rejects.toThrow(/profile|escape/i)
+    await expect(stat(resolve(profile, escaping))).rejects.toMatchObject({ code: 'ENOENT' })
+    const absolute = process.platform === 'win32' ? 'C:\\evil\\registry.json' : '/evil/registry.json'
+    await expect(snapshotPageAppJournalFiles(profile, [absolute])).rejects.toThrow(/absolute|profile/i)
+    // The escaped source file was never touched and no backup appeared beside it.
+    await expect(stat(`${outside}.backup`)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(outside, 'utf8')).toBe('outside-content')
+  })
+
+  it('snapshots the profile manifest through a contained ../ relative path', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    await writeFile(join(profile, 'package.json'), '{"name":"profile"}', { mode: 0o600 })
+
+    const files = await snapshotPageAppJournalFiles(profile, ['../package.json'])
+
+    expect(files['../package.json']).toEqual({
+      present: true,
+      sha256: createHash('sha256').update('{"name":"profile"}').digest('hex'),
+    })
+    expect(await readFile(join(profile, 'package.json.backup'), 'utf8')).toBe('{"name":"profile"}')
   })
 
   it('writes, reads, and removes the transaction journal atomically', async () => {

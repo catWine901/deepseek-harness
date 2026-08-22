@@ -9,7 +9,7 @@
 
 import { createHash } from 'node:crypto'
 import { readFile, rm } from 'node:fs/promises'
-import { join } from 'node:path'
+import { isAbsolute, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { parseStrict } from './manifest.ts'
@@ -40,22 +40,49 @@ export function parsePageAppJournal(value: unknown): PageAppJournalV1 {
 }
 
 /**
- * Snapshot the before-state of owned files under the manager directory: an
- * sha256 hash for every present file plus a 0600 private backup copy, and an
- * absent marker for files that do not exist. Backups and hashes are taken
- * before any mutation and before the journal itself is written.
+ * Resolve one journal-owned relative path and prove it stays inside the
+ * profile. Paths are manager-directory-relative (for example
+ * `registry.json`, or `../package.json` for the profile manifest), must not
+ * be absolute, and after normalization must not escape the profile
+ * directory — otherwise a crafted name could read or back up arbitrary files
+ * outside the profile.
  * @param profileDir - absolute profile directory.
- * @param relativePaths - manager-directory-relative file names to snapshot.
+ * @param relative - the caller-supplied manager-relative path.
+ * @returns the absolute, contained path.
+ */
+function resolveJournalOwnedPath(profileDir: string, relative: string): string {
+  if (relative === '') {
+    throw new Error('page-app journal: empty path is not a manager-relative path')
+  }
+  if (isAbsolute(relative) || /^[A-Za-z]:[\\/]/.test(relative)) {
+    throw new Error(`page-app journal: ${JSON.stringify(relative)} is an absolute path, not a manager-relative path`)
+  }
+  const managerDirectory = resolve(resolvePageAppProfilePaths(profileDir).directory)
+  const containment = resolve(profileDir)
+  const resolved = resolve(managerDirectory, relative)
+  if (resolved !== containment && !resolved.startsWith(`${containment}${sep}`)) {
+    throw new Error(`page-app journal: ${JSON.stringify(relative)} escapes the profile directory`)
+  }
+  return resolved
+}
+
+/**
+ * Snapshot the before-state of owned files under the profile: an sha256 hash
+ * for every present file plus a 0600 private backup copy, and an absent
+ * marker for files that do not exist. Backups and hashes are taken before any
+ * mutation and before the journal itself is written. Paths are
+ * manager-relative and must stay inside the profile directory.
+ * @param profileDir - absolute profile directory.
+ * @param relativePaths - manager-relative file paths to snapshot.
  * @returns the frozen file-state record for the journal.
  */
 export async function snapshotPageAppJournalFiles(
   profileDir: string,
   relativePaths: readonly string[],
 ): Promise<Readonly<Record<string, PageAppJournalFileState>>> {
-  const paths = resolvePageAppProfilePaths(profileDir)
   const files: Record<string, PageAppJournalFileState> = {}
   for (const relative of relativePaths) {
-    const absolute = join(paths.directory, relative)
+    const absolute = resolveJournalOwnedPath(profileDir, relative)
     let content: string | null
     try {
       content = await readFile(absolute, 'utf8')
