@@ -835,7 +835,7 @@ describe('immutable owner package provenance', () => {
 
 describe('runtime immutability of owner provenance', () => {
   /** Mount the real loader entry whose fiber registers into 't.host' and return the stored entry. */
-  async function entryWithRealOwner(bench: LoaderBench): Promise<{ ownerPackage?: string }> {
+  async function entryWithRealOwner(bench: LoaderBench): Promise<{ ownerPackage?: string | undefined }> {
     bench.erased.register({ name: 'root', children: { 't.host': { kind: 'single', scope: 'root' } } }, C)
     bench.plugin('@deepseek-ai/dsh-client-ui-layout/client', {
       name: 'ui-layout',
@@ -875,7 +875,7 @@ describe('runtime immutability of owner provenance', () => {
     expect(entry?.ownerPackage).toBeUndefined()
     expect(() => { entry!.ownerPackage = '@deepseek-ai/dsh-forged' }).toThrow()
     expect(entry?.ownerPackage).toBeUndefined()
-    const descriptor = Object.getOwnPropertyDescriptor(entry as object, 'ownerPackage')
+    const descriptor = Object.getOwnPropertyDescriptor(entry, 'ownerPackage')
     expect(descriptor?.writable).toBe(false)
     expect(descriptor?.configurable).toBe(false)
     expect(descriptor?.value).toBeUndefined()

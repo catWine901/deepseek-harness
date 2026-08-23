@@ -1,15 +1,39 @@
 /**
  * Shared types of the Host page-app manager: the projection the Settings tab
  * reads, the health model, and the install-source vocabulary. Types only — no
- * runtime code — so source parsing, validation, and the service can share one
- * contract without import cycles.
+ * runtime code. This subpath is the CLIENT-safe face of the manager (the
+ * generated `typert.remote-client` references it), so the wire vocabulary is
+ * defined here structurally and never imports Host-only packages; the host
+ * side's page-app-profile types are structurally compatible.
  * @module @deepseek-ai/dsh-page-app-manager/types
  */
 
-import type { ActiveProfileIdentity } from '@deepseek-ai/dsh-app-boot'
-import type {
-  PageAppJournalPhase, PageAppPageFields, PageAppRegistrySource, PageAppSourceKind,
-} from '@deepseek-ai/dsh-page-app-profile'
+/** How a managed package's source spec was stated at install time (wire copy). */
+export type PageAppSourceKind = 'registry' | 'file' | 'link' | 'tarball' | 'git'
+
+/** Redacted source record persisted in the registry (wire copy; never carries credentials). */
+export interface PageAppRegistrySource {
+  readonly kind: PageAppSourceKind
+  readonly display: string
+}
+
+/** The manifest page fields every registry row echoes for its installed page (wire copy). */
+export interface PageAppPageFields {
+  readonly id: string
+  readonly name: string
+  readonly description: string
+  readonly defaultOrder: number
+  readonly rootEntryId: string
+}
+
+/** The immutable active-profile identity as the manager projects it (wire copy of `ActiveProfileIdentity`). */
+export interface PageAppProfileIdentity {
+  readonly name: string
+  readonly directory: string
+}
+
+/** Durable phases of one page-app transaction journal (wire copy). */
+export type PageAppJournalPhase = 'prepared' | 'staged' | 'committing'
 
 /**
  * Derived operational health of one managed row. Manager lifecycle state and
@@ -59,7 +83,7 @@ export interface PageAppRecoveryView {
 /** Immutable projection of the whole managed set for one profile. */
 export interface PageAppManagerSnapshot {
   /** The immutable active-profile identity. */
-  readonly profile: ActiveProfileIdentity
+  readonly profile: PageAppProfileIdentity
   /** Registry revision (0 when no registry has been published). */
   readonly revision: number
   /** Managed rows in registry order; the registry is the sole ownership source. */
@@ -92,6 +116,34 @@ export interface PageAppActivationRequestedEvent {
   readonly pageId: string
   /** The graph revision the client must have converged to. */
   readonly graphRevision: string
+}
+
+/** Branded transaction id (journal-visible identity of one mutation). */
+export type PageAppTransactionId = string & { readonly __pageAppTransaction: true }
+
+/** Branded opaque client-instance id (stable `crypto.randomUUID()` of the controller). */
+export type PageAppClientInstanceId = string & { readonly __pageAppClientInstance: true }
+
+/** One pending activation the manager announces before staging. */
+export interface ClientActivationRequest {
+  /** The transaction this activation belongs to. */
+  readonly transactionId: PageAppTransactionId
+  /** The opaque initiating client instance that may acknowledge. */
+  readonly clientInstanceId: PageAppClientInstanceId
+  /** The installed package name. */
+  readonly packageName: string
+  /** The managed page id. */
+  readonly pageId: string
+  /** The graph revision the client must have converged to. */
+  readonly graphRevision: string
+}
+
+/** Outcome of one acknowledgement attempt. */
+export interface ActivationAcknowledgement {
+  /** Whether this attempt settled the transaction. */
+  readonly accepted: boolean
+  /** Machine-readable refusal code when not accepted. */
+  readonly reason?: 'stale' | 'wrong-client' | 'wrong-target' | 'already-settled'
 }
 
 declare module '@deepseek-ai/cordis' {

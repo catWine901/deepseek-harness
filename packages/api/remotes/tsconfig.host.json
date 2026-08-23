@@ -41,6 +41,9 @@
       "path": "../../extensions/cordis-host-runner"
     },
     {
+      "path": "../../host/page-app-manager"
+    },
+    {
       "path": "../../settings/settings"
     },
     {

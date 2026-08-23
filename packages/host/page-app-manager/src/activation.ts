@@ -8,33 +8,9 @@
  * @module @deepseek-ai/dsh-page-app-manager/activation
  */
 
-/** Branded transaction id (journal-visible identity of one mutation). */
-export type PageAppTransactionId = string & { readonly __pageAppTransaction: true }
-
-/** Branded opaque client-instance id (stable `crypto.randomUUID()` of the controller). */
-export type PageAppClientInstanceId = string & { readonly __pageAppClientInstance: true }
-
-/** One pending activation the manager announces before staging. */
-export interface ClientActivationRequest {
-  /** The transaction this activation belongs to. */
-  readonly transactionId: PageAppTransactionId
-  /** The opaque initiating client instance that may acknowledge. */
-  readonly clientInstanceId: PageAppClientInstanceId
-  /** The installed package name. */
-  readonly packageName: string
-  /** The managed page id. */
-  readonly pageId: string
-  /** The graph revision the client must have converged to. */
-  readonly graphRevision: string
-}
-
-/** Outcome of one acknowledgement attempt. */
-export interface ActivationAcknowledgement {
-  /** Whether this attempt settled the transaction. */
-  readonly accepted: boolean
-  /** Machine-readable refusal code when not accepted. */
-  readonly reason?: 'stale' | 'wrong-client' | 'wrong-target' | 'already-settled'
-}
+import type {
+  ActivationAcknowledgement, ClientActivationRequest, PageAppClientInstanceId, PageAppTransactionId,
+} from './types.ts'
 
 /**
  * One-shot activation gate. The manager opens it with the pending request

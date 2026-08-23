@@ -434,9 +434,10 @@ describe('runtime immutability of owner provenance', () => {
     expect(Object.isFrozen(first)).toBe(true)
     expect(Object.isFrozen(first[0]!)).toBe(true)
     // Strict-mode writes to a frozen entry or array must be rejected.
-    const entry = first[0]! as { ownerPackage?: string }
+    const entry = first[0]! as { ownerPackage?: string | undefined }
     expect(() => { entry.ownerPackage = '@deepseek-ai/dsh-forged' }).toThrow()
-    expect(() => { (first as { ownerPackage?: string }[]).push({ component: null, options: {} }) }).toThrow()
+    const mutable = first as unknown as { component: unknown; options: object }[]
+    expect(() => { mutable.push({ component: null, options: {} }) }).toThrow()
     expect(core.entries('test.single')).toBe(first) // stable reference between mutations
   })
 })

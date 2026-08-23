@@ -151,7 +151,8 @@ const readRegistryFile = (): PageAppRegistryV1 | null => {
 describe('install transaction', () => {
   it('runs pnpm add as an argument array (never a shell string), stages, applies, publishes, and clears the journal', async () => {
     writeWorkspacePackage()
-    const spawn = vi.fn(async (file: string, args: readonly string[], _options: { cwd: string; signal: AbortSignal; reject: false }) => {
+    type SpawnOptions = { cwd: string; cancelSignal: AbortSignal; reject: false }
+    const spawn = vi.fn(async (file: string, args: readonly string[], _options: SpawnOptions) => {
       if (file === 'pnpm' && args[0] === 'add' && args[1] !== undefined) {
         // Simulate pnpm's real effect: the dependency lands in the manifest.
         const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }

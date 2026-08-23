@@ -3,6 +3,7 @@
  * report through clientModuleHost.rebuilt, and everything dies with the fiber.
  */
 import { mkdtempSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs'
+import type { ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -207,7 +208,6 @@ describe('hmr node half', () => {
 })
 
 describe('hmr node half: SSE graph broadcast', () => {
-  /* oxlint-disable typescript/no-unsafe-assignment, typescript/no-unsafe-return -- structural ServerResponse fake */
   /** Capturing ServerResponse standing in for a live SSE connection. */
   function sseConnection(): { res: ServerResponse; writes: string[] } {
     const writes: string[] = []
@@ -234,7 +234,6 @@ describe('hmr node half: SSE graph broadcast', () => {
     handler({ method: 'GET', url: EVENTS_ENDPOINT }, res)
     return { clientModuleHost, writes, fiber, routes }
   }
-  /* oxlint-enable typescript/no-unsafe-assignment, typescript/no-unsafe-return */
 
   const frames = (writes: string[]): unknown[] =>
     writes.filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice('data: '.length)) as unknown)

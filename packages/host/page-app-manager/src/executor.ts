@@ -47,7 +47,7 @@ interface ExecaResult {
 export type PnpmSpawn = (
   file: string,
   args: readonly string[],
-  options: { cwd: string; signal: AbortSignal; reject: false },
+  options: { cwd: string; cancelSignal: AbortSignal; reject: false },
 ) => Promise<ExecaResult>
 
 /**
@@ -65,7 +65,10 @@ export function createPnpmExecutor(spawn?: PnpmSpawn): PageAppPackageExecutor {
   return {
     async run(args, options) {
       try {
-        const result = await exec('pnpm', [...args], { ...options, reject: false })
+        // execa v10 renamed the cancellation option from `signal` to
+        // `cancelSignal`; the manager's seam keeps the AbortSignal name and
+        // must not leak the old key to execa.
+        const result = await exec('pnpm', [...args], { cwd: options.cwd, cancelSignal: options.signal, reject: false })
         return {
           exitCode: result.exitCode ?? 0,
           stdout: result.stdout.slice(0, 64_000),

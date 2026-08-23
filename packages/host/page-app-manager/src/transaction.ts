@@ -34,7 +34,8 @@ import {
   type ValidatedManagedRoot,
 } from '@deepseek-ai/dsh-page-app-profile'
 import type { PageAppInstallSource } from './types.ts'
-import { PageAppActivationGate, type ClientActivationRequest, type PageAppClientInstanceId, type PageAppTransactionId } from './activation.ts'
+import type { ClientActivationRequest, PageAppClientInstanceId, PageAppTransactionId } from './types.ts'
+import { PageAppActivationGate } from './activation.ts'
 import type { PageAppPackageExecutor } from './executor.ts'
 import { validateInstalledPageAppPackage, resolveInstalledPackageDir } from './validation.ts'
 

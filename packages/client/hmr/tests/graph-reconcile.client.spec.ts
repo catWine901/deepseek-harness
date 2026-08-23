@@ -198,7 +198,7 @@ describe('apply frame handling', () => {
     ctx.reflect.provide('modules', b.modLoader)
     apply(ctx)
     const source = FakeEventSource.instances[0]
-    expect(source).toBeDefined()
+    if (source === undefined) throw new Error('client-hmr did not open an EventSource')
     source.emit({ type: 'rebuilt', id: 'a', rev: 'r2' })
     source.emit({ type: 'graph', graph: graph('r3', [row('a'), row('b')]) })
     // Both frames settle through the same queue: rebuilt first, then graph.

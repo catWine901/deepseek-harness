@@ -111,6 +111,3 @@ export function parsePageAppInstallSource(spec: string, kind?: PageAppSourceKind
     display: parsePageAppSourceDisplay(resolvedKind, trimmed),
   })
 }
-
-/** Convenience re-export so consumers need only this module for the kind vocabulary. */
-export type { PageAppSourceKind } from '@deepseek-ai/dsh-page-app-profile'

@@ -28,13 +28,12 @@ import {
   type PageAppRegistryEntry,
   type PageAppRegistryV1,
 } from '@deepseek-ai/dsh-page-app-profile'
-import type { PageAppManagerSnapshot, PageAppView } from './types.ts'
+import type { PageAppClientInstanceId, PageAppTransactionId } from './types.ts'
+import type { PageAppManagerSnapshot, PageAppView, PageAppInstallSource } from './types.ts'
 import { parsePageAppInstallSource } from './source.ts'
-import type { PageAppInstallSource } from './types.ts'
 import { PageAppLifecycle } from './transaction.ts'
-import { createPnpmExecutor } from './executor.ts'
+import { createPnpmExecutor, type PageAppPackageExecutor } from './executor.ts'
 import { recoverPageAppTransaction } from './recovery.ts'
-import type { PageAppClientInstanceId, PageAppTransactionId } from './activation.ts'
 
 export * from './types.ts'
 export * from './source.ts'
@@ -112,12 +111,12 @@ export class PageAppManager extends TypertRemoteService {
   private readonly profileRuntime: ProfileRuntime
   private readonly lifecycle: PageAppLifecycle
 
-  constructor(ctx: Context, options: { profileRuntime: ProfileRuntime }) {
+  constructor(ctx: Context, options: { profileRuntime: ProfileRuntime; executor?: PageAppPackageExecutor }) {
     super(ctx, 'pageAppManager')
     this.profileRuntime = options.profileRuntime
     this.lifecycle = new PageAppLifecycle({
       profileDir: this.profileRuntime.identity.directory,
-      executor: createPnpmExecutor(),
+      executor: options.executor ?? createPnpmExecutor(),
       runtime: this.profileRuntime,
       pnpmWorkspaceFile: join(this.profileRuntime.identity.directory, 'pnpm-workspace.yaml'),
       onChanged: (revision) => { ctx.emit('page-app-manager/changed', revision) },
@@ -128,6 +127,11 @@ export class PageAppManager extends TypertRemoteService {
   /** The immutable active-profile identity (consumers cannot replace it). */
   public get identity(): { name: string; directory: string } {
     return this.profileRuntime.identity
+  }
+
+  /** The pending targeted client activation gate (install acknowledgement). */
+  public get activation(): PageAppLifecycle['activation'] {
+    return this.lifecycle.activation
   }
 
   /**

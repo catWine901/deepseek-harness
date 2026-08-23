@@ -349,7 +349,7 @@ describe('late package activation', () => {
     // The package is installed now; a fresh internal/plugin emission for the
     // still-not-on-the-table entry must drop the stale null and compose a row.
     writeBuiltPackage(lateName, {})
-    ctx.emit('internal/plugin', { entry: { options: { name: lateName } } })
+    ctx.emit('internal/plugin', { entry: { options: { name: lateName } } } as never)
     await Promise.resolve()
     expect(service.graph().entries.map(row => row.id)).toEqual([lateName])
   })
@@ -367,7 +367,7 @@ describe('late package activation', () => {
     writePackage('@fixture/broken-arriving')
     const warned: unknown[] = []
     vi.spyOn(ctx.logger, 'warn').mockImplementation((...args: unknown[]) => { warned.push(args) })
-    ctx.emit('internal/plugin', { entry: { options: { name: '@fixture/broken-arriving' } } })
+    ctx.emit('internal/plugin', { entry: { options: { name: '@fixture/broken-arriving' } } } as never)
     await Promise.resolve()
     expect(service.graph()).toBe(before)
     expect(service.graph().entries.map(row => row.id)).toEqual([goodName])
