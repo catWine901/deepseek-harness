@@ -18,6 +18,7 @@ import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
 import {
   canonicalManagedRootHash,
   loadOverlayPatches,
+  PROFILE_RUNTIME_SERVICE,
   type ProfileRuntime,
 } from '@deepseek-ai/dsh-app-boot'
 import {
@@ -379,4 +380,26 @@ function readJournalOperation(profileDir: string): { phase: 'prepared' | 'staged
   } catch {
     return null
   }
+}
+
+/** Stable Cordis plugin name. */
+export const name = 'page-app-manager'
+
+/** Required services: the launcher-owned profile runtime and the Loader. */
+export const inject = [PROFILE_RUNTIME_SERVICE, 'loader']
+
+/**
+ * Mount the Host page-app manager service as a Cordis plugin: reads the
+ * launcher-owned profile runtime (the immutable identity and the only
+ * acknowledged live-recomposition writer) and constructs the manager over it.
+ * The manager must never infer the profile from cwd or browser arguments
+ * (spec §8.1). Constructing the TypertRemoteService registers it on the
+ * caller's fiber, so it unregisters automatically when the fiber unloads.
+ * @param ctx - Host context with the profile runtime and Loader mounted.
+ */
+export function apply(ctx: Context): void {
+  const runtime = ctx.get(PROFILE_RUNTIME_SERVICE) as ProfileRuntime
+  // Constructing the manager provides ctx.pageAppManager on this fiber; the
+  // Service base auto-unregisters it when the fiber unloads.
+  new PageAppManager(ctx, { profileRuntime: runtime })
 }
