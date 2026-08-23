@@ -743,6 +743,17 @@ interface WatcherBoot {
   releaseConfig: () => void
   /** Config callbacks the fake HMR registered, in call order (only successes). */
   capturedConfigs: (() => Promise<void>)[]
+  /** Watcher disposer invocations, each recording its registration index in call order. */
+  disposerCalls: number[]
+  /** Read after boot settles: whether the root fiber was active when a fail-inactive create threw. */
+  treeWasActiveAtFailure: () => boolean
+}
+
+/** One per-name loader.create gate behavior. */
+interface GateSpec {
+  mode: 'pass' | 'hold' | 'fail' | 'fail-inactive' | 'create-noop'
+  /** Local plugin file the create-noop gate mounts instead of the requested package. */
+  file?: string
 }
 
 /**
@@ -755,14 +766,17 @@ interface WatcherBoot {
 async function bootWatcherTree(options: {
   /** Loader.create name the gate intercepts ('pass' disables interception). */
   gateName: string
-  gateMode: 'pass' | 'hold' | 'fail' | 'fail-inactive'
-  fakeHmr?: 'ok' | 'hold' | 'fail' | 'inactive-second' | 'dispose-on-resolve'
+  gateMode: GateSpec['mode']
+  /** Additional per-create-name gates; win over gateName/gateMode. */
+  gates?: Record<string, GateSpec>
+  fakeHmr?: 'ok' | 'hold' | 'fail' | 'fail-third' | 'inactive-second' | 'dispose-on-resolve' | 'dispose-after-second'
   fakeTimer?: boolean
   /** Number of launcher watcher paths; defaults to 1. */
   watchCount?: number
 }): Promise<WatcherBoot> {
   const dir = tmp()
   writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
+  writeFileSync(join(dir, 'noop2.mjs'), NOOP_PLUGIN)
   writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
   mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
   let releaseCreate!: () => void
@@ -775,28 +789,32 @@ async function bootWatcherTree(options: {
   const ready = new Promise<void>((resolve) => { readyResolve = resolve })
   const watchCount = options.watchCount ?? 1
   const capturedConfigs: (() => Promise<void>)[] = []
+  const disposerCalls: number[] = []
+  let treeWasActiveAtFailure = false
   let runtime: ProfileRuntime | undefined
   let rootCtx: Context | undefined
-  const gate = { mode: options.gateMode, targetName: options.gateName }
   const bootPromise = boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
     rootCtx = hostCtx
-    // Hold or fail the runtime's timer/HMR loader.create deterministically.
-    // The loader is already installed when prepare runs, and the patched
-    // instance is the same one the runtime later calls through ctx.get.
+    // Hold, fail, or redirect the runtime's timer/HMR loader.create
+    // deterministically. The loader is already installed when prepare runs,
+    // and the patched instance is the same one the runtime later calls
+    // through ctx.get.
     const realCreate = hostCtx.loader.create.bind(hostCtx.loader)
     hostCtx.loader.create = async (entryOptions) => {
-      if (gate.mode === 'pass' || entryOptions.name !== gate.targetName) {
-        return realCreate(entryOptions)
-      }
-      if (gate.mode === 'fail') {
-        gate.mode = 'pass'
-        throw new Error('pinned watcher setup failure')
-      }
+      const gate = options.gates?.[entryOptions.name]
+        ?? (entryOptions.name === options.gateName ? { mode: options.gateMode } : undefined)
+      if (gate === undefined || gate.mode === 'pass') return realCreate(entryOptions)
+      if (gate.mode === 'fail') throw new Error('pinned watcher setup failure')
       if (gate.mode === 'fail-inactive') {
-        gate.mode = 'pass'
+        treeWasActiveAtFailure = hostCtx.fiber.state === FiberState.ACTIVE
         throw Object.assign(new Error('cannot create effect on inactive context'), { code: 'INACTIVE_EFFECT' })
       }
-      gate.mode = 'pass'
+      if (gate.mode === 'create-noop') {
+        // Mount a local plugin file instead of the requested package: the
+        // entry genuinely exists in the loader tree, so rollback disposal is
+        // observable, without resolving the unbuilt vendor timer/HMR libs.
+        return realCreate({ ...entryOptions, name: gate.file ?? './noop.mjs' })
+      }
       createReachedResolve()
       await new Promise<void>((resolve) => { releaseCreate = resolve })
       return realCreate(entryOptions)
@@ -805,8 +823,10 @@ async function bootWatcherTree(options: {
       hostCtx.provide('hmr', {
         registerConfig: async (_filename: string, callback: () => Promise<void>) => {
           configReachedResolve()
+          const index = capturedConfigs.length
           if (options.fakeHmr === 'fail') throw new Error('pinned registration failure')
-          if (options.fakeHmr === 'inactive-second' && capturedConfigs.length >= 1) {
+          if (options.fakeHmr === 'fail-third' && index >= 2) throw new Error('pinned registration failure')
+          if (options.fakeHmr === 'inactive-second' && index >= 1) {
             throw Object.assign(new Error('cannot create effect on inactive context'), { code: 'INACTIVE_EFFECT' })
           }
           if (options.fakeHmr === 'dispose-on-resolve') {
@@ -814,11 +834,16 @@ async function bootWatcherTree(options: {
             // registration resolves; the tree is really gone by the time the
             // runtime's await lands.
             await hostCtx.fiber.dispose()
+          }
+          capturedConfigs.push(callback)
+          if (options.fakeHmr === 'dispose-after-second' && index >= 1) {
+            // The app exits exactly as asked after the final registration
+            // resolved; every owned watcher must be rolled back.
+            await hostCtx.fiber.dispose()
           } else if (options.fakeHmr === 'hold') {
             await new Promise<void>((resolve) => { releaseConfig = resolve })
           }
-          capturedConfigs.push(callback)
-          return async () => {}
+          return async () => { disposerCalls.push(index) }
         },
       })
     }
@@ -853,6 +878,8 @@ async function bootWatcherTree(options: {
     configReached,
     releaseConfig: () => { releaseConfig() },
     capturedConfigs,
+    disposerCalls,
+    treeWasActiveAtFailure: () => treeWasActiveAtFailure,
   }
 }
 
@@ -940,45 +967,22 @@ describe('ProfileRuntime watcher setup and the settled gate', () => {
     }
   })
 
-  it('does not treat a partial watcher registration (INACTIVE_EFFECT) as settled', async () => {
+  it('rolls back earlier watchers and fails boot loud when an INACTIVE_EFFECT registration lands on a live tree', async () => {
     const tree = await bootWatcherTree({
       gateName: 'pass',
       gateMode: 'pass',
       fakeHmr: 'inactive-second',
       watchCount: 2,
     })
-    const { bootPromise, runtime, rootCtx, capturedConfigs, managerLayerPath } = tree
+    const { bootPromise, runtime, rootCtx, capturedConfigs, disposerCalls } = tree
     try {
-      // The first watcher path registers; the second fails with INACTIVE_EFFECT
-      // while the tree still looks live. Setup is partial — one watcher is
-      // missing — so the mutation gate must stay closed and no manager apply
-      // may be accepted or treated as settled.
-      const { layer, expected } = singleRootLayer('page', 1)
-      writeFileSync(managerLayerPath, layer)
-      const ctx = await bootPromise
+      // The second registration fails with INACTIVE_EFFECT while the tree is
+      // still live: that is a real setup failure, so boot fails loud, the
+      // first watcher's disposer is rolled back, and the mutation gate never
+      // opens (a partial watcher set is never settled).
+      await expect(bootPromise).rejects.toThrow(/cannot create effect on inactive context/)
       expect(capturedConfigs.length).toBe(1)
-      expect(rootCtx.get('loader')).toBeDefined()
-      await expect(runtime.applyManagerLayer(applyRequest(layer, [expected])))
-        .rejects.toThrow(/before the initial tree has settled/i)
-      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(false)
-    } finally {
-      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
-    }
-  })
-
-  it('does not escalate an INACTIVE_EFFECT timer create into a boot failure', async () => {
-    const tree = await bootWatcherTree({
-      gateName: '@deepseek-ai/cordis-plugin-timer',
-      gateMode: 'fail-inactive',
-    })
-    const { bootPromise, runtime, rootCtx } = tree
-    try {
-      // The timer create fails with INACTIVE_EFFECT while the tree still looks
-      // live: the exit is in flight but has not visibly flipped, so boot must
-      // not fail, and the gate must not open.
-      const ctx = await bootPromise
-      expect(rootCtx.fiber.state).toBe(FiberState.ACTIVE)
-      expect(ctx.get('loader')).toBeDefined()
+      expect(disposerCalls).toEqual([0])
       await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/before the initial tree has settled/i)
     } finally {
@@ -986,19 +990,139 @@ describe('ProfileRuntime watcher setup and the settled gate', () => {
     }
   })
 
-  it('does not escalate an INACTIVE_EFFECT HMR create into a boot failure', async () => {
+  it('calls earlier watcher disposers in reverse when a later registration fails on a live tree', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      fakeHmr: 'fail-third',
+      watchCount: 3,
+    })
+    const { bootPromise, rootCtx, capturedConfigs, disposerCalls } = tree
+    try {
+      await expect(bootPromise).rejects.toThrow(/pinned registration failure/)
+      // The first two registrations succeeded; the third failed, so rollback
+      // disposed exactly the two owned watchers, newest first.
+      expect(capturedConfigs.length).toBe(2)
+      expect(disposerCalls).toEqual([1, 0])
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('rolls back registered watcher disposers in reverse when the tree exits mid-setup', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      fakeHmr: 'dispose-after-second',
+      watchCount: 2,
+    })
+    const { bootPromise, runtime, disposerCalls } = tree
+    // The app exits exactly as asked inside the second registration: boot
+    // must resolve, the owned watchers must be rolled back in reverse order,
+    // and the mutation gate must never open for the exited tree.
+    const ctx = await bootPromise
+    expect(ctx.get('loader')).toBeUndefined()
+    expect(disposerCalls).toEqual([1, 0])
+    await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+      .rejects.toThrow(/before the initial tree has settled/i)
+  })
+
+  it('disposes a timer entry this setup created when the HMR create fails later', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      gates: {
+        '@deepseek-ai/cordis-plugin-timer': { mode: 'create-noop', file: './noop.mjs' },
+        '@deepseek-ai/cordis-plugin-hmr': { mode: 'fail' },
+      },
+    })
+    const { bootPromise, rootCtx } = tree
+    const removed: string[] = []
+    rootCtx.loader.context.on('loader/partial-dispose', (entry) => { removed.push(entry.options.name) })
+    try {
+      await expect(bootPromise).rejects.toThrow(/pinned watcher setup failure/)
+      // Only explicit loader removal emits loader/partial-dispose (boot's own
+      // teardown does not), so the recorded entry proves the timer entry this
+      // setup created was disposed during rollback.
+      expect(removed).toEqual(['./noop.mjs'])
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('disposes this setup\'s timer and HMR entries in reverse when the later HMR check aborts', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      gates: {
+        '@deepseek-ai/cordis-plugin-timer': { mode: 'create-noop', file: './noop.mjs' },
+        '@deepseek-ai/cordis-plugin-hmr': { mode: 'create-noop', file: './noop2.mjs' },
+      },
+    })
+    const { bootPromise, rootCtx } = tree
+    const removed: string[] = []
+    rootCtx.loader.context.on('loader/partial-dispose', (entry) => { removed.push(entry.options.name) })
+    try {
+      // Both entries mounted (neither provides HMR), so setup aborts at the
+      // HMR availability check; rollback removes the HMR entry before the
+      // timer entry — reverse creation order.
+      await expect(bootPromise).rejects.toThrow(/the HMR service is unavailable for user-patch watching/)
+      expect(removed).toEqual(['./noop2.mjs', './noop.mjs'])
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('fails boot loud when an INACTIVE_EFFECT timer create lands on a live tree', async () => {
+    const tree = await bootWatcherTree({
+      gateName: '@deepseek-ai/cordis-plugin-timer',
+      gateMode: 'fail-inactive',
+    })
+    const { bootPromise, runtime, rootCtx, treeWasActiveAtFailure } = tree
+    try {
+      // The tree never exited — an INACTIVE_EFFECT create on a live tree is a
+      // real watcher-setup failure, so boot must fail loud instead of
+      // resolving into a half-initialized runtime with the gate closed.
+      await expect(bootPromise).rejects.toThrow(/cannot create effect on inactive context/)
+      expect(treeWasActiveAtFailure()).toBe(true)
+      await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+        .rejects.toThrow(/before the initial tree has settled/i)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('fails boot loud when an INACTIVE_EFFECT HMR create lands on a live tree', async () => {
     const tree = await bootWatcherTree({
       gateName: '@deepseek-ai/cordis-plugin-hmr',
       gateMode: 'fail-inactive',
       fakeTimer: true, // skip timer creation so the HMR create is the failing one
     })
-    const { bootPromise, runtime, rootCtx } = tree
+    const { bootPromise, runtime, rootCtx, treeWasActiveAtFailure } = tree
     try {
-      const ctx = await bootPromise
-      expect(rootCtx.fiber.state).toBe(FiberState.ACTIVE)
-      expect(ctx.get('loader')).toBeDefined()
+      await expect(bootPromise).rejects.toThrow(/cannot create effect on inactive context/)
+      expect(treeWasActiveAtFailure()).toBe(true)
       await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/before the initial tree has settled/i)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('retains the registered watchers and opens the gate on a fully successful setup', async () => {
+    const tree = await bootWatcherTree({ gateName: 'pass', gateMode: 'pass', fakeHmr: 'ok', watchCount: 2 })
+    const { bootPromise, runtime, rootCtx, capturedConfigs, disposerCalls, managerLayerPath } = tree
+    try {
+      await bootPromise
+      // Both watchers stayed registered and none was rolled back, and the
+      // mutation gate opened: a manager apply composes a generation.
+      expect(capturedConfigs.length).toBe(2)
+      expect(disposerCalls).toEqual([])
+      const { layer, expected } = singleRootLayer('page', 1)
+      writeFileSync(managerLayerPath, layer)
+      const result = await runtime.applyManagerLayer(applyRequest(layer, [expected]))
+      expect(result.generation).toBe(1)
+      expect(result.activeRoots).toEqual(['page'])
     } finally {
       if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
     }
@@ -1010,12 +1134,14 @@ describe('ProfileRuntime watcher setup and the settled gate', () => {
       gateMode: 'pass',
       fakeHmr: 'dispose-on-resolve',
     })
-    const { bootPromise, runtime } = tree
+    const { bootPromise, runtime, disposerCalls } = tree
     // The real tree is disposed inside the final registerConfig call, so by
     // the time the await lands the exit already happened; the final liveness
-    // recheck must keep the gate closed instead of settling an exited tree.
+    // recheck must keep the gate closed instead of settling an exited tree,
+    // and the owned watcher disposer is rolled back.
     const ctx = await bootPromise
     expect(ctx.get('loader')).toBeUndefined()
+    expect(disposerCalls).toEqual([0])
     await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
       .rejects.toThrow(/before the initial tree has settled/i)
   })
