@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { recoverOrphanedPageAppLock, withPageAppProfileLock } from '../src/lock.ts'
 import { resolvePageAppProfilePaths } from '../src/paths.ts'
@@ -45,6 +45,20 @@ async function waitForLock(lockPath: string): Promise<void> {
     } catch {
       await new Promise(resolve => setTimeout(resolve, 5))
     }
+  }
+}
+
+/**
+ * One full recovery attempt: orphan recovery prep, then recovery work under
+ * the fresh profile lock. Used by the concurrent single-winner tests.
+ */
+function recoveryAttempt(profile: string, callbackRuns: { count: number }): () => Promise<void> {
+  return async () => {
+    await recoverOrphanedPageAppLock(profile)
+    await withPageAppProfileLock(profile, { kind: 'manager', token: 'recoverer' }, async () => {
+      callbackRuns.count += 1
+      await new Promise(resolve => setTimeout(resolve, 30))
+    })
   }
 }
 
@@ -216,20 +230,14 @@ describe('recoverOrphanedPageAppLock', () => {
     await writeFile(paths.operationKey, lockPayload('manager', 'token-x', await deadPid()), { flag: 'wx', mode: 0o600 })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
 
-    let callbackRuns = 0
-    const recover = async (): Promise<void> => {
-      await recoverOrphanedPageAppLock(profile)
-      await withPageAppProfileLock(profile, { kind: 'manager', token: 'recoverer' }, async () => {
-        callbackRuns += 1
-        await new Promise(resolve => setTimeout(resolve, 30))
-      })
-    }
+    const callbackRuns = { count: 0 }
+    const recover = recoveryAttempt(profile, callbackRuns)
 
     const results = await Promise.allSettled([recover(), recover()])
 
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
-    expect(callbackRuns).toBe(1)
+    expect(callbackRuns.count).toBe(1)
     expect((await readdir(paths.directory)).filter(name => name.endsWith('.quarantine'))).toHaveLength(1)
   })
 
@@ -288,5 +296,63 @@ describe('recoverOrphanedPageAppLock', () => {
     await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
 
     await expect(recoverOrphanedPageAppLock(profile)).resolves.toBeUndefined()
+  })
+
+  it('atomically takes over a stale claim: with a missing lock and live journal, exactly one recoverer runs recovery', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    const callbackRuns = { count: 0 }
+    const recover = recoveryAttempt(profile, callbackRuns)
+
+    const results = await Promise.allSettled([recover(), recover()])
+
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
+    expect(callbackRuns.count).toBe(1)
+    // The take-over claim now records this process as the live recoverer.
+    expect(await readFile(`${paths.operationKey}.token-x.claim`, 'utf8')).toBe(`${process.pid}\n`)
+  })
+
+  it('atomically claims recovery when no claim exists but the journal survives', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+
+    const callbackRuns = { count: 0 }
+    const recover = recoveryAttempt(profile, callbackRuns)
+
+    const results = await Promise.allSettled([recover(), recover()])
+
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
+    expect(callbackRuns.count).toBe(1)
+  })
+
+  it('rejects unsafe owner tokens at acquisition and never creates the lock', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    for (const token of ['../evil', 'a/b', 'a\\b', '..', '', 'token with space']) {
+      await expect(withPageAppProfileLock(profile, { kind: 'manager', token }, async () => {})).rejects.toThrow(/token/i)
+    }
+    await expect(stat(paths.operationKey)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('fails closed on an unsafe token in a planted payload without touching anything outside', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.operationKey, lockPayload('manager', '../outside-evidence', await deadPid()), { flag: 'wx', mode: 0o600 })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/unreadable|token|payload/i)
+    expect((await readdir(paths.directory)).sort()).toEqual(['operation.lock', 'transaction.json'])
+    // No claim or quarantine path escaped the manager directory.
+    await expect(stat(resolve(profile, '..', 'outside-evidence'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })

@@ -85,15 +85,29 @@ describe('parsePageAppSourceDisplay', () => {
       .toBe('https://github.com/deepseek-ai/example-page.git')
     expect(parsePageAppSourceDisplay('registry', 'https://token@npm.pkg.github.com/@scope/example-page').display)
       .toBe('https://npm.pkg.github.com/@scope/example-page')
+    expect(parsePageAppSourceDisplay('git', 'https:user:secret@example.com/path').display)
+      .toBe('https://example.com/path')
   })
 
-  it('rejects credential-bearing URLs outright', () => {
+  it('rejects credential-bearing URLs outright, including valid non-// absolute forms', () => {
     expect(() => { assertPageAppSourceNoCredentials('https://user:secret@github.com/deepseek-ai/example-page.git') })
       .toThrow(/credential/i)
     expect(() => { assertPageAppSourceNoCredentials('https://token@npm.pkg.github.com/@scope/example-page') })
       .toThrow(/credential/i)
     expect(() => { assertPageAppSourceNoCredentials('https://token@example.com/pkg.tgz') }).toThrow(/credential/i)
+    expect(() => { assertPageAppSourceNoCredentials('https:user:secret@example.com/path') }).toThrow(/credential/i)
+    expect(() => { assertPageAppSourceNoCredentials('http:token@example.com/path') }).toThrow(/credential/i)
     expect(() => { assertPageAppSourceNoCredentials('https://github.com/deepseek-ai/example-page.git') }).not.toThrow()
+  })
+
+  it('never misclassifies local paths and scp-style specs as credential-bearing URLs', () => {
+    expect(() => { assertPageAppSourceNoCredentials('C:\\dev\\pkg') }).not.toThrow()
+    expect(() => { assertPageAppSourceNoCredentials('/abs/path/pkg') }).not.toThrow()
+    expect(() => { assertPageAppSourceNoCredentials('git@github.com:deepseek-ai/example-page.git') }).not.toThrow()
+    expect(() => { assertPageAppSourceNoCredentials('npm:pkg') }).not.toThrow()
+    expect(parsePageAppSourceDisplay('link', 'C:\\dev\\pkg').display).toBe('C:\\dev\\pkg')
+    expect(parsePageAppSourceDisplay('file', '/abs/path/pkg').display).toBe('/abs/path/pkg')
+    expect(parsePageAppSourceDisplay('registry', 'npm:pkg').display).toBe('npm:pkg')
   })
 
   it('leaves local paths and scp-style git specs unchanged', () => {

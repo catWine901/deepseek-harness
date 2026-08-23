@@ -8,11 +8,11 @@
  */
 
 import { createHash } from 'node:crypto'
-import { readFile, rm } from 'node:fs/promises'
-import { isAbsolute, resolve, sep } from 'node:path'
+import { readFile, realpath, rm } from 'node:fs/promises'
+import { dirname, isAbsolute, resolve, sep } from 'node:path'
 import { z } from 'zod'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
-import { parseStrict } from './manifest.ts'
+import { PAGE_APP_TOKEN_PATTERN, parseStrict } from './manifest.ts'
 import { resolvePageAppProfilePaths } from './paths.ts'
 import type { PageAppJournalFileState, PageAppJournalPhase, PageAppJournalV1 } from './types.ts'
 
@@ -24,7 +24,7 @@ const journalFileStateSchema = z.discriminatedUnion('present', [
 const journalSchema = z.object({
   schemaVersion: z.literal(1),
   phase: z.enum(['prepared', 'staged', 'committing']),
-  lockOwnerToken: z.string().min(1),
+  lockOwnerToken: z.string().regex(PAGE_APP_TOKEN_PATTERN),
   files: z.record(z.string().min(1), journalFileStateSchema).readonly(),
 }).strict().readonly()
 
@@ -67,11 +67,51 @@ function resolveJournalOwnedPath(profileDir: string, relative: string): string {
 }
 
 /**
+ * Prove that `resolved` (already lexically contained) does not escape the
+ * profile through symlinks. The canonical profile root is compared against
+ * the realpath of the deepest existing ancestor of the target, so a symlinked
+ * directory or source file pointing outside is rejected before anything is
+ * read or backed up.
+ * @param profileDir - absolute profile directory (may itself be a symlink).
+ * @param resolved - the lexically contained absolute target path.
+ * @param relative - the caller-supplied path used in diagnostics.
+ */
+async function ensureRealpathContained(profileDir: string, resolved: string, relative: string): Promise<void> {
+  let root: string
+  try {
+    root = await realpath(profileDir)
+  } catch {
+    root = resolve(profileDir)
+  }
+  let probe = resolved
+  for (;;) {
+    let real: string
+    try {
+      real = await realpath(probe)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        const parent = dirname(probe)
+        if (parent === probe) throw error
+        probe = parent
+        continue
+      }
+      throw error
+    }
+    if (real !== root && !real.startsWith(`${root}${sep}`)) {
+      throw new Error(`page-app journal: ${JSON.stringify(relative)} resolves outside the profile directory`)
+    }
+    return
+  }
+}
+
+/**
  * Snapshot the before-state of owned files under the profile: an sha256 hash
  * for every present file plus a 0600 private backup copy, and an absent
  * marker for files that do not exist. Backups and hashes are taken before any
  * mutation and before the journal itself is written. Paths are
- * manager-relative and must stay inside the profile directory.
+ * manager-relative, must stay inside the profile directory lexically, and
+ * must not escape it through symlinks.
  * @param profileDir - absolute profile directory.
  * @param relativePaths - manager-relative file paths to snapshot.
  * @returns the frozen file-state record for the journal.
@@ -83,6 +123,7 @@ export async function snapshotPageAppJournalFiles(
   const files: Record<string, PageAppJournalFileState> = {}
   for (const relative of relativePaths) {
     const absolute = resolveJournalOwnedPath(profileDir, relative)
+    await ensureRealpathContained(profileDir, absolute, relative)
     let content: string | null
     try {
       content = await readFile(absolute, 'utf8')

@@ -65,9 +65,32 @@ export function parsePageAppManifest(packageName: string, value: unknown): PageA
   })
 }
 
-/** A spec that parses as a `scheme://` URL, or null when it is not URL-shaped. */
+/**
+ * The one opaque-token grammar every lock owner token, lock payload, and
+ * journal owner token must satisfy. Tokens are interpolated into claim and
+ * quarantine file names, so separators and traversal would escape the manager
+ * directory; the grammar is exactly the filename-safe set with no path
+ * structure and no pure-dot names (`.`/`..` read as path pseudo-segments).
+ * Callers generate opaque tokens (UUID-style); anything else is rejected at
+ * every boundary that would persist or path-build with it.
+ */
+export const PAGE_APP_TOKEN_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._~-]+$/
+
+/**
+ * Reject an opaque owner token that is not filename-safe. Tokens name claim
+ * and quarantine files, so separators, traversal, and whitespace must fail
+ * closed before any path is built or any payload is persisted.
+ * @param token - the owner token to validate.
+ */
+export function assertSafeOpaqueToken(token: string): void {
+  if (!PAGE_APP_TOKEN_PATTERN.test(token)) {
+    throw new Error(`page-app: unsafe opaque owner token ${JSON.stringify(token)}`)
+  }
+}
+
+/** A spec that parses as a `scheme:` URL, or null when it is not URL-shaped. */
 function urlShape(spec: string): URL | null {
-  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(spec)) return null
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec)) return null
   try {
     return new URL(spec)
   } catch {
@@ -80,7 +103,10 @@ function urlShape(spec: string): URL | null {
  * Reject an install source spec that embeds credentials in a URL. A URL whose
  * userinfo carries a username or password is refused outright, because
  * credentials must never be persisted; local paths and scp-style git specs
- * carry no URL credentials and pass through.
+ * carry no URL credentials and pass through. Any absolute URL form — with or
+ * without the `//` host separator — is inspected; only specs that actually
+ * parse as URLs are checked, so package specs like `npm:pkg` and Windows
+ * paths like `C:\dev\pkg` are never misclassified.
  * @param spec - the exact install source spec.
  */
 export function assertPageAppSourceNoCredentials(spec: string): void {
@@ -94,7 +120,9 @@ export function assertPageAppSourceNoCredentials(spec: string): void {
  * Derive the registry-persisted source record from an install source spec.
  * The display is always redacted: URL userinfo is stripped so the persisted
  * record can never carry credentials even if a spec bypassed the validation
- * step, and local paths plus scp-style git specs pass through unchanged.
+ * step. Only URL-shaped specs are rewritten (host-form URLs are canonicalized
+ * and any userinfo is removed); local paths and scp-style git specs pass
+ * through unchanged.
  * @param kind - the source kind the manager validated.
  * @param spec - the exact install source spec.
  * @returns the immutable redacted source record.
@@ -103,9 +131,13 @@ export function parsePageAppSourceDisplay(kind: PageAppSourceKind, spec: string)
   const url = urlShape(spec)
   let display = spec
   if (url !== null) {
-    url.username = ''
-    url.password = ''
-    display = url.toString()
+    const hasUserinfo = url.username !== '' || url.password !== ''
+    const hostForm = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(spec)
+    if (hasUserinfo || hostForm) {
+      url.username = ''
+      url.password = ''
+      display = url.toString()
+    }
   }
   return Object.freeze({ kind, display })
 }

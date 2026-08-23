@@ -23,22 +23,38 @@ const SCHEME_NAME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/
  */
 const LOADER_BUILTIN_SCHEME = 'cordis'
 
+/** A valid bare package/subpath specifier: unscoped or scoped, no empty segments. */
+const BARE_SPECIFIER = /^(?:@[a-zA-Z0-9._~-]+\/)?[a-zA-Z0-9._~-]+(?:\/[a-zA-Z0-9._~-]+)*$/
+
+/** A valid Loader builtin name after `cordis:`: a single filename-safe token. */
+const BUILTIN_NAME = /^[A-Za-z0-9._-]+$/
+
 /**
  * Assert one root's entry tree is declarative and portable: every Loader
- * `name` must be a built-in (`cordis:` only) or a bare package/subpath
- * specifier, never a relative or absolute filesystem location and never a
- * URL or foreign scheme. Nested group structure is walked recursively.
+ * `name` must be a built-in (`cordis:` plus a valid builtin name) or a valid
+ * bare package/subpath specifier (scoped or unscoped, no empty segments, no
+ * query/fragment/whitespace), never a relative or absolute filesystem
+ * location, a URL, or a foreign scheme. Nested group structure is walked
+ * recursively.
  * @param entries - the root's serializable Loader entry tree.
  */
 function assertBareLoaderNames(entries: readonly PageAppRuntimeEntry[]): void {
   for (const entry of entries) {
     if (entry.name !== undefined) {
-      if (RELATIVE_NAME.test(entry.name)) {
-        throw new Error(`page-app layer: relative Loader name ${JSON.stringify(entry.name)} is not serializable`)
+      const name = entry.name
+      if (RELATIVE_NAME.test(name)) {
+        throw new Error(`page-app layer: relative Loader name ${JSON.stringify(name)} is not serializable`)
       }
-      const scheme = SCHEME_NAME.exec(entry.name)?.[0]?.slice(0, -1)
-      if (scheme !== undefined && scheme !== LOADER_BUILTIN_SCHEME) {
-        throw new Error(`page-app layer: Loader name ${JSON.stringify(entry.name)} uses non-builtin scheme ${JSON.stringify(scheme)}`)
+      const scheme = SCHEME_NAME.exec(name)?.[0]?.slice(0, -1)
+      if (scheme !== undefined) {
+        if (scheme !== LOADER_BUILTIN_SCHEME) {
+          throw new Error(`page-app layer: Loader name ${JSON.stringify(name)} uses non-builtin scheme ${JSON.stringify(scheme)}`)
+        }
+        if (!BUILTIN_NAME.test(name.slice(scheme.length + 1))) {
+          throw new Error(`page-app layer: Loader name ${JSON.stringify(name)} has an invalid builtin name`)
+        }
+      } else if (name === '.' || name === '..' || !BARE_SPECIFIER.test(name)) {
+        throw new Error(`page-app layer: Loader name ${JSON.stringify(name)} is not a bare package/subpath specifier`)
       }
     }
     if (entry.insert !== undefined) assertBareLoaderNames(entry.insert)

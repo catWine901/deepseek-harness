@@ -11,7 +11,7 @@ The package is profile-scoped and pure Host: it never infers the profile from pr
 ```ts
 import {
   parsePageAppManifest,
-  parsePageAppRegistry,
+  readPageAppRegistry,
   renderPageAppRuntimeLayer,
   resolvePageAppProfilePaths,
   withPageAppProfileLock,
@@ -25,8 +25,8 @@ const paths = resolvePageAppProfilePaths(profileDir)
 // operationKey: .../operation.lock
 
 const manifest = parsePageAppManifest(packageName, parsedPackageJson)
-const registry = parsePageAppRegistry(await readFile(paths.registry, 'utf8'))
-const layer = renderPageAppRuntimeLayer(registry.entries.map(toManagedRoot))
+const registry = await readPageAppRegistry(profileDir)
+const layer = renderPageAppRuntimeLayer(registry?.entries.map(toManagedRoot) ?? [])
 
 await withPageAppProfileLock(profileDir, { kind: 'manager', token }, async () => {
   // one mutation per profile: pnpm and owned-file writes stay under the lock

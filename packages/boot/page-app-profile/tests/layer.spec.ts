@@ -117,6 +117,44 @@ describe('renderPageAppRuntimeLayer', () => {
     expect(renderPageAppRuntimeLayer([builtin])).toContain('name: cordis:group')
   })
 
+  it('accepts only valid bare package/subpath specifiers and cordis builtin names', () => {
+    const accepted = [
+      'pkg',
+      '@scope/pkg',
+      '@scope/pkg/subpath',
+      'pkg/subpath',
+      'pkg/sub/deep/leaf',
+      'cordis:group',
+      'cordis:memory-test-system-prompt',
+    ]
+    for (const name of accepted) {
+      expect(() => renderPageAppRuntimeLayer([root({
+        entries: [{ id: 'example-page-root', name, config: { enabled: true } }],
+      })])).not.toThrow()
+    }
+    const rejected = [
+      '',
+      '@scope',
+      'pkg?query',
+      'pkg#fragment',
+      'pkg with space',
+      'pkg/',
+      '/pkg',
+      '@scope/',
+      '@scope/pkg/',
+      'cordis:',
+      'cordis:bad name',
+      'a:b',
+      '..',
+      '.',
+    ]
+    for (const name of rejected) {
+      expect(() => renderPageAppRuntimeLayer([root({
+        entries: [{ id: 'example-page-root', name, config: { enabled: true } }],
+      })])).toThrow()
+    }
+  })
+
   it('serializes nested group structure and validates its names recursively', () => {
     const nested = root({
       entries: [{

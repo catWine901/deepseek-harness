@@ -8,7 +8,12 @@
 
 export * from './types.ts'
 export { resolvePageAppProfilePaths } from './paths.ts'
-export { assertPageAppSourceNoCredentials, parsePageAppManifest, parsePageAppSourceDisplay } from './manifest.ts'
+export {
+  assertPageAppSourceNoCredentials,
+  assertSafeOpaqueToken,
+  parsePageAppManifest,
+  parsePageAppSourceDisplay,
+} from './manifest.ts'
 export { parsePageAppRegistry, readPageAppRegistry, writePageAppRegistry } from './registry.ts'
 export { renderPageAppRuntimeLayer } from './layer.ts'
 export {

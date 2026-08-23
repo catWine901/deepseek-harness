@@ -96,6 +96,9 @@ describe('parsePageAppRegistry', () => {
     expect(() => parsePageAppRegistry(registry([
       entry({ source: { kind: 'registry', display: 'https://token@npm.pkg.github.com/@scope/example-page' } }),
     ]))).toThrow(/credential/i)
+    expect(() => parsePageAppRegistry(registry([
+      entry({ source: { kind: 'git', display: 'https:user:secret@example.com/path' } }),
+    ]))).toThrow(/credential/i)
   })
 
   it('returns entries in stable order: order ascending, then package name', () => {
@@ -145,6 +148,19 @@ describe('writePageAppRegistry', () => {
       schemaVersion: 1,
       revision: 1,
       entries: [entry({ source: { kind: 'git', display: 'https://user:secret@github.com/deepseek-ai/example-page.git' } })],
+    } as unknown as PageAppRegistryV1
+
+    await expect(writePageAppRegistry(profile, credentialed)).rejects.toThrow(/credential/i)
+    await expect(stat(paths.registry)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses to persist a non-// credential-bearing display and creates nothing', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    const credentialed = {
+      schemaVersion: 1,
+      revision: 1,
+      entries: [entry({ source: { kind: 'git', display: 'https:user:secret@example.com/path' } })],
     } as unknown as PageAppRegistryV1
 
     await expect(writePageAppRegistry(profile, credentialed)).rejects.toThrow(/credential/i)

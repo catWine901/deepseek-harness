@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -57,6 +57,12 @@ describe('parsePageAppJournal', () => {
     expect(() => parsePageAppJournal({ ...journal(), files: { x: { present: true } } })).toThrow(/sha256/)
     expect(() => parsePageAppJournal({ ...journal(), files: { x: { present: false, sha256: 'a'.repeat(64) } } })).toThrow()
     expect(() => parsePageAppJournal({ ...journal(), files: { x: { present: true, sha256: 'not-hex' } } })).toThrow(/sha256/)
+  })
+
+  it('rejects unsafe lock owner tokens that could escape the manager directory', () => {
+    for (const token of ['../evil', 'a/b', 'a\\b', '..', '.', 'token with space', 'https://x']) {
+      expect(() => parsePageAppJournal({ ...journal(), lockOwnerToken: token })).toThrow(/lockOwnerToken|token/i)
+    }
   })
 
   it('returns deeply immutable data', () => {
@@ -137,6 +143,59 @@ describe('journal persistence', () => {
       sha256: createHash('sha256').update('{"name":"profile"}').digest('hex'),
     })
     expect(await readFile(join(profile, 'package.json.backup'), 'utf8')).toBe('{"name":"profile"}')
+  })
+
+  it('refuses a symlinked directory that escapes the profile and never backs up outside', async (ctx) => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    const outsideDir = join(await scratch(), 'target')
+    await mkdir(outsideDir, { recursive: true })
+    await writeFile(join(outsideDir, 'secret.txt'), 'secret-content', { mode: 0o600 })
+    try {
+      await symlink(outsideDir, join(paths.directory, 'evil'), process.platform === 'win32' ? 'junction' : 'dir')
+    } catch (error) {
+      if (['EPERM', 'EACCES', 'UNKNOWN'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+        ctx.skip()
+        return
+      }
+      throw error
+    }
+
+    await expect(snapshotPageAppJournalFiles(profile, ['evil/secret.txt']))
+      .rejects.toThrow(/outside|profile|symlink/i)
+    await expect(stat(join(outsideDir, 'secret.txt.backup'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(join(outsideDir, 'secret.txt'), 'utf8')).toBe('secret-content')
+  })
+
+  it('refuses a symlinked source file pointing outside and never writes its backup', async (ctx) => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    const outsideDir = join(await scratch(), 'target')
+    await mkdir(outsideDir, { recursive: true })
+    await writeFile(join(outsideDir, 'secret.json'), 'secret-json', { mode: 0o600 })
+    try {
+      await symlink(join(outsideDir, 'secret.json'), join(paths.directory, 'link.json'))
+    } catch (error) {
+      if (['EPERM', 'EACCES', 'UNKNOWN'].includes((error as NodeJS.ErrnoException).code ?? '')) {
+        ctx.skip()
+        return
+      }
+      throw error
+    }
+
+    await expect(snapshotPageAppJournalFiles(profile, ['link.json']))
+      .rejects.toThrow(/outside|profile|symlink/i)
+    await expect(stat(join(paths.directory, 'link.json.backup'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('refuses to persist a journal with an unsafe owner token and creates nothing', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await expect(writePageAppJournal(profile, { ...journal(), lockOwnerToken: '../evil' } as never))
+      .rejects.toThrow(/token/i)
+    await expect(stat(paths.journal)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('writes, reads, and removes the transaction journal atomically', async () => {
