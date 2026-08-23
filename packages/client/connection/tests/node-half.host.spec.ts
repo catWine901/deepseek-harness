@@ -12,6 +12,7 @@ import { RpcId, type ClientRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { WebServer, WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { API_PATH, apply, HOST_EVENTS_PATH, inject, MUX_EVENTS_PATH, type HostConnectionHandle } from '../src/index.ts'
 import { DEFAULT_MAX_REQUEST_BODY_BYTES } from '../src/http-bridge.ts'
+import { PRIVILEGED_METHODS } from '../src/privileged-methods.ts'
 
 /** Structural webServer fake recording both route registries. */
 function fakeHttpServer(
@@ -34,6 +35,17 @@ function fakeHttpServer(
     port: 0,
   }
 }
+
+/** The seven page-app manager mutations, in Typert `${namespace}/${method}` wire form. */
+const PAGE_APP_MANAGER_METHODS = [
+  'pageAppManager/install',
+  'pageAppManager/setEnabled',
+  'pageAppManager/setHidden',
+  'pageAppManager/reorder',
+  'pageAppManager/uninstall',
+  'pageAppManager/ackClientActivation',
+  'pageAppManager/recover',
+] as const
 
 /** Bodyless GET carrying the given headers (enough for the trust fence + bridge). */
 function fakeRequest(headers: Record<string, string>, url = `${API_PATH}/session.list`): IncomingMessage {
@@ -196,6 +208,64 @@ describe('connection node half', () => {
     await routes[0]!.handler(fakeRequest({ host: 'harness.example' }), read.response)
     expect(read.state.status).not.toBe(403)
     await dispose()
+  })
+
+  it('pins page-app manager mutations to loopback before the Typert gateway or API proxy can claim them', async () => {
+    const ctx = new Context()
+    const routes: WebRoute[] = []
+    ctx.provide('webServer', fakeHttpServer(routes, []) as WebServer)
+    // A counting API Proxy: any fallback dispatch would touch one of its
+    // methods through toFetchHandler, so an empty record proves the fallback
+    // never ran (and the 403 is not the proxy's answer).
+    const apiCalls: string[] = []
+    const apiProxy = new Proxy({}, {
+      get(_target, prop) {
+        if (typeof prop === 'symbol') return undefined
+        apiCalls.push(prop)
+        if (prop === 'events') return { mux: async () => new Response(), host: async () => new Response() }
+        if (prop === 'downloads') return { sessionLog: async () => new Response(null, { status: 200 }) }
+        return async () => Response.json({ ok: true, value: null })
+      },
+    }) as unknown as ApiProxy
+    ctx.provide('apiProxy', apiProxy)
+    const fiber = ctx.plugin({ inject: [...inject], apply }, { trustedHosts: ['harness.example'] })
+    await fiber.await()
+    const connection = ctx.get('connection') as HostConnectionHandle
+    // The Typert interceptor claims every endpoint; its handler is the gateway
+    // dispatch, which forwards to the page-app manager executor — the exact
+    // shape of the real dispatch chain, so a non-zero counter would prove the
+    // fence was bypassed.
+    let gatewayCalls = 0
+    let executorCalls = 0
+    const remove = connection.rpc.intercept('/api', () => true, async () => {
+      gatewayCalls += 1
+      executorCalls += 1
+      return { ok: true, value: { accepted: true } }
+    }, { authority: 'trusted-host' })
+    const route = routes.find(candidate => candidate.path === API_PATH)!
+    for (const method of PAGE_APP_MANAGER_METHODS) {
+      expect(PRIVILEGED_METHODS.has(method)).toBe(true)
+      const request: ClientRequest = {
+        type: 'client-request', rpcId: RpcId(`page-app-${method}`), method, payload: {},
+      }
+      const response = fakeResponse()
+      await route.handler(fakePost({ host: 'harness.example' }, `${API_PATH}/${method}`, request), response.response)
+      expect([method, response.state.status]).toEqual([method, 403])
+    }
+    // No dispatch surface ran for any row: the Typert gateway was never
+    // consulted, the legacy API proxy never answered, and the manager
+    // executor never fired.
+    expect([gatewayCalls, apiCalls.length, executorCalls]).toEqual([0, 0, 0])
+    // The pin is loopback-only: the same endpoint from loopback still reaches
+    // the gateway and the executor.
+    const loopback = fakeResponse()
+    await route.handler(fakePost({ host: '127.0.0.1:3080' }, `${API_PATH}/${PAGE_APP_MANAGER_METHODS[0]}`, {
+      type: 'client-request', rpcId: RpcId('page-app-loopback'), method: PAGE_APP_MANAGER_METHODS[0], payload: {},
+    }), loopback.response)
+    expect(loopback.state.status).toBe(200)
+    expect([gatewayCalls, apiCalls.length, executorCalls]).toEqual([1, 0, 1])
+    await remove()
+    await fiber.dispose()
   })
 
   it('passes loopback and declared-authority requests through to the bridge', async () => {

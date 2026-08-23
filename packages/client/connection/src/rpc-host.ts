@@ -13,6 +13,7 @@ import {
 } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { bridge, type FetchHandler } from './http-bridge.ts'
 import { isTrustedApiRequest } from './api-request-trust.ts'
+import { PRIVILEGED_METHODS } from './privileged-methods.ts'
 import { API_PATH } from './api-path.ts'
 import type {
   ConnectionRpcEndpointMatcher,
@@ -64,6 +65,10 @@ export class HostConnectionService extends Service implements HostConnectionHand
 
   /**
    * Compose one shared-channel Fetch handler from its interceptor and fallback.
+   * The privileged-method pin runs before either dispatch path is even
+   * consulted: a loopback-only mutation must not be reachable through the
+   * Typert interceptor (which claims `${namespace}/${method}` endpoints) or
+   * the legacy API Proxy fallback on a trusted-host deployment.
    * @param channel - shared channel mounted by Connection.
    * @param fallback - handler for endpoints not claimed by the interceptor.
    * @returns Fetch handler that selects exactly one target for each request.
@@ -75,6 +80,16 @@ export class HostConnectionService extends Service implements HostConnectionHand
     return {
       fetch: (request) => {
         const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
+        // The empty-trust-list check pins privileged methods to loopback
+        // before the interceptor or fallback can claim the endpoint: a
+        // declared trusted authority is a DNS-rebinding fence, not
+        // authentication, so the whole privileged plane stays
+        // loopback-same-origin through whichever transport would dispatch it.
+        if (endpoint !== undefined
+          && PRIVILEGED_METHODS.has(endpoint)
+          && !isTrustedApiRequest(request, [])) {
+          return Promise.resolve(new Response('forbidden', { status: 403 }))
+        }
         const interceptor = this.interceptors.get(channel)
         if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
           return fallback.fetch(request)
