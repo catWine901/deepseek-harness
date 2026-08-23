@@ -8,7 +8,7 @@
  * @module @deepseek-ai/dsh-page-app-profile/lock
  */
 
-import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, link, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { z } from 'zod'
 import { assertSafeOpaqueToken, PAGE_APP_TOKEN_PATTERN, parseStrict } from './manifest.ts'
 import { resolvePageAppProfilePaths } from './paths.ts'
@@ -32,6 +32,11 @@ const LOCK_RETRY_MAX_MS = 250
  * a dead owner is an explicit startup step, never an implicit wait shortcut.
  */
 const LOCK_WAIT_DEADLINE_MS = 15 * 60_000
+
+/** Bounded retries for restoring a moved claim whose fixed path was re-occupied. */
+const RESTORE_CLAIM_MAX_RETRIES = 8
+/** Initial backoff (doubled per retry) before a restore retry. */
+const RESTORE_CLAIM_RETRY_MS = 2
 
 /** Whether an exclusive create found an existing lock. */
 async function isLockContention(error: unknown, lockPath: string): Promise<boolean> {
@@ -147,15 +152,70 @@ async function readClaimantPid(claimFile: string): Promise<number | undefined> {
 }
 
 /**
+ * Atomically move the claim file to this recoverer's tombstone, returning
+ * false when another recoverer already moved it (the claim path is gone).
+ * Both candidates race the rename, but each tombstone is unique per
+ * recoverer, so on every platform exactly one recoverer can hold the moved
+ * claim for verification; the fresh `wx` creation afterwards is the final
+ * single-winner gate.
+ * @param claimFile - the claim path.
+ * @param tombstone - this recoverer's unique tombstone path.
+ * @returns true when this recoverer moved the claim, false when it was gone.
+ */
+async function moveClaimToTombstone(claimFile: string, tombstone: string): Promise<boolean> {
+  try {
+    await rename(claimFile, tombstone)
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/**
+ * Restore a claim this recoverer moved but must not keep — the file was
+ * replaced by a live claim between the stale read and the move (the ABA
+ * window). The restore is a hard link into the fixed claim path, which cannot
+ * clobber a concurrent fresh claim: on contention the restore retries with
+ * backoff and then fails closed, leaving the moved claim at the tombstone.
+ * @param claimFile - the fixed claim path.
+ * @param tombstone - the tombstone holding the moved claim.
+ */
+async function restoreMovedClaim(claimFile: string, tombstone: string): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await link(tombstone, claimFile)
+      await rm(tombstone, { force: true })
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') return // the tombstone is already gone
+      if (code === 'EEXIST' || (process.platform === 'win32' && code === 'EPERM')) {
+        if (attempt >= RESTORE_CLAIM_MAX_RETRIES) {
+          throw new Error('page-app lock: could not restore a moved recovery claim; operator repair required')
+        }
+        await new Promise(resolve => setTimeout(resolve, RESTORE_CLAIM_RETRY_MS << attempt))
+        continue
+      }
+      throw error
+    }
+  }
+}
+
+/**
  * Atomically acquire the recovery claim for `token` — the single-winner gate
  * of the whole recovery path. The claim is an exclusive `wx`-created file
  * (`<operationKey>.<token>.claim`) recording the recoverer pid: only one
  * recoverer can create it, every loser fails instead of proceeding, and only
  * the claim winner may run recovery. A provably dead claimant's claim is
- * adopted (removed and re-created) so a recoverer that crashed between claim
- * and recovery cannot block recovery forever; a live, indeterminate, or
- * unreadable claim fails closed. The claim stays in place during recovery so
- * a later caller can tell a live claimant from a dead one.
+ * taken over without the stale-read ABA window: the dead claim is moved to a
+ * recoverer-unique tombstone, the moved file is verified to still be the
+ * exact dead claim inspected, and a live claim that replaced it in between is
+ * restored clobber-free while this recoverer fails closed. The claim path is
+ * never removed by pathname, so a stale reader can never delete a replaced
+ * live claim. The claim stays in place during recovery so a later caller can
+ * tell a live claimant from a dead one.
  * @param operationKey - the lock file path naming the claim.
  * @param token - the validated owner token naming the claim.
  */
@@ -172,7 +232,17 @@ async function acquireRecoveryClaim(operationKey: string, token: string): Promis
       if (claimant === undefined || processLiveness(claimant) !== false) {
         throw new Error('page-app lock: recovery was already claimed by another recoverer')
       }
-      await rm(claimFile, { force: true })
+      // Provably dead: move the claim to our tombstone, then verify we moved
+      // the exact dead claim we inspected. If the path was replaced by a live
+      // claim before the move, restore it and fail closed.
+      const tombstone = `${claimFile}.${process.pid}.tomb`
+      if (!await moveClaimToTombstone(claimFile, tombstone)) continue
+      const moved = await readClaimantPid(tombstone)
+      if (moved !== claimant) {
+        await restoreMovedClaim(claimFile, tombstone)
+        throw new Error('page-app lock: recovery was already claimed by another recoverer')
+      }
+      await rm(tombstone, { force: true })
     }
   }
 }

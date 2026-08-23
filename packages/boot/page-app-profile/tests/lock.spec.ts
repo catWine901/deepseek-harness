@@ -7,6 +7,34 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { recoverOrphanedPageAppLock, withPageAppProfileLock } from '../src/lock.ts'
 import { resolvePageAppProfilePaths } from '../src/paths.ts'
 
+const fsState = vi.hoisted(() => ({
+  armPauseOnClaimRead: false,
+  releaseClaimRead: () => {},
+  claimReadReached: () => {},
+}))
+
+// Deterministic interleaving control for the stale-claim ABA test: the FIRST
+// recovery claim-file read after arming captures the current content and
+// blocks until the test releases it, letting a concurrent recoverer finish a
+// full takeover before the paused reader acts on its stale read.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  return {
+    ...actual,
+    readFile: (async (path: unknown, ...rest: unknown[]) => {
+      const file = String(path)
+      if (file.endsWith('.claim') && fsState.armPauseOnClaimRead) {
+        fsState.armPauseOnClaimRead = false
+        const content = String(await (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest))
+        fsState.claimReadReached()
+        await new Promise<void>((resolveGate) => { fsState.releaseClaimRead = resolveGate })
+        return content
+      }
+      return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
+    }) as typeof actual.readFile,
+  }
+})
+
 async function scratch(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'dsh-page-app-lock-'))
 }
@@ -64,6 +92,9 @@ function recoveryAttempt(profile: string, callbackRuns: { count: number }): () =
 
 afterEach(() => {
   vi.restoreAllMocks()
+  fsState.armPauseOnClaimRead = false
+  fsState.releaseClaimRead = () => {}
+  fsState.claimReadReached = () => {}
 })
 
 describe('withPageAppProfileLock', () => {
@@ -332,6 +363,37 @@ describe('recoverOrphanedPageAppLock', () => {
     expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
     expect(callbackRuns.count).toBe(1)
+  })
+
+  it('never deletes a replaced live claim: a stale dead-claim read cannot take over (ABA)', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    // Deterministic interleaving: stale reader B reads the dead claim and is
+    // paused there; A then completes a full takeover, replacing the dead claim
+    // with a live claim at the same path. When B resumes with its stale read,
+    // it must fail closed and must not delete A's live claim.
+    const bRuns = { count: 0 }
+    const reached = new Promise<void>((resolveReached) => { fsState.claimReadReached = resolveReached })
+    fsState.armPauseOnClaimRead = true
+    const bPromise = recoveryAttempt(profile, bRuns)()
+    await reached
+
+    const aRuns = { count: 0 }
+    await recoveryAttempt(profile, aRuns)()
+
+    fsState.releaseClaimRead()
+    await expect(bPromise).rejects.toThrow(/already claimed|recoverer/i)
+
+    expect(aRuns.count).toBe(1)
+    expect(bRuns.count).toBe(0)
+    // A's live claim survived B's stale takeover attempt, and no tombstone lingers.
+    expect(await readFile(`${paths.operationKey}.token-x.claim`, 'utf8')).toBe(`${process.pid}\n`)
+    expect((await readdir(paths.directory)).filter(name => name.endsWith('.tomb'))).toEqual([])
   })
 
   it('rejects unsafe owner tokens at acquisition and never creates the lock', async () => {

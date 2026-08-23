@@ -124,6 +124,9 @@ describe('renderPageAppRuntimeLayer', () => {
       '@scope/pkg/subpath',
       'pkg/subpath',
       'pkg/sub/deep/leaf',
+      'pkg.v2/sub',
+      'pkg.with.dots',
+      '@scope/pkg.v2',
       'cordis:group',
       'cordis:memory-test-system-prompt',
     ]
@@ -147,6 +150,15 @@ describe('renderPageAppRuntimeLayer', () => {
       'a:b',
       '..',
       '.',
+      'pkg/../evil',
+      'pkg/./evil',
+      '@scope/../evil',
+      '@scope/./pkg',
+      'pkg/..',
+      'pkg/.',
+      'pkg/../sub',
+      '@../x',
+      '@./x',
     ]
     for (const name of rejected) {
       expect(() => renderPageAppRuntimeLayer([root({

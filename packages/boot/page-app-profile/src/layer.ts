@@ -23,8 +23,13 @@ const SCHEME_NAME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/
  */
 const LOADER_BUILTIN_SCHEME = 'cordis'
 
-/** A valid bare package/subpath specifier: unscoped or scoped, no empty segments. */
-const BARE_SPECIFIER = /^(?:@[a-zA-Z0-9._~-]+\/)?[a-zA-Z0-9._~-]+(?:\/[a-zA-Z0-9._~-]+)*$/
+/**
+ * A valid bare package/subpath specifier: unscoped or scoped, no empty
+ * segments, and no `.` or `..` path segment anywhere (every segment may still
+ * contain dots, so dotted names like `pkg.v2` stay legal).
+ */
+const BARE_SPECIFIER =
+  /^(?:@(?!\.{1,2}(?:\/|$))[a-zA-Z0-9._~-]+\/)?(?!\.{1,2}(?:\/|$))[a-zA-Z0-9._~-]+(?:\/(?!\.{1,2}(?:\/|$))[a-zA-Z0-9._~-]+)*$/
 
 /** A valid Loader builtin name after `cordis:`: a single filename-safe token. */
 const BUILTIN_NAME = /^[A-Za-z0-9._-]+$/
@@ -53,7 +58,7 @@ function assertBareLoaderNames(entries: readonly PageAppRuntimeEntry[]): void {
         if (!BUILTIN_NAME.test(name.slice(scheme.length + 1))) {
           throw new Error(`page-app layer: Loader name ${JSON.stringify(name)} has an invalid builtin name`)
         }
-      } else if (name === '.' || name === '..' || !BARE_SPECIFIER.test(name)) {
+      } else if (!BARE_SPECIFIER.test(name)) {
         throw new Error(`page-app layer: Loader name ${JSON.stringify(name)} is not a bare package/subpath specifier`)
       }
     }
