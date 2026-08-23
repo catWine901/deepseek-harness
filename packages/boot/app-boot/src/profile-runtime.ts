@@ -12,24 +12,27 @@
  * @module @deepseek-ai/dsh-app-boot/profile-runtime
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { Context, FiberState, Service } from '@deepseek-ai/cordis'
 import type { Entry, EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
-import { applyEntryPatches, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
+import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import {
   parsePageAppManifest,
   readPageAppRegistry,
+  recoverOrphanedPageAppLock,
   renderPageAppRuntimeLayer,
   resolvePageAppProfilePaths,
+  withPageAppProfileLock,
   type PageAppRegistryEntry,
   type PageAppRegistryV1,
   type ValidatedManagedRoot,
 } from '@deepseek-ai/dsh-page-app-profile'
-import { dump } from 'js-yaml'
+import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
+import { dump, load } from 'js-yaml'
 import { loadOptionalPatches, loadOverlayPatches } from './index.ts'
 
 /** The service name the launcher provides `ProfileRuntime` under. */
@@ -158,6 +161,27 @@ export function canonicalManagedRootHash(row: EntryOptions): string {
 }
 
 /**
+ * Parse one staged runtime-layer document (a top-level YAML array of loader
+ * patch entries in the include dialect) into patches. This is the ONLY way an
+ * apply/restore turns its request content into the manager layer of a
+ * generation: the runtime never re-reads the layer file for composition.
+ * @param content - the exact `runtimeLayer` of the apply request.
+ * @returns the parsed patch list.
+ */
+function parseLayerDocument(content: string): PatchOptions[] {
+  let parsed: unknown
+  try {
+    parsed = load(content, { schema: entryListSchema })
+  } catch (error) {
+    throw new Error(`page-app profile runtime: failed to parse the staged runtime layer: ${String(error)}`)
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error('page-app profile runtime: staged runtime layer must be a top-level YAML array of loader patch entries')
+  }
+  return parsed as PatchOptions[]
+}
+
+/**
  * Read the current manager runtime layer of one profile as loader patches. A
  * missing layer means "no manager layer" and yields an empty list; an
  * unparsable or non-array file throws — at generation time a corrupt layer
@@ -238,11 +262,20 @@ export async function deriveSafeRuntimeLayer(
 
 /**
  * Startup preparation of the manager runtime layer: regenerate a missing,
- * corrupt, or stale derived layer from a valid registry (the render is
- * deterministic, so any byte difference means regeneration is owed), and when
- * the registry is corrupt preserve it while removing any stale layer so no
- * orphaned managed roots can mount; the recovery error is returned for the
- * manager to expose. A profile without a registry is left untouched.
+ * corrupt, or stale derived layer from a valid registry, or fail managed
+ * roots closed when the registry is corrupt. The whole derive-and-commit
+ * cycle runs inside the shared profile operation lock (Task 1's
+ * `withPageAppProfileLock`, after the same package's lock recovery so a
+ * crashed owner cannot stall boot), the registry revision/content is
+ * re-verified immediately before commit, and the layer is published through
+ * the atomic writer (same-directory temp file plus atomic rename), so a
+ * concurrent manager publication is never overwritten by this stale startup
+ * and no reader can observe a partial layer. When the registry is corrupt it
+ * is preserved while any stale layer is removed so no orphaned managed roots
+ * can mount, and the recovery error is returned for the manager to expose.
+ * When no registry exists the registry — the ownership authority — says
+ * nothing is managed: any existing layer is an orphan and is removed (an
+ * absent registry is a normal not-yet-managed state, not a recovery error).
  * @param binName - the diagnostic prefix on parse errors.
  * @param profileDir - absolute profile directory.
  * @returns the startup outcome: recovery error (corrupt registry) and the
@@ -252,26 +285,44 @@ export async function prepareManagerRuntimeLayer(
   binName: string,
   profileDir: string,
 ): Promise<ManagerLayerStartup> {
-  const derived = await deriveSafeRuntimeLayer(binName, profileDir)
-  if (derived.recoveryError !== undefined) {
-    // Preserve the corrupt registry; drop the derived layer so a stale layer
-    // from a previous good state cannot mount orphaned roots.
-    await rm(resolvePageAppProfilePaths(profileDir).runtimeLayer, { force: true })
-    return { recoveryError: derived.recoveryError, omitted: [] }
-  }
-  if (derived.registry === null) return { omitted: [] }
   const paths = resolvePageAppProfilePaths(profileDir)
-  let current: string | undefined
-  try {
-    current = readFileSync(paths.runtimeLayer, 'utf8')
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-  }
-  if (current !== derived.layer) {
-    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
-    await writeFile(paths.runtimeLayer, derived.layer, { mode: 0o600 })
-  }
-  return { omitted: derived.omitted }
+  // Task 1 lock recovery first: a dead owner's lock must not stall boot; the
+  // recovery also fails closed on a live holder (a concurrent manager owns
+  // the profile — booting again is the caller's retry decision).
+  await recoverOrphanedPageAppLock(profileDir)
+  return withPageAppProfileLock(profileDir, { kind: 'manager', token: randomUUID() }, async () => {
+    const derived = await deriveSafeRuntimeLayer(binName, profileDir)
+    if (derived.recoveryError !== undefined) {
+      // Preserve the corrupt registry; drop the derived layer so a stale layer
+      // from a previous good state cannot mount orphaned roots.
+      await rm(paths.runtimeLayer, { force: true })
+      return { recoveryError: derived.recoveryError, omitted: [] }
+    }
+    if (derived.registry === null) {
+      // No ownership authority: an orphaned layer must never mount.
+      await rm(paths.runtimeLayer, { force: true })
+      return { omitted: [] }
+    }
+    // Re-verify the registry is unchanged since the derivation. Both reads
+    // happen inside the same lock boundary, so a change here means a writer
+    // bypassed the lock and this stale derivation must not commit.
+    const current = await readPageAppRegistry(profileDir)
+    if (current === null
+      || current.revision !== derived.registry.revision
+      || JSON.stringify(current) !== JSON.stringify(derived.registry)) {
+      throw new Error('page-app profile runtime: registry changed during manager-layer preparation; aborting regeneration')
+    }
+    let existing: string | undefined
+    try {
+      existing = readFileSync(paths.runtimeLayer, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+    if (existing !== derived.layer) {
+      await writeFileAtomic(paths.runtimeLayer, derived.layer, { mode: 0o600, dirMode: 0o700 })
+    }
+    return { omitted: derived.omitted }
+  })
 }
 
 /** A root derivation outcome: a validated root, or the reason it was omitted. */
@@ -349,15 +400,74 @@ export interface ProfileRuntimeOptions {
   /** The immutable active-profile identity. */
   readonly identity: ActiveProfileIdentity
   /**
-   * Build one fresh full-generation patch list (bundles → manager layer →
-   * profile → home → overlays) with the manager layer read from the current
-   * `runtime-layer.yml`; every generation gets a fresh structured clone.
+   * Build one fresh full-generation patch list from the given manager layer
+   * patches (bundles → manager → profile → home → overlays); every
+   * generation gets a fresh structured clone.
    */
-  readonly compose: () => readonly PatchOptions[]
+  readonly compose: (managerPatches: readonly PatchOptions[]) => readonly PatchOptions[]
+  /**
+   * The boot-time acknowledged manager layer snapshot — exactly the patches
+   * the initial composition mounted. Watcher generations compose this
+   * snapshot until a manager-layer apply/restore audit promotes a new one.
+   */
+  readonly initialManagerPatches: readonly PatchOptions[]
   /** Startup recovery error when the registry is corrupt; managed roots failed closed. */
   readonly recoveryError?: string
   /** Roots the safe derived layer omitted at startup, with their reasons. */
   readonly omittedRoots?: readonly OmittedManagedRoot[]
+}
+
+/**
+ * Launcher- and boot-only controls over a {@link ProfileRuntime}, deliberately
+ * absent from the injected service surface: a service consumer can read the
+ * manager-facing API but can never bind, settle, or trigger the un-audited
+ * watcher recomposition. `boot()` binds and settles through
+ * {@link profileRuntimeControl}; the launcher routes the user-patch watchers
+ * through the same control's {@link ProfileRuntimeControl.recompose}.
+ */
+export interface ProfileRuntimeControl {
+  /**
+   * Bind the root Include entry to the runtime. Called by `boot()` right
+   * after `mountRootInclude` resolves; until then (and until
+   * {@link ProfileRuntimeControl.markSettled}) manager-layer calls fail loudly.
+   * @param entry - the mounted root Include entry, or undefined when the tree
+   * was disposed while mounting.
+   */
+  bindRootInclude(entry: Entry | undefined): void
+  /**
+   * Mark the initial tree as settled. Called by `boot()` after the activation
+   * audit; the manager may not mutate the profile before this.
+   */
+  markSettled(): void
+  /**
+   * Run one full-generation recomposition through the serialized queue
+   * without an audit, composing the acknowledged manager layer snapshot: the
+   * user-patch watchers call this so their updates share the manager's
+   * serialized Include-update path. Fails loudly when the Include is not
+   * bound or the tree has not settled.
+   */
+  recompose(): Promise<void>
+}
+
+/**
+ * Module-private control slot on the service instance: symbol-keyed and
+ * non-enumerable, so no public surface (`Object.keys`, own property names,
+ * string access) exposes the launcher controls. Cordis wraps an injected
+ * service in a traceable proxy that forwards symbol reads to the target, so
+ * the slot resolves on the raw instance and on the proxy alike.
+ */
+const controlKey = Symbol('dsh.profileRuntime.control')
+
+/**
+ * Resolve the launcher/boot-only control for a profile runtime. The control
+ * lives in a module-private slot keyed by the service instance; the injected
+ * service surface never exposes it.
+ * @param runtime - the service instance (raw or the traceable proxy).
+ * @returns the control, or undefined when the instance was not constructed by
+ * this module (never happens for instances built through {@link ProfileRuntime}).
+ */
+export function profileRuntimeControl(runtime: ProfileRuntime): ProfileRuntimeControl | undefined {
+  return (runtime as unknown as Record<symbol, unknown>)[controlKey] as ProfileRuntimeControl | undefined
 }
 
 /**
@@ -374,55 +484,53 @@ export interface ProfileRuntimeOptions {
  * may inject the service during boot but cannot mutate until then.
  */
 export class ProfileRuntime extends Service {
-  /** The immutable active-profile identity. */
-  public readonly identity: ActiveProfileIdentity
+  private readonly identityState: ActiveProfileIdentity
   /** Startup recovery error when the registry is corrupt; managed roots failed closed. */
   public readonly recoveryError: string | undefined
   /** Roots the safe derived layer omitted at startup, with their reasons. */
   public readonly omittedRoots: readonly OmittedManagedRoot[]
 
-  private readonly compose: () => readonly PatchOptions[]
+  private readonly compose: (managerPatches: readonly PatchOptions[]) => readonly PatchOptions[]
+  /** The last acknowledged manager-layer patches; promoted only after an audit passes. */
+  private managerPatches: readonly PatchOptions[]
   private entry: Entry | undefined
   private settled = false
   private generation = 0
   private queue: Promise<unknown> = Promise.resolve()
 
+  /** The immutable active-profile identity; consumers cannot replace it. */
+  public get identity(): ActiveProfileIdentity {
+    return this.identityState
+  }
+
   constructor(ctx: Context, options: ProfileRuntimeOptions) {
     super(ctx, PROFILE_RUNTIME_SERVICE)
-    this.identity = Object.freeze({ ...options.identity })
+    this.identityState = Object.freeze({ ...options.identity })
     this.recoveryError = options.recoveryError
     this.omittedRoots = Object.freeze([...options.omittedRoots ?? []])
     this.compose = options.compose
-  }
-
-  /**
-   * Bind the root Include entry to this runtime. Called by `boot()` right
-   * after `mountRootInclude` resolves; until then (and until
-   * {@link markSettled}) manager-layer calls fail loudly.
-   * @param entry - the mounted root Include entry, or undefined when the tree
-   * was disposed while mounting.
-   */
-  public bindRootInclude(entry: Entry | undefined): void {
-    this.entry = entry
-  }
-
-  /**
-   * Mark the initial tree as settled. Called by `boot()` after the activation
-   * audit; the manager may not mutate the profile before this.
-   */
-  public markSettled(): void {
-    this.settled = true
+    this.managerPatches = [...options.initialManagerPatches]
+    Object.defineProperty(this, controlKey, {
+      enumerable: false,
+      value: {
+        bindRootInclude: (entry: Entry | undefined): void => { this.entry = entry },
+        markSettled: (): void => { this.settled = true },
+        recompose: (): Promise<void> => this.recomposeInternal(),
+      },
+    })
   }
 
   /**
    * Acknowledge one staged manager-layer generation: verify the current
-   * `runtime-layer.yml` equals the request's layer, recompose the full
-   * profile through the serialized queue, wait for the Include update and
-   * Loader settlement, audit every expected root reached active state, and
-   * report the active roots and any effective user override by root id.
+   * `runtime-layer.yml` equals the request's layer, parse and apply the
+   * request's exact content through the serialized queue, wait for the
+   * Include update and Loader settlement, audit every expected root reached
+   * active state, and — only after the audit passes — promote the request's
+   * layer to the acknowledged snapshot that watcher generations compose.
    * Rejects when the layer was not staged as requested, when the Include
    * update or activation fails, or when the audit finds a root that did not
-   * mount or did not reach active state.
+   * mount or did not reach active state; a rejected apply never promotes the
+   * candidate and never advances the generation.
    * @param request - the staged layer and its expected roots.
    * @returns the acknowledged generation with active roots and overrides.
    */
@@ -442,18 +550,10 @@ export class ProfileRuntime extends Service {
     return this.recomposeManagerLayer(request)
   }
 
-  /**
-   * Run one full-generation recomposition through the serialized queue
-   * without an audit: the user-patch watchers call this so their updates
-   * share the manager's serialized Include-update path. The compose callback
-   * re-reads every layer fresh, so a watcher generation is a complete
-   * snapshot. Fails loudly when the Include is not bound or the tree has not
-   * settled.
-   */
-  public async recompose(): Promise<void> {
+  private async recomposeInternal(): Promise<void> {
     this.assertMutable()
     await this.enqueue(async () => {
-      await this.applyGeneration(this.compose())
+      await this.applyGeneration(this.compose(this.managerPatches))
     })
   }
 
@@ -464,8 +564,16 @@ export class ProfileRuntime extends Service {
       if (staged !== request.runtimeLayer) {
         throw new Error('page-app profile runtime: staged runtime layer does not match the apply request; manager repair required')
       }
-      await this.applyGeneration(this.compose())
-      return this.audit(request)
+      // Parse and apply the request's exact content — never re-read the disk
+      // for the manager layer, so a file swap after verification can neither
+      // be applied nor acknowledged.
+      const patches = parseLayerDocument(request.runtimeLayer)
+      await this.applyGeneration(this.compose(patches))
+      const result = this.audit(request)
+      // Promote the acknowledged snapshot only after the audit passed; a
+      // failed generation leaves the previous acknowledged layer in force.
+      this.managerPatches = patches
+      return result
     })
   }
 
@@ -502,7 +610,7 @@ export class ProfileRuntime extends Service {
   }
 
   private async readStagedLayer(): Promise<string | undefined> {
-    const paths = resolvePageAppProfilePaths(this.identity.directory)
+    const paths = resolvePageAppProfilePaths(this.identityState.directory)
     try {
       return await readFile(paths.runtimeLayer, 'utf8')
     } catch (error) {

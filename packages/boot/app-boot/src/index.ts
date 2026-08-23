@@ -20,7 +20,7 @@ import { createLaunchEnvironmentSnapshot, type LaunchEnvironmentSnapshot } from 
 import type {} from '@deepseek-ai/cordis-plugin-hmr'
 // Side-effect type import: resolves `ctx.get('systemPrompt')` to the service.
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { PROFILE_RUNTIME_SERVICE, ProfileRuntime } from './profile-runtime.ts'
+import { PROFILE_RUNTIME_SERVICE, ProfileRuntime, profileRuntimeControl } from './profile-runtime.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -57,6 +57,7 @@ export {
   prepareManagerRuntimeLayer,
   PROFILE_RUNTIME_SERVICE,
   ProfileRuntime,
+  profileRuntimeControl,
   readManagerLayerPatches,
   type ActiveProfileIdentity,
   type DerivedRuntimeLayer,
@@ -67,6 +68,7 @@ export {
   type ProfileLayerInputs,
   type ProfileRuntimeApplyRequest,
   type ProfileRuntimeApplyResult,
+  type ProfileRuntimeControl,
   type ProfileRuntimeOptions,
 } from './profile-runtime.ts'
 
@@ -808,12 +810,13 @@ export async function boot(
     stage = 'plugin tree failed to load'
     const includeEntry = await mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl)
     // Bind the launcher-provided profile runtime to the root Include right
-    // after it resolves: the manager plugin may inject the service during
-    // boot but cannot mutate until the initial tree settles (markSettled
-    // below), so a manager-layer call before binding fails loudly.
+    // after it resolves, through the boot-only control (the injected service
+    // surface exposes no bind/settle): the manager plugin may inject the
+    // service during boot but cannot mutate until the initial tree settles
+    // (markSettled below), so a manager-layer call before binding fails loudly.
     const runtime: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
     if (runtime instanceof ProfileRuntime) {
-      runtime.bindRootInclude(includeEntry)
+      profileRuntimeControl(runtime)?.bindRootInclude(includeEntry)
     }
     // A surface can finish and dispose the whole tree while startup is still
     // in flight, before the last entry settles. The Loader service goes with
@@ -826,7 +829,7 @@ export async function boot(
     if (ctx.get('loader') === undefined) return ctx
     await assertEntriesActivated(ctx, binName)
     if (runtime instanceof ProfileRuntime) {
-      runtime.markSettled()
+      profileRuntimeControl(runtime)?.markSettled()
     }
     return ctx
   } catch (cause) {

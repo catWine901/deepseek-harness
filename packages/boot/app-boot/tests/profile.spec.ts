@@ -4,10 +4,10 @@
  * empty-root composition, and the installation module-fallback healing.
  */
 
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as yaml from 'js-yaml'
 import {
   composeEntries,
@@ -23,6 +23,57 @@ import {
   resolveProfileDir,
   writeProfileManifest,
 } from '../src/index.ts'
+
+// Deterministic interleaving controls for the manager-layer startup tests: a
+// pause on the second registry read (the pre-commit re-verification) and an
+// injectable atomic-publish failure.
+const startupFsState = vi.hoisted(() => ({
+  armPauseOnSecondRegistryRead: false,
+  releaseRegistryRead: () => {},
+  registryReadReached: () => {},
+  registryReadCount: 0,
+  armFailAtomicLayerWrite: false,
+}))
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  const readFile = (async (path: unknown, ...rest: unknown[]) => {
+    const file = String(path)
+    if (file.includes('registry.json') && startupFsState.armPauseOnSecondRegistryRead) {
+      startupFsState.registryReadCount += 1
+      if (startupFsState.registryReadCount === 2) {
+        startupFsState.armPauseOnSecondRegistryRead = false
+        startupFsState.registryReadReached()
+        await new Promise<void>((resolveGate) => { startupFsState.releaseRegistryRead = resolveGate })
+        // Read after the release so the test's registry swap is visible.
+        return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
+      }
+    }
+    return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
+  }) as typeof actual.readFile
+  return { ...actual, readFile }
+})
+
+vi.mock('@deepseek-ai/dsh-atomic-write', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@deepseek-ai/dsh-atomic-write')>()
+  return {
+    ...actual,
+    writeFileAtomic: async (filename: string, content: string, options: { mode: number; dirMode?: number }) => {
+      if (startupFsState.armFailAtomicLayerWrite && filename.includes('runtime-layer.yml')) {
+        throw Object.assign(new Error('injected atomic publish failure'), { code: 'EINJECTED' })
+      }
+      return actual.writeFileAtomic(filename, content, options)
+    },
+  }
+})
+
+afterEach(() => {
+  startupFsState.armPauseOnSecondRegistryRead = false
+  startupFsState.releaseRegistryRead = () => {}
+  startupFsState.registryReadReached = () => {}
+  startupFsState.registryReadCount = 0
+  startupFsState.armFailAtomicLayerWrite = false
+})
 
 const tmp = (): string => mkdtempSync(join(tmpdir(), 'dsh-profile-'))
 
@@ -487,5 +538,62 @@ describe('manager runtime layer startup', () => {
     expect(before.layer).toBe(after.layer)
     expect(before.omitted).toEqual(after.omitted)
     expect(before.recoveryError).toBeUndefined()
+  })
+
+  it('drops an orphaned runtime layer when no registry exists', async () => {
+    const profile = tmp()
+    mkdirSync(join(profile, MANAGER_DIR), { recursive: true })
+    // A stale derived layer without any registry ownership must never mount
+    // orphaned roots: the registry is the sole ownership authority.
+    writeFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), '- insert:\n    - id: orphan\n      name: ./orphan.mjs\n')
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    // Absent registry is a normal "not yet managed" state, not a recovery error.
+    expect(startup.recoveryError).toBeUndefined()
+    expect(startup.omitted).toEqual([])
+    expect(() => readFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), 'utf8')).toThrow(/ENOENT/)
+  })
+
+  it('aborts regeneration when the registry changes between derivation and commit', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
+
+    // Pause at the pre-commit registry re-verification read; a stale startup
+    // derivation must never overwrite a newer published revision.
+    startupFsState.armPauseOnSecondRegistryRead = true
+    const reached = new Promise<void>((resolve) => { startupFsState.registryReadReached = resolve })
+    const preparing = prepareManagerRuntimeLayer('t', profile)
+    const outcome = await Promise.race([
+      preparing.then(() => 'settled', () => 'settled'),
+      reached.then(() => 'paused'),
+    ])
+    if (outcome === 'paused') {
+      // A newer revision is published (by a manager or a rogue writer) while
+      // the startup derivation is in flight.
+      writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0', {
+        resolvedVersion: '2.0.0',
+        page: { id: 'fixture-page', name: 'Fixture Page', description: 'fixture page app', defaultOrder: 0, rootEntryId: 'fixture-root' },
+      })]))
+      startupFsState.releaseRegistryRead()
+    }
+    await expect(preparing).rejects.toThrow(/registry changed/i)
+    // The stale layer was never published.
+    expect(() => readFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), 'utf8')).toThrow(/ENOENT/)
+  })
+
+  it('leaves the existing layer intact when the atomic publish fails', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
+    const existing = 'previously committed layer bytes that must survive\n'
+    writeFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), existing)
+
+    startupFsState.armFailAtomicLayerWrite = true
+    await expect(prepareManagerRuntimeLayer('t', profile)).rejects.toThrow(/injected atomic publish failure/i)
+    // The existing layer was never truncated or half-written, and no temp
+    // residue remains.
+    expect(readFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), 'utf8')).toBe(existing)
+    expect(readdirSync(join(profile, MANAGER_DIR)).filter(name => name.endsWith('.tmp'))).toEqual([])
   })
 })

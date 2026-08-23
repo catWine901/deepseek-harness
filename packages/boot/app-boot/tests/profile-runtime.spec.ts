@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
@@ -21,6 +21,7 @@ import {
   loadOptionalPatches,
   PROFILE_PATCH_FILENAME,
   ProfileRuntime,
+  profileRuntimeControl,
   readManagerLayerPatches,
   type ActiveProfileIdentity,
   type ExpectedManagedRoot,
@@ -31,6 +32,37 @@ const NAME = 'dsh-test-bin'
 const NOOP_PLUGIN = 'export const name = "noop"\nexport function apply() {}\n'
 
 const tmp = (): string => mkdtempSync(join(tmpdir(), 'dsh-profile-runtime-'))
+
+const fsState = vi.hoisted(() => ({
+  // Pauses the first fs/promises read of the runtime layer after arming —
+  // the staged-file verification read inside applyManagerLayer — so the test
+  // can swap the staged file before the apply composes the generation.
+  armPauseOnLayerVerifyRead: false,
+  releaseLayerVerifyRead: () => {},
+  layerVerifyReadReached: () => {},
+}))
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>()
+  const readFile = (async (path: unknown, ...rest: unknown[]) => {
+    const file = String(path)
+    if (file.includes('runtime-layer.yml') && fsState.armPauseOnLayerVerifyRead) {
+      fsState.armPauseOnLayerVerifyRead = false
+      const content = String(await (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest))
+      fsState.layerVerifyReadReached()
+      await new Promise<void>((resolveGate) => { fsState.releaseLayerVerifyRead = resolveGate })
+      return content
+    }
+    return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
+  }) as typeof actual.readFile
+  return { ...actual, readFile }
+})
+
+afterEach(() => {
+  fsState.armPauseOnLayerVerifyRead = false
+  fsState.releaseLayerVerifyRead = () => {}
+  fsState.layerVerifyReadReached = () => {}
+})
 
 describe('composeProfilePatches layer order', () => {
   it('composes conflicting rows with precedence bundles → manager layer → profile patch → home patch → overlays/telemetry', () => {
@@ -116,12 +148,14 @@ interface RuntimeTree {
   runtime: ProfileRuntime
   dir: string
   managerLayerPath: string
+  /** Trigger one user-watcher recomposition through the serialized path. */
+  recompose: () => Promise<void>
 }
 
 /**
  * Boot a real Loader tree with a launcher-provided ProfileRuntime whose
- * compose closure reads the current manager layer plus an optional profile
- * patch file (`cordis.patch.yml`), exactly like profile boot wires it.
+ * compose closure interleaves the given manager patches with an optional
+ * profile patch file (`cordis.patch.yml`), exactly like profile boot wires it.
  */
 async function bootRuntimeTree(): Promise<RuntimeTree> {
   const dir = tmp()
@@ -133,17 +167,28 @@ async function bootRuntimeTree(): Promise<RuntimeTree> {
   const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
     runtime = new ProfileRuntime(hostCtx, {
       identity,
-      compose: () => composeProfilePatches({
+      compose: managerPatches => composeProfilePatches({
         bundlePatches: [],
-        managerPatches: readManagerLayerPatches(NAME, dir),
+        managerPatches,
         profilePatches: loadOptionalPatches(NAME, join(dir, PROFILE_PATCH_FILENAME)) ?? [],
         homePatches: [],
         overlays: [],
       }),
+      // At boot no manager layer exists yet; the acknowledged snapshot is
+      // empty until the first apply/restore audit promotes one.
+      initialManagerPatches: readManagerLayerPatches(NAME, dir),
     })
   })
   if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
-  return { ctx, runtime, dir, managerLayerPath: join(dir, '.workspace-manager', 'runtime-layer.yml') }
+  const control = profileRuntimeControl(runtime)
+  if (control === undefined) throw new Error('boot did not expose the profile runtime control')
+  return {
+    ctx,
+    runtime,
+    dir,
+    managerLayerPath: join(dir, '.workspace-manager', 'runtime-layer.yml'),
+    recompose: () => control.recompose(),
+  }
 }
 
 /** A layer mounting one noop root plus the expected hash of its derived row. */
@@ -205,13 +250,14 @@ describe('ProfileRuntime live recomposition', () => {
     const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
       runtime = new ProfileRuntime(hostCtx, {
         identity: { name: 'demo', directory: dir },
-        compose: () => composeProfilePatches({
+        compose: managerPatches => composeProfilePatches({
           bundlePatches: [],
-          managerPatches: readManagerLayerPatches(NAME, dir),
+          managerPatches,
           profilePatches: [],
           homePatches: [],
           overlays: [],
         }),
+        initialManagerPatches: [],
       })
     })
     if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
@@ -241,13 +287,14 @@ describe('ProfileRuntime live recomposition', () => {
     const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
       runtime = new ProfileRuntime(hostCtx, {
         identity: { name: 'demo', directory: dir },
-        compose: () => composeProfilePatches({
+        compose: managerPatches => composeProfilePatches({
           bundlePatches: [],
-          managerPatches: readManagerLayerPatches(NAME, dir),
+          managerPatches,
           profilePatches: [],
           homePatches: [],
           overlays: [],
         }),
+        initialManagerPatches: [],
       })
     })
     if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
@@ -311,14 +358,14 @@ describe('ProfileRuntime live recomposition', () => {
   })
 
   it('serializes manager and watcher generations through one queue', async () => {
-    const { ctx, runtime, managerLayerPath } = await bootRuntimeTree()
+    const { ctx, runtime, recompose, managerLayerPath } = await bootRuntimeTree()
     try {
       const { layer, expected } = singleRootLayer('page', 1)
       writeFileSync(managerLayerPath, layer)
       const request = applyRequest(layer, [expected])
       const [result] = await Promise.all([
         runtime.applyManagerLayer(request),
-        runtime.recompose(),
+        recompose(),
       ])
       expect(result.generation).toBe(1)
       expect(result.activeRoots).toEqual(['page'])
@@ -357,6 +404,7 @@ describe('ProfileRuntime mutation gates', () => {
       const runtime = new ProfileRuntime(ctx, {
         identity: { name: 'demo', directory: tmp() },
         compose: () => [],
+        initialManagerPatches: [],
       })
       await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/before the root Include is bound/i)
@@ -381,7 +429,10 @@ describe('ProfileRuntime mutation gates', () => {
     const runtime = new ProfileRuntime(ctx, {
       identity: { name: 'demo', directory: dir },
       compose: () => [],
+      initialManagerPatches: [],
     })
+    const control = profileRuntimeControl(runtime)
+    if (control === undefined) throw new Error('profile runtime control is unavailable')
     try {
       await ctx.loader.create({
         name: 'cordis:include',
@@ -390,16 +441,114 @@ describe('ProfileRuntime mutation gates', () => {
       await ctx.loader.await()
       const include = [...ctx.loader.entries()].find(entry => entry.options.name === 'cordis:include')
       if (include === undefined) throw new Error('booted tree has no include entry')
-      runtime.bindRootInclude(include)
+      control.bindRootInclude(include)
       await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/before the initial tree has settled/i)
       await expect(runtime.restoreManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/before the initial tree has settled/i)
-      runtime.markSettled()
+      control.markSettled()
       // Once settled, the gates pass and the call proceeds to the staging
       // verification (no layer file was staged here).
       await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/does not match the apply request/i)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('acknowledged manager layer snapshot', () => {
+  it('keeps the acknowledged manager layer when a new layer is staged but not applied', async () => {
+    const { ctx, runtime, recompose, managerLayerPath } = await bootRuntimeTree()
+    try {
+      const first = singleRootLayer('page', 1)
+      writeFileSync(managerLayerPath, first.layer)
+      await runtime.applyManagerLayer(applyRequest(first.layer, [first.expected]))
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(true)
+
+      // The manager stages a newer layer (a new root) but has not acknowledged
+      // it; a user watcher generation must keep the acknowledged composition
+      // instead of mounting the staged bytes early.
+      const second = singleRootLayer('page2', 1)
+      writeFileSync(managerLayerPath, second.layer)
+      await recompose()
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(true)
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page2')).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('applies the request layer even when the staged file is swapped after verification', async () => {
+    const { ctx, runtime, recompose, managerLayerPath } = await bootRuntimeTree()
+    try {
+      const first = singleRootLayer('page-a', 1)
+      writeFileSync(managerLayerPath, first.layer)
+      // Pause right after the staged-file verification read, swap the file to
+      // a different layer, then release: the apply must still compose the
+      // request content and never apply or acknowledge the swapped bytes.
+      fsState.armPauseOnLayerVerifyRead = true
+      const reached = new Promise<void>((resolve) => { fsState.layerVerifyReadReached = resolve })
+      const applying = runtime.applyManagerLayer(applyRequest(first.layer, [first.expected]))
+      await reached
+      const second = singleRootLayer('page-b', 2)
+      writeFileSync(managerLayerPath, second.layer)
+      fsState.releaseLayerVerifyRead()
+      const result = await applying
+      expect(result.activeRoots).toEqual(['page-a'])
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page-a')).toBe(true)
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page-b')).toBe(false)
+      // The acknowledged snapshot is the request's layer: a later watcher
+      // generation composes it, not the swapped bytes.
+      await recompose()
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page-a')).toBe(true)
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page-b')).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('ProfileRuntime manager-facing surface', () => {
+  it('exposes an immutable identity that consumers cannot replace', async () => {
+    const { ctx, runtime, dir } = await bootRuntimeTree()
+    try {
+      expect(() => {
+        (runtime as unknown as { identity: ActiveProfileIdentity }).identity = { name: 'evil', directory: tmp() }
+      }).toThrow()
+      expect(runtime.identity).toEqual({ name: 'demo', directory: dir })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not expose launcher controls on the injected service', async () => {
+    const { ctx, runtime } = await bootRuntimeTree()
+    try {
+      const surface = runtime as unknown as Record<string, unknown>
+      expect(surface.bindRootInclude).toBeUndefined()
+      expect(surface.markSettled).toBeUndefined()
+      expect(surface.recompose).toBeUndefined()
+      // The manager-facing surface still exposes the acknowledged apply API.
+      expect(typeof runtime.applyManagerLayer).toBe('function')
+      expect(typeof runtime.restoreManagerLayer).toBe('function')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('keeps the launcher control able to bind, settle, and trigger the watcher path', async () => {
+    // boot() already bound and settled through the control; the watcher path
+    // must still apply an acknowledged generation through it.
+    const { ctx, runtime, recompose, managerLayerPath } = await bootRuntimeTree()
+    try {
+      const control = profileRuntimeControl(runtime)
+      expect(control).toBeDefined()
+      const first = singleRootLayer('page', 1)
+      writeFileSync(managerLayerPath, first.layer)
+      await runtime.applyManagerLayer(applyRequest(first.layer, [first.expected]))
+      await recompose()
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(true)
     } finally {
       await ctx.fiber.dispose()
     }

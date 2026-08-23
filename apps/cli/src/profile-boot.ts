@@ -29,6 +29,7 @@ import {
   prepareManagerRuntimeLayer,
   PROFILE_PATCH_FILENAME,
   ProfileRuntime,
+  profileRuntimeControl,
   readManagerLayerPatches,
   watchUserPatches,
   type ManagerLayerStartup,
@@ -168,17 +169,20 @@ export function composeProfile(
 /**
  * Compose one fresh full generation of one composed profile — the single
  * recomposition function shared by the initial boot, the user-patch watchers,
- * and the manager's acknowledged applies. It reads the CURRENT manager layer
- * between the bundle layers and the user layers, re-reads both user patch
- * files per generation, and returns a fresh structured clone so mounted
- * insert rows can never leak across generations.
+ * and the manager's acknowledged applies. The manager layer patches are
+ * supplied by the caller (the boot-time snapshot or the last acknowledged
+ * layer), never read from the staged file, so a staged-but-unacknowledged
+ * layer can never go live early. Both user patch files are re-read per
+ * generation, and the result is a fresh structured clone so mounted insert
+ * rows can never leak across generations.
  * @param composed - the launcher-composed profile layers.
+ * @param managerPatches - the manager layer patches for this generation.
  * @returns one fresh generation patch list (bundles → manager → profile → home → overlays).
  */
-export function composeLivePatches(composed: ComposedProfile): PatchOptions[] {
+export function composeLivePatches(composed: ComposedProfile, managerPatches: readonly PatchOptions[]): PatchOptions[] {
   return composeProfilePatches({
     bundlePatches: composed.bundlePatches,
-    managerPatches: readManagerLayerPatches(NAME, composed.profile.dir),
+    managerPatches,
     profilePatches: loadOptionalPatches(NAME, composed.profile.patchPath) ?? [],
     homePatches: loadOptionalPatches(NAME, homePatchPath()) ?? [],
     overlays: composed.overlays,
@@ -246,8 +250,12 @@ export async function bootComposedProfile(
   exit: (code: number) => void,
 ): Promise<ProfileBootResult> {
   const rootConfig = join(composed.profile.dir, PROFILE_ROOT_FILENAME)
+  // The boot-time manager layer snapshot: what the initial composition mounts
+  // becomes the runtime's acknowledged snapshot, so later watcher generations
+  // keep it until a manager-layer apply/restore audit promotes a new one.
+  const initialManagerPatches = readManagerLayerPatches(NAME, composed.profile.dir)
   let runtime: ProfileRuntime | undefined
-  const ctx = await boot(NAME, rootConfig, composeLivePatches(composed), (hostCtx) => {
+  const ctx = await boot(NAME, rootConfig, composeLivePatches(composed, initialManagerPatches), (hostCtx) => {
     onPrepare(hostCtx)
     // Before any config-tree entry mounts, so plugins resolve all launch-time
     // environment values from the same immutable provenance snapshot.
@@ -262,7 +270,8 @@ export async function bootComposedProfile(
     // acknowledged live-recomposition API, beside the launch facts.
     runtime = new ProfileRuntime(hostCtx, {
       identity: { name: composed.profile.name, directory: composed.profile.dir },
-      compose: () => composeLivePatches(composed),
+      compose: managerPatches => composeLivePatches(composed, managerPatches),
+      initialManagerPatches,
       ...managerLayer.recoveryError === undefined ? {} : { recoveryError: managerLayer.recoveryError },
       omittedRoots: managerLayer.omitted,
     })
@@ -334,8 +343,16 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
         await ctx.loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
       }
       // Both user-patch watchers and the manager route through the runtime's
-      // serialized recomposition queue: no independent entry.update writers.
-      const recompose = runtime === undefined ? undefined : (): Promise<void> => runtime.recompose()
+      // serialized recomposition queue — via the boot-only control, so the
+      // injected service surface exposes no un-audited recomposition: no
+      // independent entry.update writers.
+      const recompose = runtime === undefined ? undefined : (): Promise<void> => {
+        const control = profileRuntimeControl(runtime)
+        if (control === undefined) {
+          throw new Error('dsh: profile runtime control is unavailable for user-patch watching')
+        }
+        return control.recompose()
+      }
       await watchUserPatches(ctx, {
         binName: NAME,
         filename: composed.profile.patchPath,

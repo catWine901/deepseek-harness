@@ -9,7 +9,7 @@ import { stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { composeEntries, initProfile, prepareManagerRuntimeLayer, PROFILE_PATCH_FILENAME } from '@deepseek-ai/dsh-app-boot'
+import { composeEntries, initProfile, prepareManagerRuntimeLayer, PROFILE_PATCH_FILENAME, readManagerLayerPatches } from '@deepseek-ai/dsh-app-boot'
 import { createLaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
 import { bootComposedProfile, composeLivePatches, composeProfile } from '../src/profile-boot.ts'
 
@@ -54,7 +54,7 @@ describe('launcher layer order', () => {
       writeFileSync(overlayPath, '- id: shared\n  config:\n    value: overlay\n')
 
       const composed = composeProfile('demo', [overlayPath])
-      const generation = composeLivePatches(composed)
+      const generation = composeLivePatches(composed, readManagerLayerPatches(NAME, profileDir))
       expect(composeEntries([generation])).toEqual([
         { id: 'shared', name: '@acme/a', config: { value: 'overlay' } },
         { id: 'managed', name: '@acme/m', config: { value: 'manager' } },

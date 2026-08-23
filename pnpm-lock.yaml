@@ -942,6 +942,9 @@ importers:
 
   packages/boot/app-boot:
     dependencies:
+      '@deepseek-ai/dsh-atomic-write':
+        specifier: workspace:^
+        version: link:../../util/atomic-write
       js-yaml:
         specifier: ^4.2.0
         version: 4.2.0
