@@ -79,3 +79,37 @@ export interface PageAppInstallSource {
   /** Redacted source record the registry may persist. */
   readonly display: PageAppRegistrySource
 }
+
+/** Payload of the `page-app-manager/activation-requested` event. */
+export interface PageAppActivationRequestedEvent {
+  /** The transaction id the client acknowledgement must carry. */
+  readonly transactionId: string
+  /** The opaque initiating client instance allowed to acknowledge. */
+  readonly clientInstanceId: string
+  /** The installed package name. */
+  readonly packageName: string
+  /** The managed page id. */
+  readonly pageId: string
+  /** The graph revision the client must have converged to. */
+  readonly graphRevision: string
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * The manager committed a registry change (install/enable/disable/hide/
+     * reorder/uninstall published a new revision). Consumers re-read the
+     * snapshot.
+     * @param revision - the newly committed registry revision.
+     * @mode emit
+     */
+    'page-app-manager/changed'(revision: number): void
+    /**
+     * An install staged its runtime layer and now waits for the targeted
+     * client instance to acknowledge the activation.
+     * @param request - transaction, client instance, package, page, and graph revision.
+     * @mode emit
+     */
+    'page-app-manager/activation-requested'(request: PageAppActivationRequestedEvent): void
+  }
+}

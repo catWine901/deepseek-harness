@@ -11,7 +11,7 @@
 
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Service } from '@deepseek-ai/cordis'
+import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Loader } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
@@ -31,6 +31,10 @@ import {
 import type { PageAppManagerSnapshot, PageAppView } from './types.ts'
 import { parsePageAppInstallSource } from './source.ts'
 import type { PageAppInstallSource } from './types.ts'
+import { PageAppLifecycle } from './transaction.ts'
+import { createPnpmExecutor } from './executor.ts'
+import { recoverPageAppTransaction } from './recovery.ts'
+import type { PageAppClientInstanceId, PageAppTransactionId } from './activation.ts'
 
 export * from './types.ts'
 export * from './source.ts'
@@ -98,16 +102,27 @@ function readRegistrySync(profileDir: string): { registry: PageAppRegistryV1 | n
 }
 
 /**
- * Build the Host page-app manager service.
+ * Build the Host page-app manager service. Extends `TypertRemoteService` so the
+ * generated `pageAppManager` namespace exposes the mutation API; the read
+ * projection and staged validation are plain methods on the same service.
  * @param ctx - plugin context with the Loader available.
  * @param options - the launcher-provided profile runtime (identity source).
  */
-export class PageAppManager extends Service {
+export class PageAppManager extends TypertRemoteService {
   private readonly profileRuntime: ProfileRuntime
+  private readonly lifecycle: PageAppLifecycle
 
   constructor(ctx: Context, options: { profileRuntime: ProfileRuntime }) {
     super(ctx, 'pageAppManager')
     this.profileRuntime = options.profileRuntime
+    this.lifecycle = new PageAppLifecycle({
+      profileDir: this.profileRuntime.identity.directory,
+      executor: createPnpmExecutor(),
+      runtime: this.profileRuntime,
+      pnpmWorkspaceFile: join(this.profileRuntime.identity.directory, 'pnpm-workspace.yaml'),
+      onChanged: (revision) => { ctx.emit('page-app-manager/changed', revision) },
+      onActivationRequested: (request) => { ctx.emit('page-app-manager/activation-requested', request) },
+    })
   }
 
   /** The immutable active-profile identity (consumers cannot replace it). */
@@ -120,6 +135,105 @@ export class PageAppManager extends Service {
    * ownership authority; health is derived from current dependency, version,
    * and runtime facts. Plugin Inventory and unrelated Loader rows never create
    * entries.
+   * @returns the immutable snapshot.
+   */
+  @Remote('list')
+  public list(): PageAppManagerSnapshot {
+    return this.snapshot()
+  }
+
+  /**
+   * Install one managed package (the Remote entry of the Settings add-flow).
+   * @param source - the validated install source.
+   * @param clientInstanceId - the opaque initiating client instance.
+   * @returns the committed registry revision.
+   */
+  @Remote('install')
+  public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<number> {
+    return this.lifecycle.install(source, clientInstanceId, new AbortController().signal)
+  }
+
+  /**
+   * Enable or disable one managed page.
+   * @param pageId - the managed page id.
+   * @param enabled - the new enabled state.
+   * @returns the committed registry revision.
+   */
+  @Remote('setEnabled')
+  public setEnabled(pageId: string, enabled: boolean): Promise<number> {
+    return this.lifecycle.setEnabled(pageId, enabled, new AbortController().signal)
+  }
+
+  /**
+   * Hide or show one managed page (presentation only).
+   * @param pageId - the managed page id.
+   * @param hidden - the new hidden state.
+   * @returns the committed registry revision.
+   */
+  @Remote('setHidden')
+  public setHidden(pageId: string, hidden: boolean): Promise<number> {
+    return this.lifecycle.setHidden(pageId, hidden)
+  }
+
+  /**
+   * Reorder managed pages.
+   * @param pageIds - page ids in the desired order.
+   * @returns the committed registry revision.
+   */
+  @Remote('reorder')
+  public reorder(pageIds: readonly string[]): Promise<number> {
+    return this.lifecycle.reorder(pageIds)
+  }
+
+  /**
+   * Uninstall one managed page from the current profile.
+   * @param pageId - the managed page id.
+   * @returns the committed registry revision.
+   */
+  @Remote('uninstall')
+  public uninstall(pageId: string): Promise<number> {
+    return this.lifecycle.uninstall(pageId, new AbortController().signal)
+  }
+
+  /**
+   * Acknowledge a pending targeted client activation. Only the first valid
+   * acknowledgement from the initiating client instance settles the install.
+   * @param transactionId - the transaction the acknowledgement names.
+   * @param clientInstanceId - the acknowledging client instance.
+   * @param packageName - the acknowledged package.
+   * @param pageId - the acknowledged page id.
+   * @param graphRevision - the graph revision the client converged to.
+   * @returns whether this attempt settled the transaction.
+   */
+  @Remote('ackClientActivation')
+  public ackClientActivation(
+    transactionId: PageAppTransactionId,
+    clientInstanceId: PageAppClientInstanceId,
+    packageName: string,
+    pageId: string,
+    graphRevision: string,
+  ): { accepted: boolean; reason?: string } {
+    const result = this.lifecycle.activation.acknowledge(
+      transactionId, clientInstanceId, packageName, pageId, graphRevision,
+    )
+    return { accepted: result.accepted, ...result.reason === undefined ? {} : { reason: result.reason } }
+  }
+
+  /**
+   * Run the startup/operator recovery over the profile journal.
+   * @returns the recovery outcome.
+   */
+  @Remote('recover')
+  public recover(): Promise<{ action: string; message?: string }> {
+    return recoverPageAppTransaction(
+      this.profileRuntime.identity.directory,
+      createPnpmExecutor(),
+    ).then(outcome => ({ action: outcome.action, ...outcome.message === undefined ? {} : { message: outcome.message } }))
+  }
+
+  /**
+   * The full read-only projection of the managed set (the `list` Remote
+   * delegates here; the raw method stays available to host-side consumers).
    * @returns the immutable snapshot.
    */
   public snapshot(): PageAppManagerSnapshot {

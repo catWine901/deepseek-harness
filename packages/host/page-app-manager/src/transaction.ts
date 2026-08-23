@@ -34,7 +34,7 @@ import {
   type ValidatedManagedRoot,
 } from '@deepseek-ai/dsh-page-app-profile'
 import type { PageAppInstallSource } from './types.ts'
-import { PageAppActivationGate, type PageAppClientInstanceId, type PageAppTransactionId } from './activation.ts'
+import { PageAppActivationGate, type ClientActivationRequest, type PageAppClientInstanceId, type PageAppTransactionId } from './activation.ts'
 import type { PageAppPackageExecutor } from './executor.ts'
 import { validateInstalledPageAppPackage, resolveInstalledPackageDir } from './validation.ts'
 
@@ -59,6 +59,10 @@ export interface PageAppTransactionDeps {
   readonly runtime: ProfileRuntime
   /** Absolute pnpm-workspace.yaml path (never edited; allowBuilds diagnostics read it). */
   readonly pnpmWorkspaceFile: string
+  /** Called after each committed registry publication (the manager emits `page-app-manager/changed`). */
+  readonly onChanged?: (revision: number) => void
+  /** Called when the targeted activation gate opens (the manager emits `page-app-manager/activation-requested`). */
+  readonly onActivationRequested?: (request: ClientActivationRequest) => void
 }
 
 /** Manager-relative owned files the journal snapshots before every mutation. */
@@ -126,13 +130,15 @@ export class PageAppLifecycle {
       // Apply the layer through the acknowledged profile runtime.
       await this.applyRuntime(staged)
       // Targeted client activation: only the initiating instance may settle.
-      this.gate.open({
+      const request: ClientActivationRequest = {
         transactionId,
         clientInstanceId,
         packageName: staged.registry.entries.at(-1)?.packageName ?? '',
         pageId: staged.registry.entries.at(-1)?.page.id ?? '',
         graphRevision: staged.layer,
-      })
+      }
+      this.gate.open(request)
+      this.deps.onActivationRequested?.(request)
       try {
         await this.gate.awaitSettlement(signal)
       } finally {
@@ -395,6 +401,7 @@ export class PageAppLifecycle {
   private async publish(registry: PageAppRegistryV1): Promise<void> {
     await writePageAppRegistry(this.deps.profileDir, registry)
     await this.advanceTo('committing')
+    this.deps.onChanged?.(registry.revision)
   }
 
   /** Re-read the durable journal and walk it forward to the target phase (never a stale in-memory object). */
