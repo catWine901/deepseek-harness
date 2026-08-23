@@ -395,13 +395,13 @@ describe('recoverOrphanedPageAppLock', () => {
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
     const dead = await deadPid()
-    // The legacy fixed-path claim (honored by pre-chain rounds) and the
-    // chain's first generation both record the same dead claimant, so this
-    // test runs deterministically RED on the pre-chain implementation (B
-    // moves A's live claim away, C creates into the empty fixed path, and A
-    // and C both win) and GREEN on the append-only chain.
+    // Only the legacy fixed-path claim is planted: the pre-chain
+    // implementation (which honors only that path) runs deterministically RED
+    // on this fixture (B moves A's live claim away, C creates into the empty
+    // fixed path, and A and C both win), while the chain algorithm treats the
+    // legacy claim as generation 0, supersedes it exactly once at .0001, and
+    // fails B and C closed on the live tail.
     await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
-    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
 
     fsState.deadClaimantPid = dead
     fsState.armPauseOnClaimRead = true
@@ -464,6 +464,159 @@ describe('recoverOrphanedPageAppLock', () => {
     }
 
     await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/chain exhausted|repair/i)
+  })
+
+  it('fails closed on a live low generation with a gap and a dead high generation, creating nothing', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    // The review scenario: a live generation-0 recoverer, a missing 0001, and
+    // a dead high generation. The highest-legal-generation tail logic would
+    // supersede 0002 and let a second recoverer win alongside the live one.
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0002`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/repair/i)
+    // No new generation was created: the planted chain is untouched.
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim.0000', 'operation.lock.token-x.claim.0002'])
+  })
+
+  it('fails closed when a continuous chain contains a live ancestor', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0001`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/ancestor|repair/i)
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim.0000', 'operation.lock.token-x.claim.0001'])
+  })
+
+  it('fails closed when a continuous chain contains an indeterminate ancestor', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const ancestorPid = await deadPid()
+    const tailPid = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${ancestorPid}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0001`, `${tailPid}\n`, { flag: 'wx', mode: 0o600 })
+    // Only the ancestor's probe is indeterminate; the tail stays provably dead
+    // so the pre-chain tail-only logic would have superseded it.
+    const originalKill = process.kill.bind(process)
+    const spy = vi.spyOn(process, 'kill').mockImplementation((pid: number, signal?: number | string) => {
+      if (pid === ancestorPid) {
+        throw Object.assign(new Error('EINVAL: injected liveness probe failure'), { code: 'EINVAL' })
+      }
+      return originalKill(pid, signal)
+    })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/ancestor|liveness|indeterminate|repair/i)
+    spy.mockRestore()
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim.0000', 'operation.lock.token-x.claim.0001'])
+  })
+
+  it('fails closed when a chain ancestor is unreadable or malformed', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, 'not a pid\n', { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0001`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/unreadable|repair/i)
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim.0000', 'operation.lock.token-x.claim.0001'])
+  })
+
+  it('fails closed on claim-like anomalous generation names without creating a chain', async () => {
+    const dead = await deadPid()
+    for (const suffix of ['00000', '000x', '0000.extra', '12345']) {
+      const profile = await scratch()
+      const paths = resolvePageAppProfilePaths(profile)
+      await mkdir(paths.directory, { recursive: true })
+      await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+      await writeFile(`${paths.operationKey}.token-x.claim.${suffix}`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+      await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/claim-like|repair/i)
+      // The anomalous file stays and no chain generation was created.
+      expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+        .toEqual([`operation.lock.token-x.claim.${suffix}`])
+    }
+  })
+
+  it('fails closed on an out-of-range generation index without creating anything', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim.0064`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/out of range|exhausted|repair/i)
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim.0064'])
+  })
+
+  it('proceeds when a continuous multi-generation chain is fully dead', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0001`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).resolves.toBeUndefined()
+    expect(await readFile(`${paths.operationKey}.token-x.claim.0002`, 'utf8')).toBe(`${process.pid}\n`)
+  })
+
+  it('treats a legacy fixed-path claim as generation 0 and continues at 0001 when it is dead', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).resolves.toBeUndefined()
+    expect(await readFile(`${paths.operationKey}.token-x.claim.0001`, 'utf8')).toBe(`${process.pid}\n`)
+    // The legacy claim occupies generation 0; no .0000 generation was created.
+    await expect(stat(`${paths.operationKey}.token-x.claim.0000`)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('fails closed when a legacy fixed-path claim coexists with chain generation 0000', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/ambiguous|repair/i)
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim', 'operation.lock.token-x.claim.0000'])
+  })
+
+  it('fails closed when the legacy fixed-path claim is live', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim`, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/already claimed|recoverer/i)
+    expect((await readdir(paths.directory)).filter(name => name.startsWith('operation.lock.token-x.claim')).sort())
+      .toEqual(['operation.lock.token-x.claim'])
   })
 
   it('rejects unsafe owner tokens at acquisition and never creates the lock', async () => {

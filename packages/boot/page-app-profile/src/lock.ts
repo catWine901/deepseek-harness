@@ -4,7 +4,8 @@
  * directory) before invoking pnpm or mutating owned files, so the two
  * mutation paths cannot race. The payload records schema version, owner kind,
  * pid, opaque owner token, and acquisition timestamp; startup recovery uses
- * the token to distinguish a dead transaction owner from live contention.
+ * the token to distinguish a dead transaction owner from live contention and
+ * arbitrates exactly one winner through an append-only recovery claim chain.
  * @module @deepseek-ai/dsh-page-app-profile/lock
  */
 
@@ -157,49 +158,121 @@ async function readClaimantPid(claimFile: string): Promise<number | undefined> {
 }
 
 /**
- * Find the active tail of the append-only recovery claim chain: the claim
- * file with the highest generation index under `prefix`. Claims are only ever
- * created, never deleted or moved, so the highest index is the newest claim.
- * @param directory - the manager directory holding the claims.
- * @param prefix - `operationKey basename + '.' + token + '.claim.'`.
- * @returns the tail claim's index and path, or undefined for an empty chain.
+ * One generation of a recovery claim chain. Generation 0 is the legacy
+ * fixed-path claim when it exists; every later generation is a `.NNNN` claim.
  */
-async function findClaimChainTail(
+interface RecoveryClaimEntry {
+  readonly index: number
+  readonly path: string
+  readonly pid: number
+}
+
+/** A validated recovery claim chain for one owner token, in generation order. */
+interface ScannedRecoveryChain {
+  readonly claims: readonly RecoveryClaimEntry[]
+}
+
+/**
+ * Read a claim's recoverer pid, failing closed when the claim is unreadable or
+ * does not contain a legal pid. A half-written claim (created but not yet
+ * filled by a concurrent recoverer) therefore rejects instead of authorizing
+ * a takeover.
+ * @param claimFile - the claim file path.
+ * @returns the claimant pid.
+ */
+async function readRequiredClaimantPid(claimFile: string): Promise<number> {
+  const pid = await readClaimantPid(claimFile)
+  if (pid === undefined) {
+    throw new Error(`page-app lock: recovery claim is unreadable at ${claimFile}; operator repair required`)
+  }
+  return pid
+}
+
+/**
+ * Scan and validate the complete recovery claim chain for one token: the
+ * legacy fixed-path claim `<operationKey>.<token>.claim` (generation 0 when
+ * present) plus every `<operationKey>.<token>.claim.<NNNN>` generation. The
+ * scan fails closed on any anomaly — a claim-like file whose suffix is not
+ * exactly four digits, a generation index at or beyond the cap, a legacy
+ * claim coexisting with generation 0000, a gap or missing start in the
+ * generation sequence, or an unreadable/malformed claim — because claims are
+ * immutable evidence that a confused or tampered chain must never be
+ * auto-repaired around. The empty chain (no claims) is valid.
+ * @param directory - the manager directory holding the claims.
+ * @param operationKeyBasename - `basename(operationKey)`, the claim prefix root.
+ * @param token - the validated owner token naming the claim chain.
+ * @returns the validated chain in generation order (index equals position).
+ */
+async function scanRecoveryClaimChain(
   directory: string,
-  prefix: string,
-): Promise<{ readonly index: number; readonly path: string } | undefined> {
+  operationKeyBasename: string,
+  token: string,
+): Promise<ScannedRecoveryChain> {
+  const legacyName = `${operationKeyBasename}.${token}.claim`
+  const generationPrefix = `${legacyName}.`
   let names: string[]
   try {
     names = await readdir(directory)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { claims: [] }
     throw error
   }
-  let tail: { readonly index: number; readonly path: string } | undefined
+  let legacyPath: string | undefined
+  const generations = new Map<number, string>()
   for (const name of names) {
-    if (!name.startsWith(prefix)) continue
-    const suffix = name.slice(prefix.length)
-    if (suffix.length !== RECOVERY_CLAIM_INDEX_WIDTH || !/^\d+$/.test(suffix)) continue
+    if (name === legacyName) {
+      legacyPath = join(directory, name)
+      continue
+    }
+    if (!name.startsWith(generationPrefix)) continue
+    const suffix = name.slice(generationPrefix.length)
+    if (suffix.length !== RECOVERY_CLAIM_INDEX_WIDTH || !/^\d{4}$/.test(suffix)) {
+      throw new Error(`page-app lock: unexpected claim-like file at ${join(directory, name)}; operator repair required`)
+    }
     const index = Number(suffix)
-    if (tail === undefined || index > tail.index) tail = { index, path: join(directory, name) }
+    if (index >= RECOVERY_CLAIM_MAX_GENERATIONS) {
+      throw new Error(`page-app lock: recovery claim generation out of range at ${join(directory, name)}; operator repair required`)
+    }
+    generations.set(index, join(directory, name))
   }
-  return tail
+  if (legacyPath !== undefined && generations.has(0)) {
+    throw new Error(`page-app lock: ambiguous legacy claim at ${legacyPath} alongside chain generation 0000; operator repair required`)
+  }
+  const claims: RecoveryClaimEntry[] = []
+  let expected = 0
+  if (legacyPath !== undefined) {
+    claims.push({ index: 0, path: legacyPath, pid: await readRequiredClaimantPid(legacyPath) })
+    expected = 1
+  }
+  for (const [index, path] of [...generations.entries()].sort((a, b) => a[0] - b[0])) {
+    if (index !== expected) {
+      throw new Error(`page-app lock: recovery claim chain is discontinuous at ${path}; operator repair required`)
+    }
+    claims.push({ index, path, pid: await readRequiredClaimantPid(path) })
+    expected += 1
+  }
+  return { claims }
 }
 
 /**
  * Atomically win the recovery claim for `token` — the single-winner gate of
  * the whole recovery path. Claims form an append-only successor chain
- * (`<operationKey>.<token>.claim.<generation>`): a claim is created with
- * exclusive `wx` and never deleted, moved, or replaced, so the chain only
- * grows and each generation path is claimed by at most one recoverer on every
- * platform. A recoverer walks the chain to its active tail and, when the tail
- * claimant is provably dead, creates the next generation with `wx` — the only
- * recoverer whose create succeeds becomes the sole winner; everyone else
- * observes the live tail and fails closed. A live, indeterminate, or
- * unreadable tail never authorizes a successor, and an exhausted chain (at
- * the generation cap) fails closed for operator repair. Because a successor
- * can only be created over a provably dead tail, at most one live recoverer
- * ever holds the winning claim, in the same process or across processes.
+ * (`<operationKey>.<token>.claim.<generation>`; the pre-chain fixed-path
+ * claim `<operationKey>.<token>.claim` counts as generation 0): a claim is
+ * created with exclusive `wx` and never deleted, moved, or replaced, so the
+ * chain only grows and each generation path is claimed by at most one
+ * recoverer on every platform. Every scan validates the whole chain before
+ * acting: generations must be contiguous from 0 and every claim readable (a
+ * gap, a legacy/0000 coexistence, a malformed claim-like name, an
+ * out-of-range index, or an unreadable claim fails closed), every ancestor
+ * must be provably dead, and the tail must be provably dead for a recoverer
+ * to create the next generation — so a dead high generation can never mask a
+ * live ancestor. The `wx` create is the only atomic primitive; a recoverer
+ * whose create fails EEXIST re-scans and observes the winner's live tail,
+ * failing closed, and an exhausted chain (at the generation cap) fails closed
+ * for operator repair. Because a successor can only be created over a
+ * provably dead tail of a validated chain, at most one live recoverer ever
+ * holds the winning claim, in the same process or across processes.
  * @param operationKey - the lock file path naming the claim chain.
  * @param token - the validated owner token naming the claim chain.
  */
@@ -207,17 +280,28 @@ async function acquireRecoveryClaim(operationKey: string, token: string): Promis
   const directory = dirname(operationKey)
   const prefix = `${basename(operationKey)}.${token}.claim.`
   for (;;) {
-    const tail = await findClaimChainTail(directory, prefix)
+    const chain = await scanRecoveryClaimChain(directory, basename(operationKey), token)
+    const tail = chain.claims.length === 0 ? undefined : chain.claims[chain.claims.length - 1]
+    let tailIndex = -1
     if (tail !== undefined) {
-      const claimant = await readClaimantPid(tail.path)
-      if (claimant === undefined) {
-        throw new Error(`page-app lock: recovery claim is unreadable at ${tail.path}; operator repair required`)
+      tailIndex = tail.index
+      for (const ancestor of chain.claims.slice(0, -1)) {
+        const liveness = processLiveness(ancestor.pid)
+        if (liveness === false) continue
+        if (liveness === true) {
+          throw new Error(`page-app lock: recovery claim ancestor is still alive at ${ancestor.path}; operator repair required`)
+        }
+        throw new Error(`page-app lock: cannot determine liveness of recovery claim ancestor at ${ancestor.path}`)
       }
-      if (processLiveness(claimant) !== false) {
+      const liveness = processLiveness(tail.pid)
+      if (liveness === true) {
         throw new Error('page-app lock: recovery was already claimed by another recoverer')
       }
+      if (liveness === 'indeterminate') {
+        throw new Error(`page-app lock: cannot determine liveness of recovery claimant at ${tail.path}`)
+      }
     }
-    const next = tail === undefined ? 0 : tail.index + 1
+    const next = tailIndex + 1
     if (next >= RECOVERY_CLAIM_MAX_GENERATIONS) {
       throw new Error('page-app lock: recovery claim chain is exhausted; operator repair required')
     }
@@ -228,7 +312,7 @@ async function acquireRecoveryClaim(operationKey: string, token: string): Promis
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code !== 'EEXIST') throw error
-      // A concurrent recoverer created the next generation first; re-walk.
+      // A concurrent recoverer created the next generation first; re-scan.
     }
   }
 }
@@ -252,17 +336,20 @@ async function quarantineLock(operationKey: string, token: string): Promise<void
  * name by exactly one recoverer — the winner of the exclusive recovery claim
  * chain; a simultaneous loser fails rather than proceeding. When the lock is
  * already gone but the journal survives, recovery is still owed and the same
- * claim chain is advanced (a provably dead tail is superseded by the next
- * generation, a live or unreadable tail fails closed), so exactly one caller
- * proceeds to the fresh `wx` acquisition and runs recovery in every crash
- * state. A dead `manager` lock without a journal is safe to remove because
- * the transaction protocol forbids all mutations before journal publication
- * and removes the journal only after commit. Every other case fails closed
- * for operator repair: a live pid, a mismatched token, an unreadable payload,
- * indeterminate liveness, or any dead `plugin-cli` lock (generic pnpm may
- * have stopped mid-mutation, and token-correlated quarantine recovery is
- * manager-only). The caller must win a fresh exclusive lock acquisition
- * before running recovery.
+ * claim chain is advanced: the whole chain is validated first (contiguous
+ * generations from 0, readable claims, provably dead ancestors — the legacy
+ * fixed-path claim counts as generation 0 and coexisting with `.0000` is
+ * ambiguous), then a provably dead tail is superseded by the next generation,
+ * while a live, indeterminate, or unreadable tail fails closed, so exactly
+ * one caller proceeds to the fresh `wx` acquisition and runs recovery in
+ * every crash state. A dead `manager` lock without a journal is safe to
+ * remove because the transaction protocol forbids all mutations before
+ * journal publication and removes the journal only after commit. Every other
+ * case fails closed for operator repair: a live pid, a mismatched token, an
+ * unreadable payload, indeterminate liveness, or any dead `plugin-cli` lock
+ * (generic pnpm may have stopped mid-mutation, and token-correlated
+ * quarantine recovery is manager-only). The caller must win a fresh exclusive
+ * lock acquisition before running recovery.
  * @param profileDir - absolute profile directory.
  */
 export async function recoverOrphanedPageAppLock(profileDir: string): Promise<void> {
