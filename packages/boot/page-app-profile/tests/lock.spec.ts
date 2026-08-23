@@ -19,6 +19,12 @@ const fsState = vi.hoisted(() => ({
   releaseReplacedClaimRead: () => {},
   replacedClaimReadReached: () => {},
   deadClaimantPid: undefined as number | undefined,
+  // Simulates a case-insensitive filesystem hiding claim files from the
+  // scan while the create still conflicts: readdir filters every '.claim'
+  // name out and writeFile answers EEXIST for claim paths, so the scan state
+  // stays unchanged after a failed exclusive create.
+  armHideClaimFiles: false,
+  armEexistOnClaimWrite: false,
 }))
 
 // Deterministic interleaving control for the three-recoverer test: the FIRST
@@ -50,7 +56,22 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     }
     return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
   }) as typeof actual.readFile
-  return { ...actual, readFile }
+  const readdir = (async (path: unknown, ...rest: unknown[]) => {
+    const names = await (actual.readdir as (p: unknown, ...a: unknown[]) => Promise<string[]>)(path, ...rest)
+    if (!fsState.armHideClaimFiles) return names
+    return names.filter(name => !name.includes('.claim'))
+  }) as typeof actual.readdir
+  const writeFile = (async (path: unknown, ...rest: unknown[]) => {
+    const file = String(path)
+    if (fsState.armEexistOnClaimWrite && file.includes('.claim')) {
+      // Yield to the event loop so a hypothetical infinite retry loop cannot
+      // starve the test's race timer.
+      await new Promise<void>(resolve => setImmediate(resolve))
+      throw Object.assign(new Error('EEXIST: injected claim conflict'), { code: 'EEXIST' })
+    }
+    return (actual.writeFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
+  }) as typeof actual.writeFile
+  return { ...actual, readFile, readdir, writeFile }
 })
 
 async function scratch(): Promise<string> {
@@ -117,7 +138,30 @@ afterEach(() => {
   fsState.releaseReplacedClaimRead = () => {}
   fsState.replacedClaimReadReached = () => {}
   fsState.deadClaimantPid = undefined
+  fsState.armHideClaimFiles = false
+  fsState.armEexistOnClaimWrite = false
 })
+
+/**
+ * Await `task`, rejecting with a labelled timeout error when it does not
+ * settle within `ms`. The recovery paths under test must fail closed — a
+ * promise that never settles is the infinite-retry bug this suite pins.
+ */
+async function settlesWithin<T>(task: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      task,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`operation did not settle within ${ms}ms`))
+        }, ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
 
 describe('withPageAppProfileLock', () => {
   it('creates exactly .workspace-manager/operation.lock with a complete v1 payload', async () => {
@@ -639,5 +683,89 @@ describe('recoverOrphanedPageAppLock', () => {
     expect((await readdir(paths.directory)).sort()).toEqual(['operation.lock', 'transaction.json'])
     // No claim or quarantine path escaped the manager directory.
     await expect(stat(resolve(profile, '..', 'outside-evidence'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+})
+
+describe.skipIf(process.platform !== 'win32')('case-insensitive filesystem aliases (win32)', () => {
+  // On Windows the filesystem matches names case-insensitively while the claim
+  // scan compares them case-sensitively: a claim written with a different case
+  // (e.g. by a tool that capitalized the lock name) is invisible to the scan,
+  // yet an exclusive create of the canonical name conflicts with it. Recovery
+  // must fail closed instead of retrying the same EEXIST forever.
+  it('fails closed on a case-aliased claim generation instead of retrying forever', { timeout: 20_000 }, async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    const alias = join(paths.directory, 'Operation.lock.token-x.claim.0000')
+    await writeFile(alias, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(settlesWithin(recoverOrphanedPageAppLock(profile), 3_000))
+      .rejects.toThrow(/case-aliased|unchanged|repair/i)
+    // Nothing was created or removed: the alias stays and no canonical claim
+    // generation exists.
+    expect((await readdir(paths.directory)).filter(name => name.includes('.claim')))
+      .toEqual(['Operation.lock.token-x.claim.0000'])
+  })
+
+  it('fails closed on a case-aliased legacy fixed-path claim', { timeout: 20_000 }, async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    const alias = join(paths.directory, 'Operation.lock.token-x.claim')
+    await writeFile(alias, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(settlesWithin(recoverOrphanedPageAppLock(profile), 3_000))
+      .rejects.toThrow(/case-aliased|unchanged|repair/i)
+    expect((await readdir(paths.directory)).filter(name => name.includes('.claim')))
+      .toEqual(['Operation.lock.token-x.claim'])
+  })
+
+  it('fails closed on a case-aliased lock payload naming an unsafe claim path', { timeout: 20_000 }, async () => {
+    // A dead lock whose payload token would name a claim chain that already
+    // exists under a case-aliased name: quarantine recovery must fail closed
+    // rather than spin on the claim create.
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    const dead = await deadPid()
+    await writeFile(paths.operationKey, lockPayload('manager', 'token-x', dead), { flag: 'wx', mode: 0o600 })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    await writeFile(join(paths.directory, 'Operation.lock.token-x.claim.0000'), `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    await expect(settlesWithin(recoverOrphanedPageAppLock(profile), 3_000))
+      .rejects.toThrow(/case-aliased|unchanged|repair/i)
+    expect((await readdir(paths.directory)).filter(name => name.includes('.claim')))
+      .toEqual(['Operation.lock.token-x.claim.0000'])
+    // The lock was never quarantined: the claim conflict stopped recovery.
+    await expect(stat(paths.operationKey)).resolves.toBeDefined()
+  })
+})
+
+describe('recovery claim conflicts invisible to the scan', () => {
+  // Simulates the case-insensitive filesystem behavior on every platform: the
+  // conflicting file is hidden from readdir (so the scan state never changes)
+  // while the exclusive create answers EEXIST. The acquisition loop must fail
+  // closed on the unchanged scan instead of retrying forever.
+  it('fails closed when an exclusive claim create EEXISTs with an unchanged scan', { timeout: 20_000 }, async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true, mode: 0o700 })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+
+    fsState.armHideClaimFiles = true
+    fsState.armEexistOnClaimWrite = true
+    await expect(settlesWithin(recoverOrphanedPageAppLock(profile), 3_000))
+      .rejects.toThrow(/unchanged|repair/i)
+    // No chain generation was created; the planted claim stays untouched.
+    // Disarm the readdir mask first so the assertion sees the real directory.
+    fsState.armHideClaimFiles = false
+    expect((await readdir(paths.directory)).filter(name => name.includes('.claim')))
+      .toEqual(['operation.lock.token-x.claim.0000'])
   })
 })

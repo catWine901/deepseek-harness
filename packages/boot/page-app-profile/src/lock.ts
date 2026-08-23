@@ -198,6 +198,14 @@ async function readRequiredClaimantPid(claimFile: string): Promise<number> {
  * generation sequence, or an unreadable/malformed claim — because claims are
  * immutable evidence that a confused or tampered chain must never be
  * auto-repaired around. The empty chain (no claims) is valid.
+ *
+ * On Windows the filesystem matches names case-insensitively while the scan
+ * compares them case-sensitively, so a claim written with a different case
+ * would be invisible to the exact match yet still conflict with an exclusive
+ * create of the canonical name. The scan therefore also rejects any
+ * case-aliased claim name (a name that differs from a canonical claim only by
+ * case) on win32: the alias and its canonical form are the same file there,
+ * and the canonical-exact chain semantics cannot be preserved around it.
  * @param directory - the manager directory holding the claims.
  * @param operationKeyBasename - `basename(operationKey)`, the claim prefix root.
  * @param token - the validated owner token naming the claim chain.
@@ -234,6 +242,30 @@ async function scanRecoveryClaimChain(
       throw new Error(`page-app lock: recovery claim generation out of range at ${join(directory, name)}; operator repair required`)
     }
     generations.set(index, join(directory, name))
+  }
+  // A case-aliased claim is the same file as its canonical name on Windows,
+  // so it would defeat the exact scan and make the canonical exclusive create
+  // fail EEXIST forever. Reject it as operator repair instead of guessing
+  // which spelling is authoritative.
+  if (process.platform === 'win32') {
+    const legacyLower = legacyName.toLowerCase()
+    const generationPrefixLower = generationPrefix.toLowerCase()
+    for (const name of names) {
+      // Exact matches are the canonical chain and were handled above; only a
+      // name that differs from a canonical claim by case is an alias.
+      if (name === legacyName || name.startsWith(generationPrefix)) continue
+      const lower = name.toLowerCase()
+      if (lower === legacyLower) {
+        throw new Error(`page-app lock: case-aliased legacy recovery claim at ${join(directory, name)}; operator repair required`)
+      }
+      if (!lower.startsWith(generationPrefixLower)) continue
+      const suffix = lower.slice(generationPrefixLower.length)
+      if (suffix.length === RECOVERY_CLAIM_INDEX_WIDTH
+        && /^\d{4}$/.test(suffix)
+        && Number(suffix) < RECOVERY_CLAIM_MAX_GENERATIONS) {
+        throw new Error(`page-app lock: case-aliased recovery claim at ${join(directory, name)}; operator repair required`)
+      }
+    }
   }
   if (legacyPath !== undefined && generations.has(0)) {
     throw new Error(`page-app lock: ambiguous legacy claim at ${legacyPath} alongside chain generation 0000; operator repair required`)
@@ -279,8 +311,15 @@ async function scanRecoveryClaimChain(
 async function acquireRecoveryClaim(operationKey: string, token: string): Promise<void> {
   const directory = dirname(operationKey)
   const prefix = `${basename(operationKey)}.${token}.claim.`
+  // Fingerprint of the scan that immediately preceded each failed exclusive
+  // create. An EEXIST whose re-scan is identical to the pre-create scan means
+  // the conflicting file exists but the scan cannot see it (a case-insensitive
+  // filesystem spelling the scan does not match, or an exotic concurrent
+  // create/remove): retrying would spin forever, so recovery fails closed.
+  let previousFingerprint: string | undefined
   for (;;) {
     const chain = await scanRecoveryClaimChain(directory, basename(operationKey), token)
+    const fingerprint = chain.claims.map(claim => `${claim.index}:${claim.path}:${claim.pid}`).join('|')
     const tail = chain.claims.length === 0 ? undefined : chain.claims[chain.claims.length - 1]
     let tailIndex = -1
     if (tail !== undefined) {
@@ -312,7 +351,11 @@ async function acquireRecoveryClaim(operationKey: string, token: string): Promis
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       if (code !== 'EEXIST') throw error
+      if (previousFingerprint === fingerprint) {
+        throw new Error('page-app lock: recovery claim create failed EEXIST with an unchanged scan; operator repair required')
+      }
       // A concurrent recoverer created the next generation first; re-scan.
+      previousFingerprint = fingerprint
     }
   }
 }
