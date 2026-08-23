@@ -157,14 +157,21 @@ describe('shared fetch handler dispatcher order (privileged fence first)', () =>
     const gatewayCalls: string[] = []
     const executorCalls: string[] = []
     const fallbackCalls: string[] = []
+    // A genuinely separate manager executor: the fake gateway must invoke and
+    // await this function, so an executor counter of zero independently proves
+    // the gateway never forwarded the call.
+    const executor = async (endpoint: string): Promise<{ ok: true; value: { accepted: true } }> => {
+      executorCalls.push(endpoint)
+      return { ok: true, value: { accepted: true } }
+    }
     const remove = connection.rpc.intercept('/api', (endpoint) => {
       matcherCalls.push(endpoint)
       return PAGE_APP_MANAGER_METHODS.includes(endpoint)
     }, async (endpoint) => {
-      // The Typert gateway dispatch, which forwards to the manager executor.
+      // The Typert gateway dispatch: record the gateway call, then forward to
+      // the separately counted manager executor and return its result.
       gatewayCalls.push(endpoint)
-      executorCalls.push(endpoint)
-      return { ok: true, value: { accepted: true } }
+      return executor(endpoint)
     }, { authority: 'trusted-host' })
     const fallback: FetchHandler = {
       fetch: async (received) => {
