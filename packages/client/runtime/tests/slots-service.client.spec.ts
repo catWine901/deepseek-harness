@@ -6,6 +6,7 @@
  * resolution and lifecycle on the ledger axis, and the entry-unload cascade.
  */
 import { Context } from '@deepseek-ai/cordis'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { describe, expect, it, vi } from 'vitest'
 import type { FC } from 'react'
 import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
@@ -48,6 +49,48 @@ async function boot(): Promise<Bench> {
   // plugins do not write; the accessor is the product path).
   const svc = ctx.slots
   return { ctx, svc, erased: svc as unknown as ErasedService }
+}
+
+/** One plugin body the real Loader resolves by entry name (via its internal seam). */
+interface LoaderPlugin {
+  name: string
+  inject: string[]
+  apply(ctx: Context): void | Promise<void>
+}
+
+interface LoaderBench extends Bench {
+  loader: { create(options: { name: string }): Promise<string> }
+  plugin(name: string, plugin: LoaderPlugin): void
+}
+
+/**
+ * Boot the SlotRegistry beside a REAL Loader whose internal import seam maps
+ * entry names to test plugin bodies — the same composition shape as the web
+ * shell (loader entries own real fibers with `fiber.entry`), which is what the
+ * ownerPackage derivation reads.
+ */
+async function bootWithLoader(): Promise<LoaderBench> {
+  const ctx = new Context()
+  await ctx.plugin(Loader)
+  const loader = ctx.loader as unknown as { internal: unknown }
+  const plugins = new Map<string, LoaderPlugin>()
+  loader.internal = {
+    import: async (name: string): Promise<LoaderPlugin> => {
+      const plugin = plugins.get(name)
+      if (plugin === undefined) throw new Error(`no plugin registered for loader entry ${name}`)
+      return plugin
+    },
+  }
+  const fiber = ctx.plugin(SlotRegistry)
+  await fiber
+  const svc = ctx.slots
+  return {
+    ctx,
+    svc,
+    erased: svc as unknown as ErasedService,
+    loader: loader as unknown as { create(options: { name: string }): Promise<string> },
+    plugin: (name, plugin) => { plugins.set(name, plugin) },
+  }
 }
 
 /** Engine-shaped instance stub (bare-source form: subscribe/getSnapshot + baked actions + clearPersisted). */
@@ -662,5 +705,130 @@ describe('event bridge', () => {
     }, C)
     bench.erased.register({ name: 't.rows', id: 'a' }, C)
     expect(seen).toEqual(['root', 't.rows', 't.rows'])
+  })
+})
+
+describe('immutable owner package provenance', () => {
+  /** Occupy 'root' declaring the single 't.host' child (test-body fiber, no Loader entry). */
+  function declareHost(bench: Bench): void {
+    bench.erased.register({ name: 'root', children: { 't.host': { kind: 'single', scope: 'root' } } }, C)
+  }
+
+  it('derives the normalized package name from a direct Loader entry, stripping only a trailing /client', async () => {
+    const bench = await bootWithLoader()
+    declareHost(bench)
+    bench.plugin('@deepseek-ai/dsh-client-ui-layout/client', {
+      name: 'ui-layout',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-client-ui-layout/client' })
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
+    // Provenance stays separate from the registrant diagnostics label.
+    expect(entry?.registrant).toBe('ui-layout')
+  })
+
+  it('leaves a Loader entry name without a /client suffix unchanged', async () => {
+    const bench = await bootWithLoader()
+    declareHost(bench)
+    bench.plugin('@deepseek-ai/dsh-client-runtime', {
+      name: 'runtime',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-client-runtime' })
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-client-runtime')
+  })
+
+  it('does not strip any other path segment from the entry name', async () => {
+    const bench = await bootWithLoader()
+    declareHost(bench)
+    bench.plugin('@deepseek-ai/dsh-client-ui-layout/extra', {
+      name: 'extra',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-client-ui-layout/extra' })
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout/extra')
+  })
+
+  it('inherits the parent entry owner for a child fiber of that entry', async () => {
+    const bench = await bootWithLoader()
+    declareHost(bench)
+    bench.plugin('@deepseek-ai/dsh-client-ui-layout/client', {
+      name: 'ui-layout',
+      inject: ['slots'],
+      apply: async (pluginCtx: Context) => {
+        const child = pluginCtx.plugin({
+          name: 'child-contributor',
+          inject: ['slots'],
+          apply: (childCtx: Context) => {
+            ;(childCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+          },
+        })
+        await child.await()
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-client-ui-layout/client' })
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
+  })
+
+  it('leaves ownerPackage undefined when the caller fiber has no Loader entry', async () => {
+    const bench = await boot()
+    declareHost(bench)
+    const fiber = bench.ctx.plugin({
+      name: 'plain-contributor',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await fiber.await()
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBeUndefined()
+  })
+
+  it('attributes a contribution executed by the cordis-client-runner entry to the runner package', async () => {
+    const bench = await bootWithLoader()
+    declareHost(bench)
+    bench.plugin('@deepseek-ai/dsh-cordis-client-runner', {
+      name: 'cordis-client-runner',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-cordis-client-runner' })
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-cordis-client-runner')
+  })
+
+  it('ignores a forged ownerPackage in untyped registration options', async () => {
+    const bench = await bootWithLoader()
+    declareHost(bench)
+    bench.plugin('@deepseek-ai/dsh-client-ui-layout/client', {
+      name: 'ui-layout',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register(
+          { name: 't.host', ownerPackage: '@deepseek-ai/dsh-cordis-client-runner' },
+          C,
+        )
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-client-ui-layout/client' })
+    const [entry] = bench.svc.entries('t.host')
+    // The derived caller entry wins; the option key is never read.
+    expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
   })
 })

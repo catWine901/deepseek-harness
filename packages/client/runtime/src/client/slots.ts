@@ -84,7 +84,18 @@ interface ErasedRegisterOptions {
 }
 
 /** Erased core call face (the service re-erases at its own boundary; the core's typed face targets end callers). */
-interface ErasedCore { register(options: object, component: unknown): () => void }
+interface ErasedCore {
+  register(options: object, component: unknown, ownerPackage?: string): () => void
+}
+
+/**
+ * Normalize one Loader entry name to its package name: remove only a trailing
+ * `/client`. No other path segment is stripped and no arbitrary string is
+ * rewritten — the sole normalization the provenance contract allows.
+ */
+function stripClientSuffix(name: string): string {
+  return name.endsWith('/client') ? name.slice(0, -'/client'.length) : name
+}
 
 /** One synchronous effect installed while an injected slot declaration is live. */
 type SlotInjectionEffect = (() => void) | Iterable<() => void, void, void>
@@ -113,8 +124,10 @@ export class SlotRegistry extends Service {
    * face, load-time validation, and the unload cascade). This layer adds:
    * disposal through the caller's ctx.effect (fiber unload = cascade),
    * exclusive-factory minting (`store: createXxxStore` becomes a per-entry
-   * handle), the registrant diagnostics stamp, and store-instance lifecycle
-   * on the entry axis.
+   * handle), the registrant diagnostics stamp, and the immutable ownerPackage
+   * stamp derived from the caller fiber's Loader entry — `_register` derives
+   * it, and public registration options can never carry or override it — plus
+   * store-instance lifecycle on the entry axis.
    *
    * Declared here, implemented by prototype assignment below the class: it
    * MUST stay a prototype method (never an instance arrow) — the cordis
@@ -352,13 +365,19 @@ export class SlotRegistry extends Service {
     return this._core.getVersion(key)
   }
 
-  /** Delegating registration path: factory minting + registrant stamp + core write + instance-axis bookkeeping. */
+  /** Delegating registration path: factory minting + registrant stamp + derived ownerPackage + core write + instance-axis bookkeeping. */
   private _register(options: ErasedRegisterOptions, component: unknown): () => void {
     // Exclusive stores pass the factory itself: minted here into a per-entry
     // handle so the stored entry always carries a resolvable handle (the
     // core's shared-handle scope pinning applies to it harmlessly).
     const store = typeof options.store === 'function' ? options.store() : options.store
     const registrant = options.registrant ?? (this.ctx.fiber as { name?: string } | undefined)?.name
+    // Immutable caller provenance: derived ONLY from the caller-bound fiber's
+    // Loader entry (options.ownerPackage is never read, so a forged option key
+    // cannot override it). The derived value rides the core's internal channel,
+    // separate from the public registration options.
+    const entryName = (this.ctx.fiber as { entry?: { options?: { name?: string } } } | undefined)?.entry?.options?.name
+    const ownerPackage = entryName === undefined ? undefined : stripClientSuffix(entryName)
     const erased: ErasedRegisterOptions = {
       ...options,
       ...(store !== undefined ? { store } : {}),
@@ -367,7 +386,7 @@ export class SlotRegistry extends Service {
     // Core write first: all load-time validation (undeclared target,
     // duplicate declaration, kind conflicts, cross-scope handle) throws
     // there before this layer commits anything.
-    const dispose = (this._core as unknown as ErasedCore).register(erased, component)
+    const dispose = (this._core as unknown as ErasedCore).register(erased, component, ownerPackage)
     if (store !== undefined) {
       // Register succeeded, so the target's spec is on the ledger.
       const scope = (this._core.specDynamic(options.name) as SlotSpec<SlotEntryDef>).scope

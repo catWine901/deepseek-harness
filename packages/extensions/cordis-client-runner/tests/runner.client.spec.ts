@@ -7,12 +7,20 @@
  *
  * The loader is stood in by real `ctx.plugin` fibers: entry creation must run the
  * guarded surface as a genuine plugin, or neither activation gating nor the
- * disposal cascade under test would be real.
+ * disposal cascade under test would be real. The ownerPackage provenance tests
+ * additionally boot a REAL Loader, because the derived provenance reads the
+ * caller fiber's Loader entry — the stub's fibers carry none.
  */
 /* oxlint-disable typescript/no-unsafe-assignment -- Vitest asymmetric matchers are typed as any. */
 
+/** Whether the bench mounts a real Loader (ownerPackage provenance tests). */
+interface BootOptions {
+  realLoader?: boolean
+}
+
 import { Context } from '@deepseek-ai/cordis'
-import type { Loader } from '@deepseek-ai/cordis-plugin-loader'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
+import type { Loader as LoaderService } from '@deepseek-ai/cordis-plugin-loader'
 import { describe, expect, it, vi } from 'vitest'
 import type {
   CordisDynamicPackageId, CordisDynamicPluginId, CordisDynamicPluginRunId,
@@ -81,36 +89,77 @@ function seated<T>(fiber: T): T {
   return fiber
 }
 
-async function boot(): Promise<Bench> {
+async function boot(options: BootOptions = {}): Promise<Bench> {
   const ctx = new Context()
   await ctx.plugin(SlotRegistry)
   const invalidated: string[] = []
   const removed: string[] = []
   const created: string[] = []
   const factories = new Map<string, () => unknown>()
-  const fibers = new Map<string, { fiber: unknown }>()
   let next = 0
 
   ;(globalThis as { __ModuleLoader__?: unknown }).__ModuleLoader__ = {
     load: (handoff: { id: string; factory: () => unknown }) => { factories.set(handoff.id, handoff.factory) },
   }
-  const loader = {
-    create: (options: { name: string }) => {
-      created.push(options.name)
-      const factory = factories.get(options.name)
-      if (factory === undefined) throw new Error(`no factory for ${options.name}`)
-      const entryId = `entry-${++next}`
-      fibers.set(entryId, { fiber: seated(ctx.plugin(factory() as Parameters<Context['plugin']>[0])) })
-      return Promise.resolve(entryId)
-    },
-    resolve: (entryId: string) => fibers.get(entryId) ?? { fiber: undefined },
-    remove: async (entryId: string) => {
-      removed.push(entryId)
-      const entry = fibers.get(entryId)
-      fibers.delete(entryId)
-      await (entry?.fiber as { dispose(): Promise<void> } | undefined)?.dispose()
-    },
-  } as unknown as Loader
+  let loader: LoaderService
+  if (options.realLoader === true) {
+    // The runner package's own composition shape: a REAL loader entry (whose
+    // options.name is the runner-created module id) is what the ownerPackage
+    // derivation must read off the caller fiber. Fake ids keep the existing
+    // entry-observing assertions; the fibers and their entries are real.
+    await ctx.plugin(Loader)
+    const realLoader = ctx.loader as unknown as {
+      internal: unknown
+      create(options: { name: string }): Promise<string>
+      resolve(id: string): { fiber?: unknown }
+      remove(id: string): Promise<void>
+    }
+    realLoader.internal = {
+      import: async (name: string) => {
+        const factory = factories.get(name)
+        if (factory === undefined) throw new Error(`no factory for ${name}`)
+        return factory()
+      },
+    }
+    const fakeToReal = new Map<string, string>()
+    loader = {
+      create: async (options: { name: string }) => {
+        created.push(options.name)
+        const realId = await realLoader.create(options)
+        const fakeId = `entry-${++next}`
+        fakeToReal.set(fakeId, realId)
+        return fakeId
+      },
+      resolve: (entryId: string) => {
+        const realId = fakeToReal.get(entryId)
+        return realId === undefined ? { fiber: undefined } : realLoader.resolve(realId)
+      },
+      remove: async (entryId: string) => {
+        removed.push(entryId)
+        const realId = fakeToReal.get(entryId)
+        if (realId !== undefined) await realLoader.remove(realId)
+      },
+    } as unknown as LoaderService
+  } else {
+    const fibers = new Map<string, { fiber: unknown }>()
+    loader = {
+      create: (options: { name: string }) => {
+        created.push(options.name)
+        const factory = factories.get(options.name)
+        if (factory === undefined) throw new Error(`no factory for ${options.name}`)
+        const entryId = `entry-${++next}`
+        fibers.set(entryId, { fiber: seated(ctx.plugin(factory() as Parameters<Context['plugin']>[0])) })
+        return Promise.resolve(entryId)
+      },
+      resolve: (entryId: string) => fibers.get(entryId) ?? { fiber: undefined },
+      remove: async (entryId: string) => {
+        removed.push(entryId)
+        const entry = fibers.get(entryId)
+        fibers.delete(entryId)
+        await (entry?.fiber as { dispose(): Promise<void> } | undefined)?.dispose()
+      },
+    } as unknown as LoaderService
+  }
 
   const invoke = vi.fn(() => Promise.resolve(null))
   const reported: Bench['reported'] = []
@@ -513,5 +562,43 @@ describe('render failures', () => {
     // still true of what is mounted.
     await bench.runner.load(half({ code: CONTRIBUTOR }))
     expect(bench.runner.renderFailures.getSnapshot().size).toBe(1)
+  })
+})
+
+describe('owner package provenance', () => {
+  it('attributes a contribution to the loader entry the runner created, not to the package name', async () => {
+    const bench = await boot({ realLoader: true })
+    await bench.runner.load(half({
+      code: `return {
+        inject: ['slots'],
+        apply(ctx) {
+          ctx.slots.register({ name: 'root' }, () => null)
+        },
+      }`,
+    }))
+    const [entry] = bench.slots.entries('root')
+    // The half declares name 'demo'; the derivation reads the real caller
+    // fiber's Loader entry, which the runner created as dyn/<pluginId>.
+    expect(entry?.ownerPackage).toBe('dyn/dyn-1')
+  })
+
+  it('cannot be forged by a dynamically evaluated package at the registration boundary', async () => {
+    const bench = await boot({ realLoader: true })
+    await bench.runner.load(half({
+      code: `return {
+        inject: ['slots'],
+        apply(ctx) {
+          ctx.slots.register(
+            { name: 'root', ownerPackage: '@deepseek-ai/dsh-cordis-client-runner' },
+            () => null,
+          )
+        },
+      }`,
+    }))
+    const [entry] = bench.slots.entries('root')
+    // The forged option key is never read; the derived runner-created entry
+    // provenance stands — a dynamic package cannot impersonate the runner package.
+    expect(entry?.ownerPackage).toBe('dyn/dyn-1')
+    expect(entry?.ownerPackage).not.toBe('@deepseek-ai/dsh-cordis-client-runner')
   })
 })

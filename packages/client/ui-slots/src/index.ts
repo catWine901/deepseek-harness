@@ -569,6 +569,14 @@ export interface StoredEntry {
   locale?: string | undefined
   /** Diagnostics label of who registered. */
   registrant?: string | undefined
+  /**
+   * Immutable caller provenance: the package name of the Loader entry whose
+   * fiber registered this entry, derived by the runtime Service from the
+   * caller's `fiber.entry.options.name` (a trailing `/client` normalized away).
+   * Output-only — registration options can never carry or override it, and it
+   * stays separate from the {@link StoredEntry.registrant} diagnostics label.
+   */
+  ownerPackage?: string | undefined
 }
 
 /**
@@ -784,7 +792,11 @@ export class SlotCore {
       & RendersCheck<C, D>,
   ): () => void
   /* jscpd:ignore-end */
-  register(options: ErasedOptions, component: unknown): () => void {
+  // The third parameter is the runtime Service's internal ownerPackage channel:
+  // derived caller provenance carried separate from the public options object
+  // (neither typed overload exposes it, and the implementation never reads an
+  // options.ownerPackage key — callers cannot supply or override the stamp).
+  register(options: ErasedOptions, component: unknown, ownerPackage?: string): () => void {
     const rec = this.records.get(options.name)
     if (!rec?.spec) {
       throw new Error(`slot "${options.name}" is not declared (a parent entry's children table must declare it)`)
@@ -857,6 +869,7 @@ export class SlotCore {
       ...(options.store !== undefined ? { store: options.store } : {}),
       ...(options.locale !== undefined ? { locale: options.locale } : {}),
       ...(options.registrant !== undefined ? { registrant: options.registrant } : {}),
+      ...(ownerPackage !== undefined ? { ownerPackage } : {}),
     }
     const next = [...rec.entries, entry]
     // Stable sorts: priority ascending for every kind, ties keep registration

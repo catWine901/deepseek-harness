@@ -384,3 +384,32 @@ describe('subscription API', () => {
     expect(keys).toHaveLength(1)
   })
 })
+
+describe('owner package provenance (output-only metadata)', () => {
+  it('stores no ownerPackage when the registration supplies none', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.single' }, Comp)
+    expect(core.entries('test.single')[0]?.ownerPackage).toBeUndefined()
+  })
+
+  it('rejects ownerPackage in typed public register options and ignores it at runtime', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    // ownerPackage is derived output provenance; the public options type must
+    // never carry it (compile error) and the runtime must ignore the key.
+    // @ts-expect-error ownerPackage is output-only provenance, never a public register option
+    core.register({ name: 'test.single', ownerPackage: '@deepseek-ai/dsh-forged' }, Comp)
+    expect(core.entries('test.single')[0]?.ownerPackage).toBeUndefined()
+  })
+
+  it('stamps the runtime internal metadata channel onto the stored entry', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    // The third argument is the runtime Service's internal ownerPackage channel
+    // (typed callers never reach it through the two-argument public overloads).
+    ;(core.register as (options: object, component: unknown, ownerPackage: string) => () => void)(
+      { name: 'test.single' }, Comp, '@deepseek-ai/dsh-client-ui-layout')
+    expect(core.entries('test.single')[0]?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
+  })
+})
