@@ -1078,6 +1078,74 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     ],
   },
   {
+    key: 'pageAppManager',
+    summary: 'Build the Host page-app manager service.',
+    description: 'Build the Host page-app manager service. Extends `TypertRemoteService` so the generated `pageAppManager` namespace exposes the mutation API; the read projection and staged validation are plain methods on the same service.',
+    methods: [
+      {
+        signature: '@Remote(\'list\') public list(): PageAppManagerSnapshot',
+        description: 'The full read-only projection of the managed set. The registry is the ownership authority; health is derived from current dependency, version, and runtime facts. Plugin Inventory and unrelated Loader rows never create entries.',
+        parameters: [],
+        returns: 'the immutable snapshot.',
+      },
+      {
+        signature: '@Remote(\'install\') public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<number>',
+        description: 'Install one managed package (the Remote entry of the Settings add-flow).',
+        parameters: [{ name: 'source', description: 'the validated install source.' }, { name: 'clientInstanceId', description: 'the opaque initiating client instance.' }],
+        returns: 'the committed registry revision.',
+      },
+      {
+        signature: '@Remote(\'setEnabled\') public setEnabled(pageId: string, enabled: boolean): Promise<number>',
+        description: 'Enable or disable one managed page.',
+        parameters: [{ name: 'pageId', description: 'the managed page id.' }, { name: 'enabled', description: 'the new enabled state.' }],
+        returns: 'the committed registry revision.',
+      },
+      {
+        signature: '@Remote(\'setHidden\') public setHidden(pageId: string, hidden: boolean): Promise<number>',
+        description: 'Hide or show one managed page (presentation only).',
+        parameters: [{ name: 'pageId', description: 'the managed page id.' }, { name: 'hidden', description: 'the new hidden state.' }],
+        returns: 'the committed registry revision.',
+      },
+      {
+        signature: '@Remote(\'reorder\') public reorder(pageIds: readonly string[]): Promise<number>',
+        description: 'Reorder managed pages.',
+        parameters: [{ name: 'pageIds', description: 'page ids in the desired order.' }],
+        returns: 'the committed registry revision.',
+      },
+      {
+        signature: '@Remote(\'uninstall\') public uninstall(pageId: string): Promise<number>',
+        description: 'Uninstall one managed page from the current profile.',
+        parameters: [{ name: 'pageId', description: 'the managed page id.' }],
+        returns: 'the committed registry revision.',
+      },
+      {
+        signature: '@Remote(\'ackClientActivation\') public ackClientActivation( transactionId: PageAppTransactionId, clientInstanceId: PageAppClientInstanceId, packageName: string, pageId: string, graphRevision: string, ): { accepted: boolean; reason?: string }',
+        description: 'Acknowledge a pending targeted client activation. Only the first valid acknowledgement from the initiating client instance settles the install.',
+        parameters: [{ name: 'transactionId', description: 'the transaction the acknowledgement names.' }, { name: 'clientInstanceId', description: 'the acknowledging client instance.' }, { name: 'packageName', description: 'the acknowledged package.' }, { name: 'pageId', description: 'the acknowledged page id.' }, { name: 'graphRevision', description: 'the graph revision the client converged to.' }],
+        returns: 'whether this attempt settled the transaction.',
+      },
+      {
+        signature: '@Remote(\'recover\') public recover(): Promise<{ action: string; message?: string }>',
+        description: 'Run the startup/operator recovery over the profile journal.',
+        parameters: [],
+        returns: 'the recovery outcome.',
+      },
+      {
+        signature: 'public snapshot(): PageAppManagerSnapshot',
+        description: 'The full read-only projection of the managed set (the `list` Remote delegates here; the raw method stays available to host-side consumers).',
+        parameters: [],
+        returns: 'the immutable snapshot.',
+      },
+      {
+        signature: 'public validateInstall(source: string | PageAppInstallSource): { source: PageAppInstallSource; preflight: string | null }',
+        description: 'Parse and classify one Settings add-flow source spec. Local directory sources are additionally preflighted against the on-disk package; registry, git, link, and tarball sources await the pnpm staging step (Task 8) before the full static validation runs. Never mutates ownership.',
+        parameters: [{ name: 'source', description: 'the raw specifier (or an already-typed source).' }],
+        returns: 'the validated install source plus a preflight note.',
+        throws: ['{Error} when the spec is rejected (kind grammar, credentials, relative path).'],
+      },
+    ],
+  },
+  {
     key: 'permissionPresets',
     summary: 'Owns the deployment\'s permission presets and their write path.',
     description: 'Owns the deployment\'s permission presets and their write path. Requires a confining `ctx.shell` executor and `ctx.approval`; unmatched knob values are reported as CUSTOM_PRESET, not an error.',
@@ -2622,6 +2690,22 @@ export const EVENT_API: readonly EventApiEntry[] = [
     parameters: [{ name: 'options', description: 'the full request. A LOOP-built request carries the process-local {@link markAgentLoopRequest} identity and arrives deep-frozen (mutation throws): its content is a pure function of the session log (the reconstructability Agent Note), so listeners read it, never rewrite it. Hand-built calls do not carry that marker; their messages already obey the immutable creation contract.' }],
   },
   {
+    name: 'page-app-manager/activation-requested',
+    mode: 'emit',
+    signature: '\'page-app-manager/activation-requested\'(request: PageAppActivationRequestedEvent): void',
+    summary: 'An install staged its runtime layer and now waits for the targeted client instance to acknowledge the activation.',
+    description: 'An install staged its runtime layer and now waits for the targeted client instance to acknowledge the activation.',
+    parameters: [{ name: 'request', description: 'transaction, client instance, package, page, and graph revision.' }],
+  },
+  {
+    name: 'page-app-manager/changed',
+    mode: 'emit',
+    signature: '\'page-app-manager/changed\'(revision: number): void',
+    summary: 'The manager committed a registry change (install/enable/disable/hide/ reorder/uninstall published a new revision).',
+    description: 'The manager committed a registry change (install/enable/disable/hide/ reorder/uninstall published a new revision). Consumers re-read the snapshot.',
+    parameters: [{ name: 'revision', description: 'the newly committed registry revision.' }],
+  },
+  {
     name: 'session-telemetry/record',
     mode: 'waterfall',
     signature: '\'session-telemetry/record\'(record: SessionTelemetryRecord, next: () => SessionTelemetryRecord): SessionTelemetryRecord',
@@ -3804,6 +3888,46 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'OneShotSubagentDescriptorData',
     declaration: 'export interface OneShotSubagentDescriptorData extends SubagentDescriptorBase {\n    readonly mode: \'one-shot\';\n    readonly label?: string;\n}',
+  },
+  {
+    name: 'PageAppActivationRequestedEvent',
+    declaration: 'export interface PageAppActivationRequestedEvent {\n    readonly transactionId: string;\n    readonly clientInstanceId: string;\n    readonly packageName: string;\n    readonly pageId: string;\n    readonly graphRevision: string;\n}',
+  },
+  {
+    name: 'PageAppClientInstanceId',
+    declaration: 'export type PageAppClientInstanceId = string & {\n    readonly __pageAppClientInstance: true;\n};',
+  },
+  {
+    name: 'PageAppHealth',
+    declaration: 'export type PageAppHealth = \'ready\' | \'disabled\' | \'missing-dependency\' | \'version-drift\' | \'invalid-manifest\' | \'activation-failed\' | \'externally-overridden\' | \'recovery-required\';',
+  },
+  {
+    name: 'PageAppInstallSource',
+    declaration: 'export interface PageAppInstallSource {\n    readonly kind: PageAppSourceKind;\n    readonly spec: string;\n    readonly display: PageAppRegistrySource;\n}',
+  },
+  {
+    name: 'PageAppManagerSnapshot',
+    declaration: 'export interface PageAppManagerSnapshot {\n    readonly profile: PageAppProfileIdentity;\n    readonly revision: number;\n    readonly entries: readonly PageAppView[];\n    readonly operation: PageAppOperationView | null;\n    readonly recovery: PageAppRecoveryView | null;\n}',
+  },
+  {
+    name: 'PageAppOperationView',
+    declaration: 'export interface PageAppOperationView {\n    readonly phase: PageAppJournalPhase;\n}',
+  },
+  {
+    name: 'PageAppProfileIdentity',
+    declaration: 'export interface PageAppProfileIdentity {\n    readonly name: string;\n    readonly directory: string;\n}',
+  },
+  {
+    name: 'PageAppRecoveryView',
+    declaration: 'export interface PageAppRecoveryView {\n    readonly message: string;\n}',
+  },
+  {
+    name: 'PageAppTransactionId',
+    declaration: 'export type PageAppTransactionId = string & {\n    readonly __pageAppTransaction: true;\n};',
+  },
+  {
+    name: 'PageAppView',
+    declaration: 'export interface PageAppView {\n    readonly packageName: string;\n    readonly source: PageAppRegistrySource;\n    readonly resolvedVersion: string;\n    readonly page: PageAppPageFields;\n    readonly order: number;\n    readonly enabled: boolean;\n    readonly hidden: boolean;\n    readonly installedAt: string;\n    readonly updatedAt: string;\n    readonly health: PageAppHealth;\n    readonly runtimeState?: string;\n    readonly lastError?: string;\n}',
   },
   {
     name: 'PermissionSelect',
