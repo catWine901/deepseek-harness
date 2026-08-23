@@ -1,7 +1,9 @@
 /**
  * Bare observable primitive for the page-app client controller: a stable
  * getSnapshot/subscribe pair with no React dependency. React binding arrives
- * later through the slot renderer's `inject.hooks` compartment (Task 11).
+ * through the slot renderer's `inject.hooks` compartment (Task 11), which
+ * hands the observable to uSES — the methods are arrow-class fields so they
+ * stay `this`-safe even when passed as bare references.
  * @module @deepseek-ai/dsh-client-ui-page-app-manager/client/stores
  */
 
@@ -31,15 +33,13 @@ export class MutableObservable<T> implements PageAppObservable<T> {
   constructor(private value: T) {}
 
   /** The current value (stable until set()). */
-  public getSnapshot(): T {
-    return this.value
-  }
+  public getSnapshot = (): T => this.value
 
   /**
    * Commit a new value. Notifies listeners exactly when the reference changes.
    * @param next - the new value.
    */
-  public set(next: T): void {
+  public set = (next: T): void => {
     if (next === this.value) return
     this.value = next
     for (const fn of [...this.listeners]) fn()
@@ -50,7 +50,7 @@ export class MutableObservable<T> implements PageAppObservable<T> {
    * @param fn - change callback.
    * @returns unsubscribe.
    */
-  public subscribe(fn: () => void): () => void {
+  public subscribe = (fn: () => void): () => void => {
     this.listeners.add(fn)
     return () => { this.listeners.delete(fn) }
   }

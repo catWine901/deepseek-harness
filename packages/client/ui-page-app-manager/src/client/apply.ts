@@ -1,0 +1,149 @@
+/**
+ * Workspace App shell registration: the manager owns the built-in `root` seat
+ * and declares both child seats — the built-in DSH seat (`page-app.shell.
+ * builtin`) and the keyed managed-surface seat (`page-app.shell.surface`).
+ * The controller is constructed with the real generated `pageAppManager`
+ * remote namespace, a slots-seam over the runtime ledger, a per-controller
+ * opaque `crypto.randomUUID()` client instance, and an HMR graph-convergence
+ * wait. The built-in seat never depends on remote readiness: without the
+ * remote namespace the shell still registers (the controller degrades to a
+ * read-only empty projection and DSH stays mounted), so composition ordering
+ * cannot block the Original DSH Surface.
+ * @module @deepseek-ai/dsh-client-ui-page-app-manager/client/apply
+ */
+
+import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
+import type {
+  PageAppClientInstanceId, PageAppInstallSource, PageAppManagerSnapshot,
+} from '@deepseek-ai/dsh-page-app-manager/types'
+import { PageAppController, type PageAppControllerDeps } from './controller.ts'
+import type {
+  PageAppManagerRemoteMethods, PageAppRemoteEvents, PageAppRemoteResult, PageAppSlotsSeam,
+} from './contracts.ts'
+import { PageAppShell, type PageAppShellInjected } from './PageAppShell.tsx'
+
+/** Empty remote projection when the generated namespace is not mounted yet. */
+const EMPTY_SNAPSHOT: PageAppManagerSnapshot = Object.freeze({
+  profile: Object.freeze({ name: '', directory: '' }),
+  revision: 0,
+  entries: Object.freeze([]),
+  operation: null,
+  recovery: null,
+})
+
+/** One-page result envelope for the degraded remote stub. */
+const ok = <T>(value: T): PageAppRemoteResult<T> => ({ ok: true as const, value })
+
+/** Degraded remote: read-only empty projection, no events, no mutations. */
+function stubRemote(): PageAppManagerRemoteMethods & PageAppRemoteEvents {
+  const never = (): Promise<PageAppRemoteResult<never>> => Promise.resolve(ok(undefined as never))
+  return {
+    list: () => Promise.resolve(ok(EMPTY_SNAPSHOT)),
+    install: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId) => never(),
+    setEnabled: (_pageId: string, _enabled: boolean) => never(),
+    setHidden: (_pageId: string, _hidden: boolean) => never(),
+    reorder: (_pageIds: readonly string[]) => never(),
+    uninstall: (_pageId: string) => never(),
+    ackClientActivation: () => never(),
+    recover: () => never(),
+    $on: () => () => {},
+  }
+}
+
+/** Build the real remote face when the generated namespace is mounted. */
+function buildRemote(ctx: ClientContext): PageAppManagerRemoteMethods & PageAppRemoteEvents | null {
+  const remote = ctx.get('remote')
+  const namespace = remote?.pageAppManager
+  if (namespace === undefined || remote === undefined) return null
+  return {
+    ...namespace,
+    // The flat generated method surface already matches the controller seam;
+    // only the event subscription lives on the carrier (TypertClientRemote).
+    $on: (event, listener) => remote.$on(event as never, listener as never),
+  }
+}
+
+/** The controller's slot-ledger seam over the runtime SlotRegistry. */
+function buildSlotsSeam(ctx: ClientContext): PageAppSlotsSeam {
+  const slots = ctx.slots as {
+    entries(key: string): readonly StoredEntry[]
+    subscribe(key: string, fn: () => void): () => void
+  }
+  return {
+    entries: key => slots.entries(key),
+    subscribe: (key, fn) => slots.subscribe(key, fn),
+    // The runtime emits `slots/changed` on every ledger mutation (its
+    // SlotCore onMutate forwarding), which is the same signal the controller
+    // rebuilds on.
+    onMutate: fn => ctx.on('slots/changed', fn),
+  }
+}
+
+/** Wait for the client graph to converge to a new revision (HMR reconcile). */
+function buildGraphWait(ctx: ClientContext): (graphRevision: string) => Promise<void> {
+  const modules = ctx.get('modules') as { manifest: { rev: string } } | undefined
+  return (graphRevision: string) => new Promise<void>((resolve) => {
+    if (modules === undefined || modules.manifest.rev === graphRevision) {
+      resolve()
+      return
+    }
+    const baseline = modules.manifest.rev
+    const started = Date.now()
+    const timer = setInterval(() => {
+      if (modules.manifest.rev !== baseline || modules.manifest.rev === graphRevision || Date.now() - started > 30_000) {
+        clearInterval(timer)
+        resolve()
+      }
+    }, 100)
+  })
+}
+
+/** Build the controller, degrading gracefully when the remote is not mounted. */
+function createController(ctx: ClientContext): PageAppController {
+  const remote = buildRemote(ctx)
+  const deps: PageAppControllerDeps = {
+    remote: remote ?? stubRemote(),
+    slots: buildSlotsSeam(ctx),
+    clientInstanceId: crypto.randomUUID() as PageAppClientInstanceId,
+    awaitGraphRevision: buildGraphWait(ctx),
+  }
+  return new PageAppController(deps)
+}
+
+/** The shell's inject face: the controller observable as a hook plus select. */
+function shellInjected(controller: PageAppController): PageAppShellInjected {
+  return {
+    hooks: { pageApp: controller.observable },
+    select: (pageId) => { controller.select(pageId) },
+  }
+}
+
+/** Required services: the slot registry (remote/modules are read defensively). */
+export const inject = ['slots']
+
+/**
+ * Register the Workspace App shell into the built-in `root` seat and declare
+ * both child seats. The controller starts with the registration and stops with
+ * its fiber; the built-in DSH seat mounts immediately regardless of remote
+ * readiness (spec §3 guarantees the permanent fallback surface).
+ * @param ctx - client root context.
+ */
+export function apply(ctx: ClientContext): void {
+  const controller = createController(ctx)
+  ctx.effect(() => {
+    const stopController = controller.start()
+    const disposeRegistration = ctx.slots.register({
+      name: 'root',
+      children: {
+        'page-app.shell.builtin': { kind: 'single', scope: 'root' },
+        'page-app.shell.surface': { kind: 'keyed', scope: 'root' },
+      },
+      inject: () => shellInjected(controller),
+    }, PageAppShell)
+    return () => {
+      disposeRegistration()
+      stopController()
+    }
+  }, 'ui-page-app-manager: shell + seats')
+}

@@ -1,14 +1,14 @@
 /**
- * Three-column shell frame, registered into the built-in 'root' slot (the web
- * shell renders only 'root'). Owns the grid tracks (sidebar | center |
- * details), the drag handles (pointer capture + rAF throttle), the concession
- * chain (columns.ts), and the child-slot render decisions: the sidebar slot
- * renders HERE with live parameters from the concession solve, and the
- * session-aware occupants render in fixed column positions; strict entries
- * gate themselves on current-session availability while session-maybe
- * entries retain identity. Pure component: everything arrives
- * through the three framework shares — zero cordis or framework imports,
- * zero self-made hooks.
+ * Three-column shell frame, registered into the page-app shell's built-in DSH
+ * seat ('page-app.shell.builtin'; the page-app manager owns the outer 'root'
+ * seat). Owns the grid tracks (sidebar | center | details), the drag handles
+ * (pointer capture + rAF throttle), the concession chain (columns.ts), and the
+ * child-slot render decisions: the sidebar slot renders HERE with live
+ * parameters from the concession solve, and the session-aware occupants
+ * render in fixed column positions; strict entries gate themselves on
+ * current-session availability while session-maybe entries retain identity.
+ * Pure component: everything arrives through the three framework shares —
+ * zero cordis or framework imports, zero self-made hooks.
  */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -19,7 +19,7 @@ import css from './AppFrame.module.css'
 
 /** Full composed props: runtime share + child-slot render share + store share. */
 export type AppFrameProps =
-  & PropsRuntime<'root'>
+  & PropsRuntime<'page-app.shell.builtin'>
   & PropsRenderSlots<'sidebar' | 'conversation' | 'details' | 'shell.overlay'>
   & PropsStore<ReturnType<typeof createLayoutStore>>
 

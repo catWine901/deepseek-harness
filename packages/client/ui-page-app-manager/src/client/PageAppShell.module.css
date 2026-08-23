@@ -1,0 +1,31 @@
+/* Workspace App shell: permanent rail + surface host (workspace-sidebar | surface-host). */
+.shell {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-base);
+}
+
+/* Surface Host: DSH always mounted, managed pages stack in paint order. */
+.host {
+  position: relative;
+  min-width: 0;
+  display: grid;
+  grid-template-rows: 100%;
+  overflow: hidden;
+}
+
+/* One keep-mounted surface frame; hidden toggles visibility only. */
+.surface {
+  grid-row: 1;
+  grid-column: 1;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.surface[hidden] {
+  display: none;
+}

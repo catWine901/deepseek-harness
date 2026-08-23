@@ -1,14 +1,21 @@
 /**
- * Layout plugin, browser half: one register() call contributes AppFrame into
- * the runtime's built-in 'root' slot and, in the same breath, declares the
- * four child slots (declaration = exclusive render authority), seats the
- * layout store (panel geometry), and wires the panel-action service face.
- * ctx.layout is the cross-plugin panel-action contract; navigation state lives
- * with the runtime sessions service. A second effect seats the theme
- * presenter, which projects ctx.theme snapshots onto document.body.
+ * Layout plugin, browser half: one inject()+register() pair contributes
+ * AppFrame into the page-app shell's built-in DSH seat
+ * ('page-app.shell.builtin') and, in the same breath, declares the four child
+ * slots (declaration = exclusive render authority), seats the layout store
+ * (panel geometry), and wires the panel-action service face. The page-app
+ * manager owns the outer `root` seat; this package is the Original DSH
+ * Surface occupant inside it. ctx.layout is the cross-plugin panel-action
+ * contract; navigation state lives with the runtime sessions service. A
+ * second effect seats the theme presenter, which projects ctx.theme
+ * snapshots onto document.body.
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-theme/client'
+// Type-only: pulls the page-app shell's SlotMap merge (the
+// 'page-app.shell.builtin' entry) into this program, so the DSH surface
+// registers into the manager-declared seat instead of the runtime root.
+import type {} from '@deepseek-ai/dsh-client-ui-page-app-manager/client'
 import type { PanelActions } from './service.ts'
 import { AppFrame } from './AppFrame.tsx'
 import { createLayoutStore } from './stores.ts'
@@ -32,10 +39,10 @@ declare module '@deepseek-ai/cordis' {
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface SlotMap {
-    // The 'root' entry itself is the runtime's built-in slot (declared
-    // there); these four are the frame's children, declared by the same
-    // register() call that contributes AppFrame. Session owners never pass
-    // sessionId: the framework injects it as a standard prop.
+    // The 'page-app.shell.builtin' entry itself is the page-app shell's
+    // built-in DSH seat (declared there); these four are the frame's children,
+    // declared by the same register() call that contributes AppFrame. Session
+    // owners never pass sessionId: the framework injects it as a standard prop.
     /**
      * The whole left column. OCCUPIED by ui-sidebar's SidebarRoot, which
      * declares the workspace and settings seats inside it — registering here
@@ -108,17 +115,20 @@ export interface DetailsOwnerProps {}
 export const inject = ['slots', 'theme']
 
 /**
- * Client plugin body: provide ctx.layout, then one register() call — AppFrame
- * into 'root' with the four child-slot declarations, the layout store seat,
- * and the inject hook that hands the store's bound actions to the service.
+ * Client plugin body: provide ctx.layout, then one inject()+register() pair —
+ * AppFrame into 'page-app.shell.builtin' with the four child-slot
+ * declarations, the layout store seat, and the inject hook that hands the
+ * store's bound actions to the service. `slots.inject` runs the registration
+ * once the page-app shell declares the builtin seat, so composition order
+ * between the manager and this package is unconstrained.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
   const layout = new LayoutController()
   ctx.effect(() => {
     const disposeService = ctx.reflect.provide('layout', layout)
-    const disposeRegistration = ctx.slots.register({
-      name: 'root',
+    const disposeRegistration = ctx.slots.inject('page-app.shell.builtin', () => ctx.slots.register({
+      name: 'page-app.shell.builtin',
       children: {
         'sidebar': { kind: 'single', scope: 'root' },
         'conversation': { kind: 'single', scope: 'session-maybe' },
@@ -134,13 +144,13 @@ export function apply(ctx: ClientContext): void {
         layout.attachPanels(actions)
         return {}
       },
-    }, AppFrame)
+    }, AppFrame))
     return () => {
       disposeRegistration()
       // provide()'s disposer settles asynchronously; teardown is synchronous fire-and-forget.
       void disposeService()
     }
-  }, 'ui-layout: service + root registration')
+  }, 'ui-layout: service + builtin registration')
 
   // Theme presentation: pure DOM writes from resolved snapshots — initial
   // state through the getter once, then event-driven only; no React path.

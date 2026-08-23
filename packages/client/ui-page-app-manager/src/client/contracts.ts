@@ -77,3 +77,32 @@ export const PAGE_APP_SURFACE_SLOT = 'page-app.shell.surface'
 
 /** The built-in DSH page id (shell-owned fallback surface; never a registry row). */
 export const PAGE_APP_DSH_PAGE = 'dsh'
+
+/** Owner share of the built-in DSH seat (the shell supplies nothing). */
+export interface PageAppBuiltinOwner {
+  /** Marker field: builtin owner props are intentionally empty. */
+  children?: never
+}
+
+/** Owner share of one managed surface (the shell supplies nothing). */
+export interface PageAppSurfaceOwner {
+  /** Marker field: surface owner props are intentionally empty. */
+  children?: never
+}
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface SlotMap {
+    /**
+     * The built-in Original DSH seat: the one permanent system surface that
+     * the shell mounts unconditionally and hides (never unmounts) while a
+     * managed surface is active. OCCUPIED by ui-layout's AppFrame.
+     */
+    'page-app.shell.builtin': { kind: 'single'; scope: 'root'; owner: PageAppBuiltinOwner }
+    /**
+     * One full-page managed surface per keyed page id. OCCUPIED by managed
+     * packages after runtime activation; the closed authorization projection
+     * (spec §7) keeps unrelated contributions invisible.
+     */
+    'page-app.shell.surface': { kind: 'keyed'; scope: 'root'; owner: PageAppSurfaceOwner; key: string }
+  }
+}

@@ -40,31 +40,44 @@ describe('ui-layout client apply', () => {
     expect(inject).toEqual(['slots', 'theme'])
   })
 
-  it('provides ctx.layout and registers AppFrame into root with the three child declarations', async () => {
+  /** The page-app shell (manager) owns 'root' and declares the builtin seat. */
+  function declareBuiltinSeat(slots: SlotRegistry): () => void {
+    return slots.register({
+      name: 'root',
+      children: { 'page-app.shell.builtin': { kind: 'single', scope: 'root' } },
+    } as never, () => null)
+  }
+
+  it('provides ctx.layout and registers AppFrame into the builtin seat with the four child declarations', async () => {
     const { ctx, slots } = await bench()
+    const shell = declareBuiltinSeat(slots)
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     expect(ctx.get('layout')).toBeInstanceOf(LayoutController)
-    // The one register() call occupied 'root'…
-    expect(slots.entries('root')).toHaveLength(1)
-    // …and declared the three children in the ledger.
+    // The inject()+register() pair occupied the builtin seat…
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    // …and declared the four children in the ledger.
     expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
     expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
     expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    shell()
   })
 
   it('injects no business face and attaches the layout actions', async () => {
     const { ctx, slots } = await bench()
+    const shell = declareBuiltinSeat(slots)
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     const actions = {
       setSidebar: vi.fn(), setDetails: vi.fn(), toggleSidebar: vi.fn(), openDetails: vi.fn(), closeDetails: vi.fn(),
     }
-    const injected = (slots.entries('root')[0]!.inject as (actions: never) => object)(actions as never)
+    const injected = (slots.entries('page-app.shell.builtin')[0]!.inject as (actions: never) => object)(actions as never)
     expect(injected).toEqual({})
     const layout = ctx.get('layout') as LayoutController
     layout.toggleSidebar()
     expect(actions.toggleSidebar).toHaveBeenCalledOnce()
+    shell()
   })
 
   it('theme presenter applies the initial snapshot, follows theme/change, and unwinds on dispose', async () => {
@@ -92,16 +105,18 @@ describe('ui-layout client apply', () => {
     expect(document.body.hasAttribute('data-ds-dark-theme')).toBe(false)
   })
 
-  it('teardown unwinds the service, the root registration, and the child declarations', async () => {
+  it('teardown unwinds the service, the builtin registration, and the child declarations', async () => {
     const { ctx, slots } = await bench()
+    const shell = declareBuiltinSeat(slots)
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     await fiber.dispose()
     expect(ctx.get('layout')).toBeUndefined()
-    expect(slots.entries('root')).toHaveLength(0)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
     expect(slots.spec('sidebar')).toBeUndefined()
-    // The built-in root declaration survives entry teardown (runtime-owned).
-    expect(slots.spec('root')).toEqual({ kind: 'single', scope: 'root' })
+    // The page-app shell's builtin declaration survives entry teardown.
+    expect(slots.spec('page-app.shell.builtin')).toEqual({ kind: 'single', scope: 'root' })
+    shell()
   })
 })
 

@@ -1,0 +1,44 @@
+/* Permanent far-left Workspace App rail. */
+.rail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 200px;
+  padding: 8px;
+  overflow-y: auto;
+  background: var(--dsw-specific-sidebar-fill);
+  border-right: 1px solid var(--dsw-alias-border-l1);
+}
+
+.item {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 8px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-brand-text);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.item:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.item[data-page-app-rail-active='true'] {
+  background: var(--dsw-alias-interactive-bg-active);
+}
+
+.item:focus-visible {
+  outline: 2px solid var(--dsw-alias-interactive-bg-active);
+  outline-offset: 1px;
+}
+
+.itemLabel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
