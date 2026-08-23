@@ -16,7 +16,7 @@
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
-      "default": "./lib/types/index.js"
+      "default": "./lib/index.js"
     },
     "./types": {
       "types": "./lib/types/types.d.ts",
@@ -32,12 +32,14 @@
     },
     "./invariant": {
       "types": "./lib/types/invariant.d.ts",
-      "default": "./lib/types/invariant.js"
+      "default": "./lib/invariant.js"
     },
     "./src/*": "./src/*",
     "./package.json": "./package.json"
   },
   "files": [
+    "lib/index.js",
+    "lib/invariant.js",
     "lib/types/**/*.js",
     "lib/types/**/*.d.ts",
     "lib/typert.host.js",
