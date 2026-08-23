@@ -1,0 +1,201 @@
+/**
+ * Host manager projection: the registry is the sole ownership source, health
+ * derives from current dependency/version/runtime facts, and unrelated Loader
+ * rows or Plugin Inventory entries never create rows. Corrupt registry and
+ * in-flight journal states surface through recovery/operation views.
+ */
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
+import { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { PageAppManager } from '../src/index.ts'
+
+const PKG = '@fixture/managed-workspace'
+const ROOT_ID = 'workspace.managed'
+
+let dir: string
+
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'dsh-page-app-manager-')) })
+afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+interface LoaderRow {
+  id: string
+  name: string
+  fiberState?: number
+  config?: Record<string, unknown>
+}
+
+function writeManagerDir(registry: unknown): void {
+  mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
+  writeFileSync(join(dir, '.workspace-manager', 'registry.json'), JSON.stringify(registry))
+}
+
+/** One fake loader entry: the manager reads options.id/name and fiber.state. */
+function loaderEntry(row: LoaderRow): { options: Record<string, unknown>; fiber: { state?: number } | undefined } {
+  return {
+    options: {
+      id: row.id,
+      name: row.name,
+      ...row.config === undefined ? {} : { config: row.config },
+    },
+    fiber: row.fiberState === undefined ? undefined : { state: row.fiberState },
+  }
+}
+
+function writeRegistryRow(overrides: Record<string, unknown> = {}): unknown {
+  return {
+    schemaVersion: 1,
+    revision: 3,
+    entries: [{
+      packageName: PKG,
+      source: { kind: 'registry', display: PKG },
+      resolvedVersion: '1.0.0',
+      page: { id: 'workspace.managed', name: 'Managed', description: 'd', defaultOrder: 100, rootEntryId: ROOT_ID },
+      order: 100,
+      enabled: true,
+      hidden: false,
+      installedAt: '2026-08-01T00:00:00.000Z',
+      updatedAt: '2026-08-01T00:00:00.000Z',
+      ...overrides,
+    }],
+  }
+}
+
+function writeInstalledPackage(version = '1.0.0', insertRows: unknown[] = [
+  { id: ROOT_ID, name: `${PKG}/client` },
+  { id: 'fixture-client-row', name: PKG },
+]): void {
+  const pkgDir = join(dir, 'node_modules', ...PKG.split('/'))
+  mkdirSync(join(pkgDir, 'lib'), { recursive: true })
+  writeFileSync(join(pkgDir, 'cordis.patch.yml'), JSON.stringify([{ insert: insertRows }]))
+  writeFileSync(join(pkgDir, 'lib', 'client.js'), 'module.exports = {}\n')
+  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({
+    name: PKG,
+    version,
+    exports: { './client': './lib/client.js' },
+    dsh: {
+      bundle: { patch: './cordis.patch.yml' },
+      workspace: {
+        schemaVersion: 1, id: 'workspace.managed', name: 'Managed', description: 'd', defaultOrder: 100, rootEntryId: ROOT_ID,
+      },
+      client: { platform: 'web' },
+    },
+  }))
+}
+
+function buildManager(options: { registry?: unknown; loaderRows?: LoaderRow[]; journal?: unknown }): {
+  ctx: Context
+  manager: PageAppManager
+} {
+  if (options.registry !== undefined) writeManagerDir(options.registry)
+  if (options.journal !== undefined) {
+    mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
+    writeFileSync(join(dir, '.workspace-manager', 'transaction.json'), JSON.stringify(options.journal))
+  }
+  const ctx = new Context()
+  const runtime = new ProfileRuntime(ctx, {
+    identity: { name: 'fixture-profile', directory: dir },
+    compose: patches => patches,
+    initialManagerPatches: [],
+  })
+  ctx.reflect.provide('loader', {
+    *entries(): Generator<{ options: Record<string, unknown>; fiber: { state?: number } | undefined }> {
+      for (const row of options.loaderRows ?? []) yield loaderEntry(row)
+    },
+  })
+  const manager = new PageAppManager(ctx, { profileRuntime: runtime })
+  return { ctx, manager }
+}
+
+describe('manager snapshot', () => {
+  it('projects an empty set when no registry has been published', () => {
+    const { manager } = buildManager({})
+    const snapshot = manager.snapshot()
+    expect(snapshot.profile).toEqual({ name: 'fixture-profile', directory: dir })
+    expect(snapshot.revision).toBe(0)
+    expect(snapshot.entries).toEqual([])
+    expect(snapshot.operation).toBeNull()
+    expect(snapshot.recovery).toBeNull()
+  })
+
+  it('treats the registry as the sole ownership source: unrelated Loader rows never create entries', () => {
+    writeInstalledPackage()
+    const { manager } = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [
+        { id: 'unrelated-1', name: '@deepseek-ai/dsh-client-ui-layout', fiberState: 2 },
+        { id: 'unrelated-2', name: '@deepseek-ai/dsh-client-connection', fiberState: 2 },
+      ],
+    })
+    const snapshot = manager.snapshot()
+    expect(snapshot.entries).toHaveLength(1)
+    expect(snapshot.entries[0]?.packageName).toBe(PKG)
+  })
+
+  it('derives ready when the installed package and runtime root match the committed row', () => {
+    writeInstalledPackage()
+    const { manager } = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ id: ROOT_ID, name: `${PKG}/client`, fiberState: 2 }],
+    })
+    expect(manager.snapshot().entries[0]?.health).toBe('ready')
+  })
+
+  it('derives disabled for a row that is not enabled', () => {
+    const { manager } = buildManager({ registry: writeRegistryRow({ enabled: false }) })
+    expect(manager.snapshot().entries[0]?.health).toBe('disabled')
+  })
+
+  it('derives missing-dependency when the package is not installed', () => {
+    const { manager } = buildManager({ registry: writeRegistryRow() })
+    expect(manager.snapshot().entries[0]?.health).toBe('missing-dependency')
+  })
+
+  it('derives version-drift when the installed version differs from the committed one', () => {
+    writeInstalledPackage('2.0.0')
+    const { manager } = buildManager({ registry: writeRegistryRow() })
+    expect(manager.snapshot().entries[0]?.health).toBe('version-drift')
+  })
+
+  it('derives invalid-manifest when the installed package violates the contract', () => {
+    writeInstalledPackage('1.0.0', [{ id: 'wrong-root', name: `${PKG}/client` }])
+    const { manager } = buildManager({ registry: writeRegistryRow() })
+    expect(manager.snapshot().entries[0]?.health).toBe('invalid-manifest')
+  })
+
+  it('derives activation-failed when the runtime root is absent or fiberless', () => {
+    writeInstalledPackage()
+    const { manager } = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ id: 'some-other-id', name: `${PKG}/client`, fiberState: 2 }],
+    })
+    expect(manager.snapshot().entries[0]?.health).toBe('activation-failed')
+  })
+
+  it('derives externally-overridden when a user patch changes the managed root', () => {
+    writeInstalledPackage()
+    const { manager } = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ id: ROOT_ID, name: `${PKG}/client`, fiberState: 2, config: { enabled: false } }],
+    })
+    expect(manager.snapshot().entries[0]?.health).toBe('externally-overridden')
+  })
+
+  it('exposes a recovery view when the registry is corrupt', () => {
+    const { manager } = buildManager({ registry: { schemaVersion: 99 } })
+    const snapshot = manager.snapshot()
+    expect(snapshot.entries).toEqual([])
+    expect(snapshot.recovery?.message).toMatch(/registry is corrupt/)
+  })
+
+  it('exposes the durable journal phase as the in-flight operation', () => {
+    writeInstalledPackage()
+    const { manager } = buildManager({
+      registry: writeRegistryRow(),
+      journal: { schemaVersion: 1, phase: 'staged', lockOwnerToken: 'token-1', files: {} },
+    })
+    expect(manager.snapshot().operation).toEqual({ phase: 'staged' })
+  })
+})
