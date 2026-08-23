@@ -11,28 +11,46 @@ const fsState = vi.hoisted(() => ({
   armPauseOnClaimRead: false,
   releaseClaimRead: () => {},
   claimReadReached: () => {},
+  // Pauses the first read of a claim that was moved into a tombstone whose
+  // content no longer matches the dead claimant the mover inspected — the
+  // stale mover's verify read, which the pre-chain implementation performs
+  // after it renamed a replaced live claim away.
+  armPauseOnTombMismatch: false,
+  releaseReplacedClaimRead: () => {},
+  replacedClaimReadReached: () => {},
+  deadClaimantPid: undefined as number | undefined,
 }))
 
-// Deterministic interleaving control for the stale-claim ABA test: the FIRST
+// Deterministic interleaving control for the three-recoverer test: the FIRST
 // recovery claim-file read after arming captures the current content and
-// blocks until the test releases it, letting a concurrent recoverer finish a
-// full takeover before the paused reader acts on its stale read.
+// blocks until the test releases it, letting concurrent recoverers finish a
+// full takeover before the paused reader acts on its stale read. A second
+// hook pauses the stale mover's verify read of a tombstone whose content no
+// longer matches the dead claimant it inspected, so the test can insert a
+// third recoverer into the replacement window.
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return {
-    ...actual,
-    readFile: (async (path: unknown, ...rest: unknown[]) => {
-      const file = String(path)
-      if (file.endsWith('.claim') && fsState.armPauseOnClaimRead) {
-        fsState.armPauseOnClaimRead = false
-        const content = String(await (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest))
-        fsState.claimReadReached()
-        await new Promise<void>((resolveGate) => { fsState.releaseClaimRead = resolveGate })
-        return content
+  const readFile = (async (path: unknown, ...rest: unknown[]) => {
+    const file = String(path)
+    if (file.includes('.claim') && fsState.armPauseOnClaimRead) {
+      fsState.armPauseOnClaimRead = false
+      const content = String(await (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest))
+      fsState.claimReadReached()
+      await new Promise<void>((resolveGate) => { fsState.releaseClaimRead = resolveGate })
+      return content
+    }
+    if (file.includes('.tomb') && fsState.armPauseOnTombMismatch && fsState.deadClaimantPid !== undefined) {
+      const content = String(await (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest))
+      if (content.trim() !== String(fsState.deadClaimantPid)) {
+        fsState.armPauseOnTombMismatch = false
+        fsState.replacedClaimReadReached()
+        await new Promise<void>((resolveGate) => { fsState.releaseReplacedClaimRead = resolveGate })
       }
-      return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
-    }) as typeof actual.readFile,
-  }
+      return content
+    }
+    return (actual.readFile as (p: unknown, ...a: unknown[]) => Promise<unknown>)(path, ...rest)
+  }) as typeof actual.readFile
+  return { ...actual, readFile }
 })
 
 async function scratch(): Promise<string> {
@@ -95,6 +113,10 @@ afterEach(() => {
   fsState.armPauseOnClaimRead = false
   fsState.releaseClaimRead = () => {}
   fsState.claimReadReached = () => {}
+  fsState.armPauseOnTombMismatch = false
+  fsState.releaseReplacedClaimRead = () => {}
+  fsState.replacedClaimReadReached = () => {}
+  fsState.deadClaimantPid = undefined
 })
 
 describe('withPageAppProfileLock', () => {
@@ -163,7 +185,7 @@ describe('recoverOrphanedPageAppLock', () => {
     await recoverOrphanedPageAppLock(profile)
 
     expect((await readdir(paths.directory)).sort())
-      .toEqual(['operation.lock.token-x.claim', 'operation.lock.token-x.quarantine', 'transaction.json'])
+      .toEqual(['operation.lock.token-x.claim.0000', 'operation.lock.token-x.quarantine', 'transaction.json'])
     await expect(stat(paths.operationKey)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
@@ -313,7 +335,7 @@ describe('recoverOrphanedPageAppLock', () => {
     const paths = resolvePageAppProfilePaths(profile)
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
-    await writeFile(`${paths.operationKey}.token-x.claim`, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${process.pid}\n`, { flag: 'wx', mode: 0o600 })
 
     await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/already claimed|recoverer/i)
   })
@@ -324,9 +346,11 @@ describe('recoverOrphanedPageAppLock', () => {
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
     const dead = await deadPid()
-    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
 
     await expect(recoverOrphanedPageAppLock(profile)).resolves.toBeUndefined()
+    // The provably dead tail was superseded by exactly one live successor.
+    expect(await readFile(`${paths.operationKey}.token-x.claim.0001`, 'utf8')).toBe(`${process.pid}\n`)
   })
 
   it('atomically takes over a stale claim: with a missing lock and live journal, exactly one recoverer runs recovery', async () => {
@@ -335,7 +359,7 @@ describe('recoverOrphanedPageAppLock', () => {
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
     const dead = await deadPid()
-    await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
 
     const callbackRuns = { count: 0 }
     const recover = recoveryAttempt(profile, callbackRuns)
@@ -346,7 +370,7 @@ describe('recoverOrphanedPageAppLock', () => {
     expect(results.filter(result => result.status === 'rejected')).toHaveLength(1)
     expect(callbackRuns.count).toBe(1)
     // The take-over claim now records this process as the live recoverer.
-    expect(await readFile(`${paths.operationKey}.token-x.claim`, 'utf8')).toBe(`${process.pid}\n`)
+    expect(await readFile(`${paths.operationKey}.token-x.claim.0001`, 'utf8')).toBe(`${process.pid}\n`)
   })
 
   it('atomically claims recovery when no claim exists but the journal survives', async () => {
@@ -365,35 +389,81 @@ describe('recoverOrphanedPageAppLock', () => {
     expect(callbackRuns.count).toBe(1)
   })
 
-  it('never deletes a replaced live claim: a stale dead-claim read cannot take over (ABA)', async () => {
+  it('lets at most one of three recoverers win when a stale mover replaces a live claim (A/B/C)', async () => {
     const profile = await scratch()
     const paths = resolvePageAppProfilePaths(profile)
     await mkdir(paths.directory, { recursive: true })
     await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
     const dead = await deadPid()
+    // The legacy fixed-path claim (honored by pre-chain rounds) and the
+    // chain's first generation both record the same dead claimant, so this
+    // test runs deterministically RED on the pre-chain implementation (B
+    // moves A's live claim away, C creates into the empty fixed path, and A
+    // and C both win) and GREEN on the append-only chain.
     await writeFile(`${paths.operationKey}.token-x.claim`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+    await writeFile(`${paths.operationKey}.token-x.claim.0000`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
 
-    // Deterministic interleaving: stale reader B reads the dead claim and is
-    // paused there; A then completes a full takeover, replacing the dead claim
-    // with a live claim at the same path. When B resumes with its stale read,
-    // it must fail closed and must not delete A's live claim.
-    const bRuns = { count: 0 }
-    const reached = new Promise<void>((resolveReached) => { fsState.claimReadReached = resolveReached })
+    fsState.deadClaimantPid = dead
     fsState.armPauseOnClaimRead = true
+    fsState.armPauseOnTombMismatch = true
+
+    // B stale-reads the dead claimant and pauses before acting on it.
+    const bRuns = { count: 0 }
+    const bReached = new Promise<void>((resolveReached) => { fsState.claimReadReached = resolveReached })
     const bPromise = recoveryAttempt(profile, bRuns)()
-    await reached
+    await bReached
 
+    // A completes a full takeover and wins the recovery.
     const aRuns = { count: 0 }
-    await recoveryAttempt(profile, aRuns)()
+    const aPromise = recoveryAttempt(profile, aRuns)()
+    await aPromise
 
+    // B resumes; on the pre-chain implementation it moves A's live claim to
+    // its tombstone and pauses at the verify read, leaving the fixed claim
+    // path empty for C. On the chain, B's successor create fails EEXIST and B
+    // fails closed without ever pausing.
     fsState.releaseClaimRead()
-    await expect(bPromise).rejects.toThrow(/already claimed|recoverer/i)
+    const bMoved = new Promise<void>((resolveReached) => { fsState.replacedClaimReadReached = resolveReached })
+    const bSettled = bPromise.then(
+      () => 'settled',
+      () => 'settled',
+    )
+    await Promise.race([bMoved, bSettled])
 
-    expect(aRuns.count).toBe(1)
-    expect(bRuns.count).toBe(0)
-    // A's live claim survived B's stale takeover attempt, and no tombstone lingers.
-    expect(await readFile(`${paths.operationKey}.token-x.claim`, 'utf8')).toBe(`${process.pid}\n`)
+    // C attempts recovery inside B's replacement window and runs to
+    // completion while B stays paused, so C's claim create lands before B can
+    // restore anything. B only resumes after C settles.
+    const cRuns = { count: 0 }
+    const cPromise = recoveryAttempt(profile, cRuns)()
+    await cPromise.then(
+      () => undefined,
+      () => undefined,
+    )
+
+    fsState.releaseReplacedClaimRead()
+    const results = await Promise.allSettled([aPromise, bPromise, cPromise])
+
+    // Exactly one recoverer wins: A. B and C fail closed instead of both
+    // proceeding with A, so no two recoverers ever return success together.
+    expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+    expect(results.filter(result => result.status === 'rejected')).toHaveLength(2)
+    expect(aRuns.count + bRuns.count + cRuns.count).toBe(1)
+    // The chain advanced exactly one generation past the planted dead claim.
+    expect(await readFile(`${paths.operationKey}.token-x.claim.0001`, 'utf8')).toBe(`${process.pid}\n`)
     expect((await readdir(paths.directory)).filter(name => name.endsWith('.tomb'))).toEqual([])
+  })
+
+  it('fails closed when the recovery claim chain reaches its generation cap', async () => {
+    const profile = await scratch()
+    const paths = resolvePageAppProfilePaths(profile)
+    await mkdir(paths.directory, { recursive: true })
+    await writeFile(paths.journal, journal('token-x'), { flag: 'wx', mode: 0o600 })
+    const dead = await deadPid()
+    for (let index = 0; index < 64; index += 1) {
+      await writeFile(`${paths.operationKey}.token-x.claim.${String(index).padStart(4, '0')}`, `${dead}\n`, { flag: 'wx', mode: 0o600 })
+    }
+
+    await expect(recoverOrphanedPageAppLock(profile)).rejects.toThrow(/chain exhausted|repair/i)
   })
 
   it('rejects unsafe owner tokens at acquisition and never creates the lock', async () => {
