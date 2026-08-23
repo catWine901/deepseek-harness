@@ -54,8 +54,9 @@
  * Self-reload: this plugin is itself a graph entry, so a rebuilt frame may
  * name it. The in-flight reload keeps running in the old bundle's closure
  * (its EventSource closes with the old fiber's effects); the new bundle's
- * apply opens a fresh channel. Frames arriving during the gap are lost —
- * acceptable for the dev channel, the next rebuild renotifies.
+ * apply opens a fresh channel. The connect-time graph frame then converges
+ * the new client from the current module graph, so frames lost during the
+ * EventSource gap self-heal.
  *
  * Failure policy: no rollback. An import failure leaves the entry
  * fiberless (the next rebuilt frame retries from scratch); an apply failure
@@ -63,6 +64,8 @@
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Entry, Loader } from '@deepseek-ai/cordis-plugin-loader'
+import type { ClientModuleLoader } from '@deepseek-ai/dsh-client-modules/client'
+import type { WebBootGraph } from '@deepseek-ai/dsh-client-modules'
 import type { PluginsEventFrame } from '../events.ts'
 import { EVENTS_ENDPOINT } from '../events.ts'
 
@@ -87,6 +90,53 @@ function findEntry(loader: Loader, id: string): Entry | undefined {
 function removeOwnedStyles(id: string): void {
   for (const el of document.querySelectorAll('style[data-plugin]')) {
     if (el.getAttribute('data-plugin') === id) el.remove()
+  }
+}
+
+/**
+ * Reconcile the live module graph and Loader tree to a fresh `graph` frame.
+ * The whole candidate is validated and published atomically by
+ * {@link ClientModuleLoader.replaceGraph} BEFORE any loader mutation, so a
+ * rejected wire leaves everything untouched. Removed rows drain through the
+ * safe `loader.remove(entry.id)` path (entry disposal never persists
+ * `options.disabled`), then their module factory/record and owned styles are
+ * invalidated. Added rows prefetch in graph order (a failing arrival aborts
+ * before any entry exists — no partial added set), then their Loader entries
+ * are created and each fiber settles before the reconcile resolves.
+ * Unchanged rows are never touched, so their entries, fibers, records, and
+ * mounted component state retain identity.
+ * @param loader - the client cordis Loader owning the entry tree.
+ * @param modLoader - the client module system owning the graph and bundle table.
+ * @param graph - the validated wire graph to converge to.
+ * @throws {Error} when the wire is rejected (no state changed) or an added
+ * bundle cannot arrive (the graph is current but the row is not mounted).
+ */
+export async function reconcileGraph(
+  loader: Loader,
+  modLoader: ClientModuleLoader,
+  graph: WebBootGraph,
+): Promise<void> {
+  // Validate the entire candidate and publish it atomically; a throw here
+  // means zero mutations anywhere.
+  const diff = modLoader.replaceGraph(graph)
+  // 1. Removals: drain the entry (safe path — entry._dispose guards the
+  //    Loader's self-dispose branch, so options.disabled is never persisted),
+  //    drop the module factory/record, and remove owned styles.
+  for (const id of diff.removed) {
+    const entry = findEntry(loader, id)
+    if (entry !== undefined) await loader.remove(entry.id)
+    modLoader.invalidate(id)
+    removeOwnedStyles(id)
+  }
+  // 2. Additions: prefetch every added row in graph order, then create their
+  //    entries. A prefetch failure aborts before any entry exists.
+  for (const id of diff.added) {
+    await modLoader.prefetch(id)
+  }
+  for (const id of diff.added) {
+    const entryId = await loader.create({ name: id })
+    const fiber = loader.resolve(entryId).fiber
+    if (fiber !== undefined) await fiber.await()
   }
 }
 
@@ -139,22 +189,27 @@ export function apply(ctx: Context): void {
     await entry.fiber?.await()
   }
 
-  // Serialize reloads: frames can arrive faster than a swap completes, and
-  // interleaved dispose/execute chains would corrupt the single-slot handoff.
+  // Serialize reloads and graph reconciles: frames can arrive faster than a
+  // swap completes, and interleaved dispose/execute chains would corrupt the
+  // single-slot handoff (or the graph/rebuild ordering).
   let queue: Promise<void> = Promise.resolve()
+  const enqueue = (operation: () => Promise<void>, label: string): void => {
+    queue = queue.then(operation).catch((error: unknown) => {
+      ctx.logger.error(`client-hmr: ${label} failed`)
+      ctx.logger.error(error)
+    })
+  }
   const handle = (frame: PluginsEventFrame): void => {
     switch (frame.type) {
       case 'rebuilt':
-        queue = queue.then(() => reload(frame.id)).catch((error: unknown) => {
-          ctx.logger.error(`client-hmr: reload of "${frame.id}" failed`)
-          ctx.logger.error(error)
-        })
+        enqueue(() => reload(frame.id), `reload of "${frame.id}"`)
         break
       case 'graph':
-        // Connect-time snapshot, unused. The loader's cached graph rev
-        // goes stale after rebuilds — harmless, since prefetch hits the
-        // network anyway (host serves bundles no-cache); graph rev refresh
-        // lands with the reconnect-handshake mechanism.
+        // The connect-time snapshot AND every later graph broadcast converge
+        // the live graph; after a self-reload this heals frames lost during
+        // the EventSource gap. The generic path (no Workspace Apps
+        // special-casing): the manager waits on the converged graph result.
+        enqueue(() => reconcileGraph(loader, modLoader, frame.graph), 'graph reconcile')
         break
       default:
         // Merge-extensible frame union: unknown frame types from newer hosts

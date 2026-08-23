@@ -27,19 +27,22 @@ type FakeHost = ClientModuleRegistry & { rebuiltCalls: string[]; fireGraphChange
 interface FakeHostOptions {
   beforeGraphRead?: () => void
   rebuilt?: (id: string) => string | undefined
+  /** Live graph rev source; defaults to the constant 'r'. */
+  rev?: () => string
 }
 
 function fakeClientModuleHost(rows: Map<string, string>, options: FakeHostOptions = {}): FakeHost {
   const graphListeners = new Set<() => void>()
   const rebuiltCalls: string[] = []
+  const rev = options.rev ?? (() => 'r')
   const fake: Pick<FakeHost, 'graph' | 'clientPath' | 'rebuilt' | 'onRebuilt' | 'onGraphChanged' | 'rebuiltCalls' | 'fireGraphChanged'> = {
     rebuiltCalls,
     fireGraphChanged: () => { for (const l of graphListeners) l() },
     graph: (): WebBootGraph => {
       options.beforeGraphRead?.()
       return {
-        rev: 'r',
-        entries: [...rows.keys()].map(id => ({ id, url: `/plugins/${id}/client.js?rev=r`, rev: 'r' })),
+        rev: rev(),
+        entries: [...rows.keys()].map(id => ({ id, url: `/plugins/${id}/client.js?rev=${rev()}`, rev: rev() })),
       }
     },
     clientPath: id => rows.get(id),
@@ -199,6 +202,72 @@ describe('hmr node half', () => {
     const fiber = await mount(clientModuleHost, fakeHttpServer([]))
 
     await vi.waitFor(() => { expect(clientModuleHost.rebuiltCalls).toEqual(['pkg-a', 'pkg-a']) }, { timeout: 3_000 })
+    await fiber.dispose()
+  })
+})
+
+describe('hmr node half: SSE graph broadcast', () => {
+  /* oxlint-disable typescript/no-unsafe-assignment, typescript/no-unsafe-return -- structural ServerResponse fake */
+  /** Capturing ServerResponse standing in for a live SSE connection. */
+  function sseConnection(): { res: ServerResponse; writes: string[] } {
+    const writes: string[] = []
+    const res = {
+      writeHead: () => res,
+      write: (chunk: string) => { writes.push(chunk); return res },
+      on: () => res,
+      destroy: () => res,
+    } as unknown as ServerResponse
+    return { res, writes }
+  }
+
+  async function connect(rows: Map<string, string>, revSource: () => string): Promise<{
+    clientModuleHost: FakeHost
+    writes: string[]
+    fiber: Awaited<ReturnType<typeof mount>>
+    routes: WebRoute[]
+  }> {
+    const clientModuleHost = fakeClientModuleHost(rows, { rev: revSource })
+    const routes: WebRoute[] = []
+    const fiber = await mount(clientModuleHost, fakeHttpServer(routes))
+    const { res, writes } = sseConnection()
+    const handler = routes[0]?.handler as (req: { method: string; url: string }, res: ServerResponse) => void
+    handler({ method: 'GET', url: EVENTS_ENDPOINT }, res)
+    return { clientModuleHost, writes, fiber, routes }
+  }
+  /* oxlint-enable typescript/no-unsafe-assignment, typescript/no-unsafe-return */
+
+  const frames = (writes: string[]): unknown[] =>
+    writes.filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice('data: '.length)) as unknown)
+
+  it('broadcasts a fresh graph frame only when graph.rev changes, while rebuilt frames still carry content changes', async () => {
+    const bundle = join(dir, 'broadcast.js')
+    writeFileSync(bundle, 'v1')
+    let rev = 'r1'
+    const { clientModuleHost, writes, fiber } = await connect(new Map([['pkg-a', bundle]]), () => rev)
+    // Connect-time graph frame: one frame on open.
+    expect(frames(writes)).toEqual([{ type: 'graph', graph: { rev: 'r1', entries: [
+      { id: 'pkg-a', url: '/plugins/pkg-a/client.js?rev=r1', rev: 'r1' },
+    ] } }])
+    writes.length = 0
+
+    // Same rev: an onGraphChanged notification must not re-broadcast.
+    clientModuleHost.fireGraphChanged()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(writes).toEqual([])
+
+    // Changed rev: one fresh graph frame.
+    rev = 'r2'
+    clientModuleHost.fireGraphChanged()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(frames(writes)).toEqual([{ type: 'graph', graph: { rev: 'r2', entries: [
+      { id: 'pkg-a', url: '/plugins/pkg-a/client.js?rev=r2', rev: 'r2' },
+    ] } }])
+    writes.length = 0
+
+    // A same-rev graph change again stays silent.
+    clientModuleHost.fireGraphChanged()
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(writes).toEqual([])
     await fiber.dispose()
   })
 })

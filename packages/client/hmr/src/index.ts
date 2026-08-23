@@ -147,6 +147,9 @@ export function apply(ctx: Context, config: Config): void {
 
   // --- /plugins/events SSE channel ----------------------------------------
   const connections = new Set<ServerResponse>()
+  // Last graph rev put on the channel: an onGraphChanged notification that
+  // recomposed without changing the rev must not spam the wire.
+  let lastGraphRev = ''
 
   const connect = (res: ServerResponse): void => {
     res.writeHead(200, {
@@ -157,7 +160,9 @@ export function apply(ctx: Context, config: Config): void {
     // Comment line on open so clients/proxies see a live channel even when
     // no rebuild ever happens; EventSource frame parsing skips it naturally.
     res.write(': connected\n\n')
-    res.write(sseData({ type: 'graph', graph: ctx.clientModules.graph() }))
+    const graph = ctx.clientModules.graph()
+    lastGraphRev = graph.rev
+    res.write(sseData({ type: 'graph', graph }))
     connections.add(res)
     res.on('close', () => { connections.delete(res) })
   }
@@ -181,8 +186,20 @@ export function apply(ctx: Context, config: Config): void {
       const line = sseData({ type: 'rebuilt', id, rev })
       for (const res of connections) res.write(line)
     })
+    // Graph structure changes broadcast a fresh graph frame; a notification
+    // with an unchanged rev (an ordinary flush that recomposed nothing new)
+    // stays silent. rebuilt() re-hashes and re-composes, so a bundle content
+    // change surfaces BOTH the rebuilt frame and the refreshed graph rev.
+    const unsubscribeGraph = ctx.clientModules.onGraphChanged(() => {
+      const graph = ctx.clientModules.graph()
+      if (graph.rev === lastGraphRev) return
+      lastGraphRev = graph.rev
+      const line = sseData({ type: 'graph', graph })
+      for (const res of connections) res.write(line)
+    })
     return () => {
       unsubscribe()
+      unsubscribeGraph()
       disposeRoute()
       for (const res of connections) res.destroy()
       connections.clear()
