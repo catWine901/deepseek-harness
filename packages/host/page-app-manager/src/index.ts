@@ -32,6 +32,14 @@ import type { PageAppManagerSnapshot, PageAppView } from './types.ts'
 import { parsePageAppInstallSource } from './source.ts'
 import type { PageAppInstallSource } from './types.ts'
 
+export * from './types.ts'
+export * from './source.ts'
+export * from './validation.ts'
+export * from './executor.ts'
+export * from './activation.ts'
+export * from './transaction.ts'
+export * from './recovery.ts'
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
     /** The Host page-app manager service (profile-scoped ownership projection). */
