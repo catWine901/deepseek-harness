@@ -17,7 +17,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import { Context, FiberState, Service } from '@deepseek-ai/cordis'
+import { Context, FiberState, Service, symbols } from '@deepseek-ai/cordis'
 import type { Entry, EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import {
@@ -450,74 +450,43 @@ export interface ProfileRuntimeControl {
 }
 
 /**
- * Module-private control slot on the service instance: symbol-keyed and
- * non-enumerable, so no public surface (`Object.keys`, own property names,
- * string access) exposes the launcher controls. Cordis wraps an injected
- * service in a traceable proxy that forwards symbol reads to the target, so
- * the slot resolves on the raw instance and on the proxy alike.
+ * Every piece of state the runtime owns, including the immutable identity and
+ * all launcher-controlled mutable state (acknowledged snapshot, binding,
+ * settled flag, generation, queue). A `ProfileRuntimeState` lives only in the
+ * module-private {@link states} WeakMap keyed by the raw service instance:
+ * the injected service carries no own enumerable or writable properties, so a
+ * consumer holding the Cordis traceable proxy can enumerate or overwrite
+ * nothing that affects identity or launcher state.
  */
-const controlKey = Symbol('dsh.profileRuntime.control')
+class ProfileRuntimeState {
+  readonly identity: ActiveProfileIdentity
+  readonly recoveryError: string | undefined
+  readonly omittedRoots: readonly OmittedManagedRoot[]
+  readonly compose: (managerPatches: readonly PatchOptions[]) => readonly PatchOptions[]
+  /** The launcher/boot-only control, built once over this state's closures. */
+  readonly control: ProfileRuntimeControl
 
-/**
- * Resolve the launcher/boot-only control for a profile runtime. The control
- * lives in a module-private slot keyed by the service instance; the injected
- * service surface never exposes it.
- * @param runtime - the service instance (raw or the traceable proxy).
- * @returns the control, or undefined when the instance was not constructed by
- * this module (never happens for instances built through {@link ProfileRuntime}).
- */
-export function profileRuntimeControl(runtime: ProfileRuntime): ProfileRuntimeControl | undefined {
-  return (runtime as unknown as Record<symbol, unknown>)[controlKey] as ProfileRuntimeControl | undefined
-}
-
-/**
- * Launcher-provided Cordis service owning the acknowledged profile
- * recomposition. The manager plugin injects it (by {@link PROFILE_RUNTIME_SERVICE})
- * and calls {@link applyManagerLayer} / {@link restoreManagerLayer}; each
- * call composes one fresh generation, applies it through the root Include's
- * transactional update, waits for the Loader to settle, audits that every
- * expected root reached active state, and resolves with the acknowledged
- * generation only after the audit passes. The user-patch watchers route their
- * generations through the same serialized queue ({@link recompose}), so no
- * independent `entry.update` writers can race. A call before the root Include
- * is bound or before the initial tree has settled fails loudly; the manager
- * may inject the service during boot but cannot mutate until then.
- */
-export class ProfileRuntime extends Service {
-  private readonly identityState: ActiveProfileIdentity
-  /** Startup recovery error when the registry is corrupt; managed roots failed closed. */
-  public readonly recoveryError: string | undefined
-  /** Roots the safe derived layer omitted at startup, with their reasons. */
-  public readonly omittedRoots: readonly OmittedManagedRoot[]
-
-  private readonly compose: (managerPatches: readonly PatchOptions[]) => readonly PatchOptions[]
   /** The last acknowledged manager-layer patches; promoted only after an audit passes. */
-  private managerPatches: readonly PatchOptions[]
-  private entry: Entry | undefined
-  private settled = false
-  private generation = 0
-  private queue: Promise<unknown> = Promise.resolve()
+  managerPatches: readonly PatchOptions[]
+  entry: Entry | undefined
+  settled = false
+  generation = 0
+  queue: Promise<unknown> = Promise.resolve()
 
-  /** The immutable active-profile identity; consumers cannot replace it. */
-  public get identity(): ActiveProfileIdentity {
-    return this.identityState
-  }
-
-  constructor(ctx: Context, options: ProfileRuntimeOptions) {
-    super(ctx, PROFILE_RUNTIME_SERVICE)
-    this.identityState = Object.freeze({ ...options.identity })
+  constructor(
+    private readonly ctx: Context,
+    options: ProfileRuntimeOptions,
+  ) {
+    this.identity = Object.freeze({ ...options.identity })
     this.recoveryError = options.recoveryError
     this.omittedRoots = Object.freeze([...options.omittedRoots ?? []])
     this.compose = options.compose
     this.managerPatches = [...options.initialManagerPatches]
-    Object.defineProperty(this, controlKey, {
-      enumerable: false,
-      value: {
-        bindRootInclude: (entry: Entry | undefined): void => { this.entry = entry },
-        markSettled: (): void => { this.settled = true },
-        recompose: (): Promise<void> => this.recomposeInternal(),
-      },
-    })
+    this.control = {
+      bindRootInclude: (entry): void => { this.entry = entry },
+      markSettled: (): void => { this.settled = true },
+      recompose: (): Promise<void> => this.recomposeInternal(),
+    }
   }
 
   /**
@@ -534,19 +503,19 @@ export class ProfileRuntime extends Service {
    * @param request - the staged layer and its expected roots.
    * @returns the acknowledged generation with active roots and overrides.
    */
-  public async applyManagerLayer(request: ProfileRuntimeApplyRequest): Promise<ProfileRuntimeApplyResult> {
+  async applyManagerLayer(request: ProfileRuntimeApplyRequest): Promise<ProfileRuntimeApplyResult> {
     return this.recomposeManagerLayer(request)
   }
 
   /**
    * Restore a prior manager-layer generation (the rollback path): identical
-   * contract to {@link applyManagerLayer}, distinguished by the caller's
-   * intent so the manager can await the restored composition the same way it
-   * awaits an apply.
+   * contract to {@link ProfileRuntimeState.applyManagerLayer}, distinguished
+   * by the caller's intent so the manager can await the restored composition
+   * the same way it awaits an apply.
    * @param request - the restored layer and its expected roots.
    * @returns the acknowledged generation with active roots and overrides.
    */
-  public async restoreManagerLayer(request: ProfileRuntimeApplyRequest): Promise<ProfileRuntimeApplyResult> {
+  async restoreManagerLayer(request: ProfileRuntimeApplyRequest): Promise<ProfileRuntimeApplyResult> {
     return this.recomposeManagerLayer(request)
   }
 
@@ -610,7 +579,7 @@ export class ProfileRuntime extends Service {
   }
 
   private async readStagedLayer(): Promise<string | undefined> {
-    const paths = resolvePageAppProfilePaths(this.identityState.directory)
+    const paths = resolvePageAppProfilePaths(this.identity.directory)
     try {
       return await readFile(paths.runtimeLayer, 'utf8')
     } catch (error) {
@@ -655,5 +624,103 @@ export class ProfileRuntime extends Service {
     }
     this.generation += 1
     return { generation: this.generation, activeRoots, externallyOverridden }
+  }
+}
+
+/** Module-private state registry keyed by the raw service instance. */
+const states = new WeakMap<ProfileRuntime, ProfileRuntimeState>()
+
+/**
+ * Resolve the raw service instance behind any Cordis access path: the raw
+ * instance, the traceable proxy `ctx.get` returns, or the shadow context a
+ * proxied method receives as `this`. The traceable proxy exposes the raw
+ * target under `symbols.original`; anything else is already raw.
+ * @param runtime - the service instance in any proxy form.
+ * @returns the raw instance.
+ */
+function unwrapProfileRuntime(runtime: ProfileRuntime): ProfileRuntime {
+  const target = (runtime as unknown as Record<symbol, unknown>)[symbols.original]
+  return (target as ProfileRuntime | undefined) ?? runtime
+}
+
+/** Resolve one runtime's module-private state, failing loud on foreign instances. */
+function stateOf(runtime: ProfileRuntime): ProfileRuntimeState {
+  const state = states.get(unwrapProfileRuntime(runtime))
+  if (state === undefined) {
+    throw new Error('page-app profile runtime: state is unavailable for this instance')
+  }
+  return state
+}
+
+/**
+ * Resolve the launcher/boot-only control for a profile runtime. The control
+ * lives in the module-private state registry; it is not exported from the
+ * package entry surface, so consumers of the injected service cannot reach
+ * bind/settle/recompose through any public string, symbol, or package API.
+ * @param runtime - the service instance (raw or the traceable proxy).
+ * @returns the control, or undefined when the instance was not constructed by
+ * this module (never happens for instances built through {@link ProfileRuntime}).
+ */
+export function profileRuntimeControl(runtime: ProfileRuntime): ProfileRuntimeControl | undefined {
+  return states.get(unwrapProfileRuntime(runtime))?.control
+}
+
+/**
+ * Launcher-provided Cordis service owning the acknowledged profile
+ * recomposition. The manager plugin injects it (by {@link PROFILE_RUNTIME_SERVICE})
+ * and calls {@link ProfileRuntime.applyManagerLayer} /
+ * {@link ProfileRuntime.restoreManagerLayer}; each call composes one fresh
+ * generation, applies it through the root Include's transactional update,
+ * waits for the Loader to settle, audits that every expected root reached
+ * active state, and resolves with the acknowledged generation only after the
+ * audit passes. All state lives in the module-private state registry keyed by
+ * the raw instance, so this object itself carries no own enumerable or
+ * writable properties beyond the Cordis service base fields — a consumer can
+ * replace neither the identity nor any launcher-controlled value. The
+ * user-patch watchers route their generations through the same serialized
+ * queue via the boot-only control, so no independent `entry.update` writers
+ * can race. A call before the root Include is bound or before the initial
+ * tree has settled fails loudly; the manager may inject the service during
+ * boot but cannot mutate until then.
+ */
+export class ProfileRuntime extends Service {
+  constructor(ctx: Context, options: ProfileRuntimeOptions) {
+    super(ctx, PROFILE_RUNTIME_SERVICE)
+    states.set(this, new ProfileRuntimeState(ctx, options))
+  }
+
+  /** The immutable active-profile identity; consumers cannot replace it. */
+  public get identity(): ActiveProfileIdentity {
+    return stateOf(this).identity
+  }
+
+  /** Startup recovery error when the registry is corrupt; managed roots failed closed. */
+  public get recoveryError(): string | undefined {
+    return stateOf(this).recoveryError
+  }
+
+  /** Roots the safe derived layer omitted at startup, with their reasons. */
+  public get omittedRoots(): readonly OmittedManagedRoot[] {
+    return stateOf(this).omittedRoots
+  }
+
+  /**
+   * Acknowledge one staged manager-layer generation; see
+   * {@link ProfileRuntimeState.applyManagerLayer} for the full contract.
+   * @param request - the staged layer and its expected roots.
+   * @returns the acknowledged generation with active roots and overrides.
+   */
+  public async applyManagerLayer(request: ProfileRuntimeApplyRequest): Promise<ProfileRuntimeApplyResult> {
+    return stateOf(this).applyManagerLayer(request)
+  }
+
+  /**
+   * Restore a prior manager-layer generation (the rollback path); see
+   * {@link ProfileRuntimeState.restoreManagerLayer} for the full contract.
+   * @param request - the restored layer and its expected roots.
+   * @returns the acknowledged generation with active roots and overrides.
+   */
+  public async restoreManagerLayer(request: ProfileRuntimeApplyRequest): Promise<ProfileRuntimeApplyResult> {
+    return stateOf(this).restoreManagerLayer(request)
   }
 }

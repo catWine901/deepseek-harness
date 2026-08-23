@@ -20,13 +20,16 @@ import {
   composeProfilePatches,
   loadOptionalPatches,
   PROFILE_PATCH_FILENAME,
+  PROFILE_RUNTIME_SERVICE,
   ProfileRuntime,
-  profileRuntimeControl,
   readManagerLayerPatches,
   type ActiveProfileIdentity,
   type ExpectedManagedRoot,
   type ProfileRuntimeApplyRequest,
 } from '../src/index.ts'
+// Module-internal capability: reachable only from this package's own sources
+// (the package entry surface deliberately does not re-export it).
+import { profileRuntimeControl } from '../src/profile-runtime.ts'
 
 const NAME = 'dsh-test-bin'
 const NOOP_PLUGIN = 'export const name = "noop"\nexport function apply() {}\n'
@@ -552,5 +555,68 @@ describe('ProfileRuntime manager-facing surface', () => {
     } finally {
       await ctx.fiber.dispose()
     }
+  })
+})
+
+describe('ProfileRuntime runtime privacy', () => {
+  const LAUNCHER_STATE_NAMES = [
+    'identityState', 'compose', 'managerPatches', 'entry', 'settled', 'generation', 'queue',
+    'recoveryError', 'omittedRoots',
+  ] as const
+
+  it('holds launcher state off the raw instance and the real ctx.get proxy', async () => {
+    const { ctx, runtime } = await bootRuntimeTree()
+    try {
+      const viaProxy: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
+      expect(viaProxy).toBeDefined()
+      for (const candidate of [runtime, viaProxy]) {
+        const names = Object.getOwnPropertyNames(candidate)
+        for (const launcherName of LAUNCHER_STATE_NAMES) {
+          expect(names, `${launcherName} on ${candidate === runtime ? 'raw' : 'proxy'}`).not.toContain(launcherName)
+        }
+        // Only the Cordis service base fields remain as own string properties.
+        expect(names.sort()).toEqual(['ctx', 'name'])
+      }
+      // No launcher control symbol is discoverable on the instance: every own
+      // symbol belongs to Cordis's traceability machinery.
+      for (const candidate of [runtime, viaProxy]) {
+        const symbols = Object.getOwnPropertySymbols(candidate)
+        for (const symbol of symbols) {
+          expect(String(symbol.description)).toMatch(/^cordis\./)
+        }
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('overwriting enumerated own state through the real ctx.get proxy cannot alter identity or launcher state', async () => {
+    const { ctx, runtime, recompose, managerLayerPath, dir } = await bootRuntimeTree()
+    try {
+      const first = singleRootLayer('page', 1)
+      writeFileSync(managerLayerPath, first.layer)
+      await runtime.applyManagerLayer(applyRequest(first.layer, [first.expected]))
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(true)
+
+      const viaProxy = ctx.get(PROFILE_RUNTIME_SERVICE) as unknown as Record<string, unknown>
+      viaProxy.identityState = { name: 'evil', directory: tmp() }
+      viaProxy.settled = false
+      viaProxy.entry = 'hacked'
+      viaProxy.managerPatches = [{ insert: [{ id: 'evil-row', name: './noop.mjs' }] }]
+      viaProxy.generation = 999
+      viaProxy.queue = 'hacked'
+
+      expect(runtime.identity).toEqual({ name: 'demo', directory: dir })
+      await recompose()
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(true)
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'evil-row')).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('exposes no launcher control accessor on the package entry surface', async () => {
+    const appBoot = await import('../src/index.ts')
+    expect((appBoot as Record<string, unknown>).profileRuntimeControl).toBeUndefined()
   })
 })

@@ -57,7 +57,6 @@ export {
   prepareManagerRuntimeLayer,
   PROFILE_RUNTIME_SERVICE,
   ProfileRuntime,
-  profileRuntimeControl,
   readManagerLayerPatches,
   type ActiveProfileIdentity,
   type DerivedRuntimeLayer,
@@ -68,7 +67,6 @@ export {
   type ProfileLayerInputs,
   type ProfileRuntimeApplyRequest,
   type ProfileRuntimeApplyResult,
-  type ProfileRuntimeControl,
   type ProfileRuntimeOptions,
 } from './profile-runtime.ts'
 
@@ -244,13 +242,13 @@ export interface UserPatchWatchOptions {
    */
   compose?: (userPatches: PatchOptions[]) => PatchOptions[]
   /**
-   * Serialized recomposition path replacing the built-in root-Include update:
-   * the {@link ProfileRuntime} queue, so user-patch generations share the
-   * manager's serialized `entry.update` writer and cannot race it. When set,
-   * the watcher calls `apply()` instead of composing and updating the Include
-   * itself; `compose` is then unused.
+   * Route this watcher through the profile runtime's serialized
+   * recomposition queue (the boot-only control, resolved inside this package):
+   * user-patch generations then compose the acknowledged manager layer
+   * snapshot and share the manager's single `entry.update` writer, so no
+   * independent writers can race. When set, `compose` is unused.
    */
-  apply?: () => Promise<void>
+  runtime?: ProfileRuntime
 }
 
 /**
@@ -264,16 +262,20 @@ export async function watchUserPatches(
   ctx: Context,
   options: UserPatchWatchOptions,
 ): Promise<() => Promise<void>> {
-  const { binName, filename, compose = (patches: PatchOptions[]) => patches, apply } = options
+  const { binName, filename, compose = (patches: PatchOptions[]) => patches, runtime } = options
   const hmr = ctx.get('hmr')
   if (hmr === undefined) throw new Error(`${binName}: user patch-layer watching requires the Cordis HMR service`)
   const entry = bootstrapIncludes.get(ctx)
   if (entry === undefined) throw new Error(`${binName}: user patch-layer watching requires the root Include entry`)
   const register = hmr.registerConfig(filename, async () => {
-    if (apply !== undefined) {
+    if (runtime !== undefined) {
       // The serialized recomposition path owns the entry.update; the launcher
       // routes both user watchers and manager generations through one queue.
-      await apply()
+      const control = profileRuntimeControl(runtime)
+      if (control === undefined) {
+        throw new Error(`${binName}: profile runtime control is unavailable for user-patch watching`)
+      }
+      await control.recompose()
       return
     }
     // Re-read the include's non-patch options per refresh: a writer that

@@ -29,7 +29,6 @@ import {
   prepareManagerRuntimeLayer,
   PROFILE_PATCH_FILENAME,
   ProfileRuntime,
-  profileRuntimeControl,
   readManagerLayerPatches,
   watchUserPatches,
   type ManagerLayerStartup,
@@ -343,25 +342,18 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
         await ctx.loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
       }
       // Both user-patch watchers and the manager route through the runtime's
-      // serialized recomposition queue — via the boot-only control, so the
-      // injected service surface exposes no un-audited recomposition: no
-      // independent entry.update writers.
-      const recompose = runtime === undefined ? undefined : (): Promise<void> => {
-        const control = profileRuntimeControl(runtime)
-        if (control === undefined) {
-          throw new Error('dsh: profile runtime control is unavailable for user-patch watching')
-        }
-        return control.recompose()
-      }
+      // serialized recomposition queue — app-boot resolves the boot-only
+      // control internally, so the injected service surface exposes no
+      // un-audited recomposition: no independent entry.update writers.
       await watchUserPatches(ctx, {
         binName: NAME,
         filename: composed.profile.patchPath,
-        ...recompose === undefined ? {} : { apply: recompose },
+        ...runtime === undefined ? {} : { runtime },
       })
       await watchUserPatches(ctx, {
         binName: NAME,
         filename: homePatchPath(),
-        ...recompose === undefined ? {} : { apply: recompose },
+        ...runtime === undefined ? {} : { runtime },
       })
     } catch (error) {
       suppressShutdownError(ctx, signalShutdown.signal, error)
