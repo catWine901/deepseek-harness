@@ -5,7 +5,10 @@
  * cmdline facts, before any config-tree entry mounts; `boot()` binds the root
  * Include entry to it immediately after `mountRootInclude` resolves. The
  * tree's manager plugin may inject the service during boot but cannot mutate
- * the profile until the initial tree has settled. Every generation — the
+ * the profile until the initial tree has settled — a settled mark that opens
+ * the mutation gate only after launcher watcher setup fully succeeds, and
+ * that treats a tree exiting mid-setup as the exit it is, never a boot
+ * failure. Every generation — the
  * manager's apply/restore and both user-patch watchers — runs through one
  * serialized recomposition queue, so no independent `entry.update` writers
  * can race on the root Include.
@@ -449,6 +452,9 @@ export interface ProfileRuntimeControl {
    * Mark the initial tree as settled and register the launcher-owned watcher
    * paths. Called by `boot()` after the activation audit; the manager may not
    * mutate the profile before this, and the watchers only exist afterwards.
+   * The mutation gate opens only after watcher setup fully succeeds: a setup
+   * failure on a live tree keeps the gate closed and fails boot, and a tree
+   * that exits during setup never opens the gate.
    */
   markSettled(): Promise<void>
   /**
@@ -500,34 +506,61 @@ class ProfileRuntimeState {
     this.control = {
       bindRootInclude: (entry): void => { this.entry = entry },
       markSettled: async (): Promise<void> => {
-        this.settled = true
-        await this.registerWatchPatches()
+        // The mutation gate opens only after watcher setup fully succeeds: a
+        // manager-layer call while registration is still pending rejects as
+        // not settled, a setup failure on a live tree keeps the gate closed
+        // (and fails boot), and a tree that exited during setup never opens it.
+        this.settled = await this.registerWatchPatches()
       },
       recompose: (): Promise<void> => this.recomposeInternal(),
     }
   }
 
   /**
+   * Whether the booted tree is already exiting or gone (the app left exactly
+   * as asked): the Loader service has been unregistered and/or the root fiber
+   * is no longer active. A setup error that lands on such a tree describes the
+   * exit, not a watch failure.
+   * @returns true when the tree is disposing or disposed.
+   */
+  private treeExited(): boolean {
+    return this.ctx.get('loader') === undefined || this.ctx.fiber.state !== FiberState.ACTIVE
+  }
+
+  /**
    * Register the launcher-owned user-patch watchers on the serialized queue.
    * Runs when the tree settles (boot's post-audit mark): an absent HMR
    * service is mounted watch-only (no module roots), then one config watcher
-   * per path recomposes the acknowledged snapshot. The tree may be disposing
-   * exactly as asked (a signal or a fast one-shot), in which case
-   * registration stops or an `INACTIVE_EFFECT` failure is treated as the exit
-   * it is; any other setup failure fails loud.
+   * per path recomposes the acknowledged snapshot. The whole setup is
+   * shutdown-aware — the tree may be disposing exactly as asked (a signal or
+   * a fast one-shot) while a `loader.create` or `registerConfig` await is in
+   * flight, in which case setup stops and the exit is not a boot failure; an
+   * `INACTIVE_EFFECT` registration failure is that same exit; any other setup
+   * error on a still-active tree fails loud.
+   * @returns false when the tree exited during setup (the mutation gate stays
+   * closed for a tree that never settled), true otherwise.
    */
-  private async registerWatchPatches(): Promise<void> {
-    if (this.watchPatches.length === 0) return
-    if (this.ctx.get('hmr') === undefined) {
-      const loader = this.ctx.get('loader')
-      if (loader === undefined) return // the tree exited while settling
-      if (this.ctx.get('timer') === undefined) {
-        await loader.create({ name: '@deepseek-ai/cordis-plugin-timer' })
+  private async registerWatchPatches(): Promise<boolean> {
+    if (this.watchPatches.length === 0) return !this.treeExited()
+    if (this.treeExited()) return false
+    try {
+      if (this.ctx.get('hmr') === undefined) {
+        const loader = this.ctx.get('loader')
+        if (loader === undefined) return false // the tree exited while settling
+        if (this.ctx.get('timer') === undefined) {
+          await loader.create({ name: '@deepseek-ai/cordis-plugin-timer' })
+        }
+        await loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
       }
-      await loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
+    } catch (error) {
+      // A create that fails because the tree is going away is the exit itself;
+      // the same error on an active tree is a real watcher-setup failure.
+      if (this.treeExited()) return false
+      throw error
     }
     const hmr = this.ctx.get('hmr')
     if (hmr === undefined) {
+      if (this.treeExited()) return false
       throw new Error('page-app profile runtime: the HMR service is unavailable for user-patch watching')
     }
     for (const watch of this.watchPatches) {
@@ -535,9 +568,11 @@ class ProfileRuntimeState {
         await hmr.registerConfig(watch.filename, () => this.recomposeInternal())
       } catch (error) {
         if ((error as { code?: string } | null)?.code === 'INACTIVE_EFFECT') continue
+        if (this.treeExited()) return false
         throw error
       }
     }
+    return true
   }
 
   /**

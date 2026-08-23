@@ -726,3 +726,194 @@ describe('ProfileRuntime proxy poisoning and watcher surface', () => {
     }
   })
 })
+
+interface WatcherBoot {
+  bootPromise: Promise<Context>
+  runtime: ProfileRuntime
+  rootCtx: Context
+  dir: string
+  managerLayerPath: string
+  /** Resolves when the gated loader.create (timer or HMR) is held and pending. */
+  createReached: Promise<void>
+  /** Release the held loader.create. */
+  releaseCreate: () => void
+  /** Resolves when the fake HMR's registerConfig has been called. */
+  configReached: Promise<void>
+  /** Release the held registerConfig. */
+  releaseConfig: () => void
+}
+
+/**
+ * Boot a real tree whose launcher runtime carries one watcher path, with the
+ * timer/HMR `loader.create` calls deterministically holdable or failable from
+ * this test's own realm (the prepare hook patches the shared loader instance)
+ * and an optional fake HMR/timer service. Resolves once boot's prepare has
+ * run (the runtime and root context exist); boot itself may still be settling.
+ */
+async function bootWatcherTree(options: {
+  /** Loader.create name the gate intercepts ('pass' disables interception). */
+  gateName: string
+  gateMode: 'pass' | 'hold' | 'fail'
+  fakeHmr?: 'ok' | 'hold' | 'fail'
+  fakeTimer?: boolean
+}): Promise<WatcherBoot> {
+  const dir = tmp()
+  writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
+  writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
+  mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
+  let releaseCreate!: () => void
+  let createReachedResolve!: () => void
+  const createReached = new Promise<void>((resolve) => { createReachedResolve = resolve })
+  let releaseConfig!: () => void
+  let configReachedResolve!: () => void
+  const configReached = new Promise<void>((resolve) => { configReachedResolve = resolve })
+  let readyResolve!: () => void
+  const ready = new Promise<void>((resolve) => { readyResolve = resolve })
+  let runtime: ProfileRuntime | undefined
+  let rootCtx: Context | undefined
+  const gate = { mode: options.gateMode, targetName: options.gateName }
+  const bootPromise = boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
+    rootCtx = hostCtx
+    // Hold or fail the runtime's timer/HMR loader.create deterministically.
+    // The loader is already installed when prepare runs, and the patched
+    // instance is the same one the runtime later calls through ctx.get.
+    const realCreate = hostCtx.loader.create.bind(hostCtx.loader)
+    hostCtx.loader.create = async (entryOptions) => {
+      if (gate.mode === 'pass' || entryOptions.name !== gate.targetName) {
+        return realCreate(entryOptions)
+      }
+      if (gate.mode === 'fail') {
+        gate.mode = 'pass'
+        throw new Error('pinned watcher setup failure')
+      }
+      gate.mode = 'pass'
+      createReachedResolve()
+      await new Promise<void>((resolve) => { releaseCreate = resolve })
+      return realCreate(entryOptions)
+    }
+    if (options.fakeHmr !== undefined) {
+      hostCtx.provide('hmr', {
+        registerConfig: async () => {
+          configReachedResolve()
+          if (options.fakeHmr === 'fail') throw new Error('pinned registration failure')
+          if (options.fakeHmr === 'hold') {
+            await new Promise<void>((resolve) => { releaseConfig = resolve })
+          }
+          return async () => {}
+        },
+      })
+    }
+    if (options.fakeTimer) hostCtx.provide('timer', {})
+    runtime = new ProfileRuntime(hostCtx, {
+      identity: { name: 'demo', directory: dir },
+      compose: managerPatches => composeProfilePatches({
+        bundlePatches: [],
+        managerPatches,
+        profilePatches: [],
+        homePatches: [],
+        overlays: [],
+      }),
+      initialManagerPatches: [],
+      watchPatches: [{ binName: NAME, filename: join(dir, PROFILE_PATCH_FILENAME) }],
+    })
+    readyResolve()
+  })
+  await ready
+  if (runtime === undefined || rootCtx === undefined) throw new Error('boot did not construct the profile runtime')
+  return {
+    bootPromise,
+    runtime,
+    rootCtx,
+    dir,
+    managerLayerPath: join(dir, '.workspace-manager', 'runtime-layer.yml'),
+    createReached,
+    releaseCreate: () => { releaseCreate() },
+    configReached,
+    releaseConfig: () => { releaseConfig() },
+  }
+}
+
+describe('ProfileRuntime watcher setup and the settled gate', () => {
+  it('keeps the mutation gate closed while watcher registration is pending', async () => {
+    const tree = await bootWatcherTree({ gateName: 'pass', gateMode: 'pass', fakeHmr: 'hold' })
+    const { bootPromise, runtime, rootCtx, managerLayerPath, configReached, releaseConfig } = tree
+    try {
+      // Stage the layer before boot so a gate breach would fully apply.
+      const { layer, expected } = singleRootLayer('page', 1)
+      writeFileSync(managerLayerPath, layer)
+      await configReached // watcher registration is now pending inside boot
+      // A concurrent manager apply must reject as not settled.
+      await expect(runtime.applyManagerLayer(applyRequest(layer, [expected])))
+        .rejects.toThrow(/before the initial tree has settled/i)
+      releaseConfig() // only now does the gate open
+      const ctx = await bootPromise
+      // The pending apply never mutated the tree nor advanced the generation.
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(false)
+      // With every registration finished the gate opens: a real apply works.
+      const result = await runtime.applyManagerLayer(applyRequest(layer, [expected]))
+      expect(result.generation).toBe(1)
+      expect(result.activeRoots).toEqual(['page'])
+    } finally {
+      await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('keeps the gate closed and fails boot loud when watcher registration fails on a live tree', async () => {
+    const tree = await bootWatcherTree({ gateName: 'pass', gateMode: 'pass', fakeHmr: 'fail' })
+    const { bootPromise, runtime, rootCtx } = tree
+    try {
+      await expect(bootPromise).rejects.toThrow(/pinned registration failure/)
+      // The setup failure left settled false: an apply still rejects as not
+      // settled instead of mutating through an already-opened gate.
+      await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+        .rejects.toThrow(/before the initial tree has settled/i)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('does not turn a requested disposal during timer creation into a boot failure', async () => {
+    const tree = await bootWatcherTree({
+      gateName: '@deepseek-ai/cordis-plugin-timer',
+      gateMode: 'hold',
+    })
+    const { bootPromise, runtime, rootCtx, createReached, releaseCreate } = tree
+    await createReached // the timer create is held pending
+    await rootCtx.fiber.dispose() // the app exits exactly as asked mid-setup
+    releaseCreate() // the create now lands on the disposing tree
+    const ctx = await bootPromise // the exit is not a watch failure
+    expect(ctx.get('loader')).toBeUndefined()
+    // The gate never opened for a tree that exited while settling.
+    await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+      .rejects.toThrow(/before the initial tree has settled/i)
+  })
+
+  it('does not turn a requested disposal during HMR creation into a boot failure', async () => {
+    const tree = await bootWatcherTree({
+      gateName: '@deepseek-ai/cordis-plugin-hmr',
+      gateMode: 'hold',
+      fakeTimer: true, // skip timer creation so the HMR create is the held one
+    })
+    const { bootPromise, runtime, rootCtx, createReached, releaseCreate } = tree
+    await createReached // the HMR create is held pending
+    await rootCtx.fiber.dispose()
+    releaseCreate()
+    const ctx = await bootPromise
+    expect(ctx.get('loader')).toBeUndefined()
+    await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+      .rejects.toThrow(/before the initial tree has settled/i)
+  })
+
+  it('fails boot loud when watcher setup errors on a still-active tree', async () => {
+    const tree = await bootWatcherTree({
+      gateName: '@deepseek-ai/cordis-plugin-timer',
+      gateMode: 'fail',
+    })
+    const { bootPromise, rootCtx } = tree
+    try {
+      await expect(bootPromise).rejects.toThrow(/pinned watcher setup failure/)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+})
