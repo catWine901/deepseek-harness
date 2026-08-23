@@ -249,6 +249,16 @@ export interface ClientModuleRecord {
   edges: Set<string>
 }
 
+/** The id-level delta of one {@link ClientModuleLoader.replaceGraph} call. */
+export interface ClientGraphDiff {
+  /** Rows present only in the new graph, in new-graph order. */
+  readonly added: readonly string[]
+  /** Rows present only in the old graph, in old-graph order. */
+  readonly removed: readonly string[]
+  /** Rows present in both with different content (url/rev/external/inject/immediately), in new-graph order. */
+  readonly changed: readonly string[]
+}
+
 /**
  * The internal-contract subset the vendored Loader and the client HMR plugin
  * consume. Mounted on `ctx.loader.internal` by the shell boot and provided
@@ -257,10 +267,27 @@ export interface ClientModuleRecord {
 export interface ClientModuleLoader {
   /** Discriminant against Node's internal loader shapes ('v1'/'v2'). */
   version: 'client'
-  /** Parsed Host boot graph shared with the web entry after module-system creation. */
-  manifest: BootManifest
+  /**
+   * Parsed Host boot graph shared with the web entry after module-system
+   * creation. A stable getter over the current validated manifest: the same
+   * object reference between reads, refreshed only by a successful
+   * {@link replaceGraph}.
+   */
+  readonly manifest: BootManifest
   /** Materialized-module registry: id → record. The governance-side read API for entry exports. */
   loadCache: Map<string, ClientModuleRecord>
+  /**
+   * Atomically replace the live module graph with a new wire manifest. The
+   * entire candidate is validated (parse, duplicate ids, malformed rows,
+   * self-requests, and external-graph cycles) BEFORE anything mutates — a
+   * rejected candidate leaves the current manifest and rows untouched.
+   * Materialized records keep their identity, and a row removed by the swap
+   * stays importable until the caller unloads it through {@link invalidate}.
+   * @param wire - a raw `window.__DSH_BOOT__`-shaped graph.
+   * @returns added/removed/changed ids in graph order.
+   * @throws {Error} when the candidate wire is invalid; the live graph is unchanged.
+   */
+  replaceGraph(wire: unknown): ClientGraphDiff
   /**
    * Internal contract consumed by the vendored Loader's `tree.import`. Resolves
    * `specifier` through the branch order documented on the module, fetching

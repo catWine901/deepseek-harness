@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { runInNewContext } from 'node:vm'
 import { Context } from '@deepseek-ai/cordis'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { renderIndexInjections, type WebServer, type WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import * as modulesClient from '../src/client/index.ts'
 import { ClientModuleRegistry, bootInjections, orderByModuleGraph } from '../src/index.ts'
@@ -51,7 +51,7 @@ function writeBuiltPackage(packageName: string, client: Record<string, unknown>)
 }
 
 /** Construct the node-half service and capture its plugin-bundle route. */
-function constructWithRoute(packageNames: string[]): { service: ClientModuleRegistry; route: WebRoute } {
+function constructWithRoute(packageNames: string[]): { service: ClientModuleRegistry; route: WebRoute; ctx: Context } {
   const ctx = new Context()
   ctx.baseUrl = pathToFileURL(root!).href + '/'
   ctx.provide('loader', {
@@ -73,7 +73,7 @@ function constructWithRoute(packageNames: string[]): { service: ClientModuleRegi
   ctx.provide('webServer', webServer as WebServer)
   const service = new ClientModuleRegistry(ctx)
   if (route === undefined) throw new Error('client bundle route was not registered')
-  return { service, route }
+  return { service, route, ctx }
 }
 
 /** Construct the node-half service over the enabled fixture entries. */
@@ -335,5 +335,43 @@ describe('module graph order', () => {
     writeBuiltPackage('@fixture/cycle-b', { external: ['@fixture/cycle-a'] })
     expect(() => construct(['@fixture/cycle-a', '@fixture/cycle-b']))
       .toThrow('module graph cycle @fixture/cycle-a -> @fixture/cycle-b -> @fixture/cycle-a')
+  })
+})
+
+describe('late package activation', () => {
+  it('invalidates a cached negative verdict when a newly active package becomes resolvable', async () => {
+    const lateName = '@fixture/late-installed'
+    // Establish the temp root first; the late package is NOT written yet, so
+    // its activation scan caches a negative verdict without throwing.
+    writeBuiltPackage('@fixture/root-anchor', {})
+    const { service, ctx } = constructWithRoute([lateName])
+    expect(service.graph().entries).toEqual([])
+    // The package is installed now; a fresh internal/plugin emission for the
+    // still-not-on-the-table entry must drop the stale null and compose a row.
+    writeBuiltPackage(lateName, {})
+    ctx.emit('internal/plugin', { entry: { options: { name: lateName } } })
+    await Promise.resolve()
+    expect(service.graph().entries.map(row => row.id)).toEqual([lateName])
+  })
+
+  it('keeps the last valid graph and reports a broken arriving package exactly once', async () => {
+    const goodName = '@fixture/stable-good'
+    writeBuiltPackage(goodName, {})
+    const names = [goodName]
+    const { service, ctx } = constructWithRoute(names)
+    const before = service.graph()
+    // A broken package becomes active after boot: its metadata resolves but the
+    // client bundle is missing. The flush must report it once and serve the
+    // last valid graph unchanged.
+    names.push('@fixture/broken-arriving')
+    writePackage('@fixture/broken-arriving')
+    const warned: unknown[] = []
+    vi.spyOn(ctx.logger, 'warn').mockImplementation((...args: unknown[]) => { warned.push(args) })
+    ctx.emit('internal/plugin', { entry: { options: { name: '@fixture/broken-arriving' } } })
+    await Promise.resolve()
+    expect(service.graph()).toBe(before)
+    expect(service.graph().entries.map(row => row.id)).toEqual([goodName])
+    expect(warned).toHaveLength(1)
+    expect(String(warned[0])).toContain('@fixture/broken-arriving')
   })
 })

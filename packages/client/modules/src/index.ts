@@ -489,6 +489,12 @@ export class ClientModuleRegistry extends Service {
     }
     if (!qualifies) return this.table.delete(entryName)
     if (this.table.has(entryName)) return false
+    // A newly active package not already on the table: a cached negative
+    // verdict was taken when the package could not resolve (installed later,
+    // or scanned before its dependency arrived). Drop the null so resolveMeta
+    // re-reads — a real (non-null) verdict stays authoritative, and an
+    // ordinary fiber restart of an already-tabled package never gets here.
+    if (this.pkgMeta.get(entryName) === null) this.pkgMeta.delete(entryName)
     const meta = this.resolveMeta(entryName)
     if (meta === null) return false
     // The rev rides the row from here on: a fiber restart reuses the row (and

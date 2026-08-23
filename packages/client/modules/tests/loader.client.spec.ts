@@ -347,6 +347,89 @@ describe('HMR reset', () => {
   })
 })
 
+describe('replaceGraph (atomic graph replacement)', () => {
+  it('applies an added row and returns the diff in graph order', () => {
+    const b = bench([row('a')], { a: () => ({ marker: 'a' }) })
+    const before = b.loader.manifest
+    const diff = b.loader.replaceGraph({ rev: 'v2', entries: [row('a'), row('c')] })
+    expect(diff).toEqual({ added: ['c'], removed: [], changed: [] })
+    expect(b.loader.manifest).not.toBe(before)
+    expect(b.loader.manifest.rev).toBe('v2')
+    expect(b.loader.manifest.modules.map(r => r.id)).toEqual(['a', 'c'])
+    expect(b.loader.manifest.plugins.map(r => r.id)).toEqual(['a', 'c'])
+  })
+
+  it('rejects duplicate ids, malformed rows, self-requests, and dependency cycles without touching the current graph', async () => {
+    const b = bench([row('a')], { a: () => ({ marker: 'a' }) })
+    const before = b.loader.manifest
+    expect(() => b.loader.replaceGraph({ rev: 'v2', entries: [row('a'), row('a')] }))
+      .toThrow('duplicate graph entry "a"')
+    expect(() => b.loader.replaceGraph({ rev: 'v2', entries: [{ id: 'bad' }] }))
+      .toThrow('must carry string id/url/rev')
+    expect(() => b.loader.replaceGraph({ rev: 'v2', entries: [row('solo', { external: ['solo'] })] }))
+      .toThrow('requests module "solo" that it answers itself')
+    expect(() => b.loader.replaceGraph({
+      rev: 'v2',
+      entries: [row('a', { external: ['b'] }), row('b', { external: ['a'] })],
+    })).toThrow('module graph cycle a -> b -> a')
+    // Every rejected candidate left the live manifest and rows untouched.
+    expect(b.loader.manifest).toBe(before)
+    expect(b.loader.manifest.rev).toBe('graph')
+    await expect(b.loader.import('a', '', {})).resolves.toMatchObject({ marker: 'a' })
+  })
+
+  it('reports added/removed/changed ids in graph order and keeps unchanged records identical', async () => {
+    const b = bench([row('a'), row('b')], {
+      a: () => ({ marker: 'a' }),
+      b: () => ({ marker: 'b' }),
+    })
+    await b.loader.import('a', '', {})
+    const record = b.loader.loadCache.get('a')
+    const diff = b.loader.replaceGraph({
+      rev: 'v2',
+      entries: [
+        row('b', { rev: '2', url: '/plugins/b/client.js?rev=2' }),
+        row('a'),
+        row('d'),
+      ],
+    })
+    // added/changed follow new-graph order; removed follows old-graph order.
+    expect(diff).toEqual({ added: ['d'], removed: [], changed: ['b'] })
+    expect(b.loader.loadCache.get('a')).toBe(record)
+    // The v3 swap restores b's default row (rev 0), so b is changed again.
+    const removed = b.loader.replaceGraph({ rev: 'v3', entries: [row('b')] })
+    expect(removed).toEqual({ added: [], removed: ['a', 'd'], changed: ['b'] })
+  })
+
+  it('keeps a removed module importable until the caller unloads then invalidates it', async () => {
+    const b = bench([row('a')], { a: () => ({ marker: 'a' }) })
+    await b.loader.import('a', '', {})
+    b.loader.replaceGraph({ rev: 'v2', entries: [] })
+    // The removed row's materialized record still serves imports...
+    await expect(b.loader.import('a', '', {})).resolves.toMatchObject({ marker: 'a' })
+    // ...until the caller unloads it through invalidate.
+    b.loader.invalidate('a')
+    await expect(b.loader.import('a', '', {})).rejects.toThrow('cannot resolve "a"')
+  })
+
+  it('keeps the manifest reference stable between reads and refreshes it only on replacement', () => {
+    const b = bench([row('a')])
+    const first = b.loader.manifest
+    expect(b.loader.manifest).toBe(first)
+    expect(b.loader.manifest).toBe(first)
+    b.loader.replaceGraph({ rev: 'v2', entries: [row('a'), row('b')] })
+    expect(b.loader.manifest).not.toBe(first)
+    const second = b.loader.manifest
+    expect(b.loader.manifest).toBe(second)
+  })
+
+  it('makes a row added by the graph immediately importable', async () => {
+    const b = bench([row('a')], { a: () => ({ marker: 'a' }), late: () => ({ marker: 'late' }) })
+    b.loader.replaceGraph({ rev: 'v2', entries: [row('late'), row('a')] })
+    await expect(b.loader.import('late', '', {})).resolves.toMatchObject({ marker: 'late' })
+  })
+})
+
 describe('style claiming', () => {
   it('claims untagged style tags for the materializing plugin and inventories owned css ids', async () => {
     const foreign = document.createElement('style')
