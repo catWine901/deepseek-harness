@@ -99,6 +99,18 @@ function guardedSlots(slots: SlotRegistry, env: DynamicCordisGuardEnv): unknown 
       const value = Reflect.get(target, prop, target) as unknown
       if (prop !== 'register') {
         if (typeof value !== 'function') return denyContext(value, 'slots', env)
+        if (prop === 'entries' || prop === 'entriesOfSlot') {
+          // Defensive copies of ledger views: the live ledger and its arrays
+          // are runtime-immutable, so a tampering attempt through the facade
+          // (Array.prototype.push on a frozen array throws; index assignment is
+          // a silent no-op) must not crash the package NOR reach the ledger.
+          // The fresh copy keeps the package alive while the real ledger stays
+          // frozen and untouched.
+          return (...args: unknown[]): unknown => {
+            const list = Reflect.apply(value, target, args) as readonly unknown[]
+            return denyContext([...list], 'slots', env)
+          }
+        }
         return (...args: unknown[]): unknown => denyContext(Reflect.apply(value, target, args), 'slots', env)
       }
       return (rawOptions: unknown, component: unknown): unknown => {

@@ -413,3 +413,30 @@ describe('owner package provenance (output-only metadata)', () => {
     expect(core.entries('test.single')[0]?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
   })
 })
+
+describe('runtime immutability of owner provenance', () => {
+  it('defines ownerPackage as a non-writable own property even when the value is undefined', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.single' }, Comp)
+    const entry = core.entries('test.single')[0]!
+    const descriptor = Object.getOwnPropertyDescriptor(entry, 'ownerPackage')
+    expect(descriptor?.writable).toBe(false)
+    expect(descriptor?.configurable).toBe(false)
+    expect(descriptor?.value).toBeUndefined()
+  })
+
+  it('freezes the stored entry and the live entries array, preserving the stable reference', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    core.register({ name: 'test.single' }, Comp)
+    const first = core.entries('test.single')
+    expect(Object.isFrozen(first)).toBe(true)
+    expect(Object.isFrozen(first[0]!)).toBe(true)
+    // Strict-mode writes to a frozen entry or array must be rejected.
+    const entry = first[0]! as { ownerPackage?: string }
+    expect(() => { entry.ownerPackage = '@deepseek-ai/dsh-forged' }).toThrow()
+    expect(() => { (first as { ownerPackage?: string }[]).push({ component: null, options: {} }) }).toThrow()
+    expect(core.entries('test.single')).toBe(first) // stable reference between mutations
+  })
+})

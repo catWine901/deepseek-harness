@@ -832,3 +832,65 @@ describe('immutable owner package provenance', () => {
     expect(entry?.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
   })
 })
+
+describe('runtime immutability of owner provenance', () => {
+  /** Mount the real loader entry whose fiber registers into 't.host' and return the stored entry. */
+  async function entryWithRealOwner(bench: LoaderBench): Promise<{ ownerPackage?: string }> {
+    bench.erased.register({ name: 'root', children: { 't.host': { kind: 'single', scope: 'root' } } }, C)
+    bench.plugin('@deepseek-ai/dsh-client-ui-layout/client', {
+      name: 'ui-layout',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await bench.loader.create({ name: '@deepseek-ai/dsh-client-ui-layout/client' })
+    return bench.svc.entries('t.host')[0]!
+  }
+
+  it('an untyped service consumer cannot change the ownerPackage of an entry with a real owner', async () => {
+    const bench = await bootWithLoader()
+    const entry = await entryWithRealOwner(bench)
+    expect(entry.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
+    expect(() => { entry.ownerPackage = '@deepseek-ai/dsh-forged' }).toThrow()
+    expect(entry.ownerPackage).toBe('@deepseek-ai/dsh-client-ui-layout')
+    const descriptor = Object.getOwnPropertyDescriptor(entry, 'ownerPackage')
+    expect(descriptor?.writable).toBe(false)
+    expect(descriptor?.configurable).toBe(false)
+    expect(Object.isFrozen(entry)).toBe(true)
+  })
+
+  it('an untyped service consumer cannot add ownerPackage to an entry that derived none', async () => {
+    const bench = await boot()
+    bench.erased.register({ name: 'root', children: { 't.host': { kind: 'single', scope: 'root' } } }, C)
+    const fiber = bench.ctx.plugin({
+      name: 'plain-contributor',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({ name: 't.host' }, C)
+      },
+    })
+    await fiber.await()
+    const [entry] = bench.svc.entries('t.host')
+    expect(entry?.ownerPackage).toBeUndefined()
+    expect(() => { entry!.ownerPackage = '@deepseek-ai/dsh-forged' }).toThrow()
+    expect(entry?.ownerPackage).toBeUndefined()
+    const descriptor = Object.getOwnPropertyDescriptor(entry as object, 'ownerPackage')
+    expect(descriptor?.writable).toBe(false)
+    expect(descriptor?.configurable).toBe(false)
+    expect(descriptor?.value).toBeUndefined()
+  })
+
+  it('an untyped service consumer cannot push or replace a forged entry in the live registry array', async () => {
+    const bench = await boot()
+    bench.erased.register({ name: 'root', children: { 't.host': { kind: 'single', scope: 'root' } } }, C)
+    bench.erased.register({ name: 't.host' }, C)
+    const mutable = bench.svc.entries('t.host') as unknown as { component: unknown; options: object }[]
+    const forged = { component: () => null, options: {} }
+    expect(Object.isFrozen(mutable)).toBe(true)
+    expect(() => { mutable.push(forged) }).toThrow()
+    expect(() => { mutable[0] = forged }).toThrow()
+    expect(bench.svc.entries('t.host')).toHaveLength(1)
+    expect(bench.svc.entries('t.host')[0]).not.toBe(forged)
+  })
+})

@@ -1,7 +1,8 @@
 /**
  * Dynamic-package runner, browser half: the load engine that turns one browser
- * half's source into a live cordis plugin (closure → guard → module table →
- * loader entry, ./runtime.ts), plus the retract announcement that unloads it.
+ * half's source into a live cordis plugin (closure → guard → child fiber under
+ * the runner's own Loader entry, ./runtime.ts), plus the retract announcement
+ * that unloads it.
  *
  * Nothing loads on activation: this page holds no dynamic package until a
  * dispatch arrives, and a dispatch only follows a model `cordis_run` or a user
@@ -15,7 +16,6 @@ import type {
   ApprovalRequestId, CordisDynamicPluginId, DynamicCordisInvokeResult, JsonValue,
   DynamicCordisInventoryRow,
 } from '@deepseek-ai/dsh-api-remotes/client'
-import type { ClientModuleSystem } from '@deepseek-ai/dsh-client-modules/client'
 import type { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 // The Client Remote assembly is the one place the two planes meet: it mounts the
 // `dynamicCordisRunner` namespace and re-exports its payload vocabulary, so this
@@ -203,9 +203,9 @@ export function apply(ctx: Context): void {
   ctx.on('connection/reset', () => { inspect.publish() })
 
   const runner = new DynamicCordisPackageRunner({
+    // The runner's own ctx: its Loader entry stamps every dynamic package's
+    // contribution with the runner package's ownerPackage (see spec §7).
     ctx,
-    loader: ctx.loader,
-    modules: ctx.get('modules') as ClientModuleSystem,
     slots: ctx.get('slots') as SlotRegistry,
     invoke: async (pluginId, pluginRunId, method, args) => {
       // Model-authored arguments reach this boundary untyped; the namespace's

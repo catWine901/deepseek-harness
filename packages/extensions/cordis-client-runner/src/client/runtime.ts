@@ -1,10 +1,11 @@
 /**
  * Per-package browser lifecycle: evaluate the closure, wrap `apply` in the guard
- * facade, seat a ready-made factory in the module table, and create a loader
+ * facade, and mount the result as a child fiber of the runner's OWN Loader
  * entry — so dynamic packages ride the exact machinery static plugins do
- * (activation gating on inject, fiber-effect cleanup, status projection). Unload
- * = loader entry removal (fiber disposal cascades slot entries and facade
- * effects) + factory invalidation + style removal.
+ * (activation gating on inject, fiber-effect cleanup, status projection) while
+ * every contribution inherits the runner package's Loader entry (the source of
+ * the immutable ownerPackage provenance). Unload = child-fiber disposal (slot
+ * entries and facade effects cascade) + style removal.
  *
  * The engine answers its caller: `load` resolves with what this page ended up
  * with, which is what the run orchestration reports back to the host. Loads
@@ -15,12 +16,10 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import type { Loader } from '@deepseek-ai/cordis-plugin-loader'
 import type {
   CordisDynamicPackageId, CordisDynamicPluginId, CordisDynamicPluginRunId, DynamicCordisPackage,
 } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SessionId } from '@deepseek-ai/dsh-client-connection/client'
-import type { ClientModuleSystem } from '@deepseek-ai/dsh-client-modules/client'
 import type { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import { DynamicCordisStyles, evaluateClientHalf, DYNAMIC_CLIENT_REDIRECTS } from './evaluator.ts'
 import type { DynamicCordisEvaluatedPlugin } from './evaluator.ts'
@@ -95,17 +94,13 @@ export type DynamicCordisLoadResult =
   | { ok: true; pluginRunId: CordisDynamicPluginRunId; waitingFor?: string[] }
   | ({ ok: false; cause: DynamicCordisLoadErrorCause; error?: unknown } & CordisErrorDetails)
 
-/** The `window.__ModuleLoader__` registration sink (client-modules contract C6). */
-interface ModuleLoaderSink {
-  __ModuleLoader__?: {
-    load(handoff: { id: string; factory: (require: (spec: string) => unknown) => unknown }): void
-  }
-}
+/** The `ctx.plugin()` fiber handle one dynamic package lives on (awaitable, with inject + dispose). */
+type PackageFiber = ReturnType<Context['plugin']>
 
 /** One live package's bookkeeping. */
 interface LivePackage {
   pkg: DynamicCordisPackage
-  entryId: string
+  fiber: PackageFiber
   styles: DynamicCordisStyles
   ledger: DynamicCordisSlotLedgerRow[]
   /** Services the browser half declared and this page has not got (parked, still a success). */
@@ -114,12 +109,8 @@ interface LivePackage {
 
 /** Runner dependencies, resolved by the plugin entry at activation. */
 export interface DynamicCordisRunnerEnv {
-  /** The client root context (service reads and the guard's fiber owner). */
+  /** The runner's own plugin ctx: dynamic packages become child fibers of its Loader entry. */
   ctx: Context
-  /** Client cordis Loader: dynamic packages become entries under it. */
-  loader: Loader
-  /** Module table, for factory invalidation before every (re-)registration. */
-  modules: ClientModuleSystem
   /** Slot registry, for the entry-crash supervision seam. */
   slots: SlotRegistry
   /** Route one `host.call` to the package's host half through the Remote namespace. */
@@ -152,7 +143,7 @@ export interface DynamicCordisRunnerEnv {
   ): void
 }
 
-/** Module-table id of one package (also its loader entry name and fiber name). */
+/** Module-table id of one package (also its fiber name for diagnostics). */
 function moduleIdOf(id: CordisDynamicPluginId): string {
   return `dyn/${id}`
 }
@@ -292,7 +283,7 @@ export class DynamicCordisPackageRunner {
         // Already running this activation here: nothing to load, but the caller
         // still needs an answer (a replayed run must not look unacknowledged).
         if (current.pkg.pluginRunId === half.pluginRunId) return settled(current)
-        await this.teardown(current.pkg.pluginId, current.entryId, current.styles)
+        await this.teardown(current.pkg.pluginId, current.fiber, current.styles)
       }
       const result = await this.mount(half)
       this.notify()
@@ -310,7 +301,7 @@ export class DynamicCordisPackageRunner {
     void this.enqueue(pluginId, async () => {
       const current = this.live.get(pluginId)
       if (current === undefined || current.pkg.pluginRunId !== pluginRunId) return
-      await this.teardown(pluginId, current.entryId, current.styles)
+      await this.teardown(pluginId, current.fiber, current.styles)
       this.notify()
     })
   }
@@ -319,7 +310,7 @@ export class DynamicCordisPackageRunner {
   async dispose(): Promise<void> {
     this.unwatch()
     for (const current of [...this.live.values()]) {
-      await this.teardown(current.pkg.pluginId, current.entryId, current.styles)
+      await this.teardown(current.pkg.pluginId, current.fiber, current.styles)
     }
     this.notify()
   }
@@ -365,33 +356,22 @@ export class DynamicCordisPackageRunner {
       name: half.name,
     }
     const surface = this.guardedSurface(pkg, half.agentId, plugin, ledger)
-    const moduleId = moduleIdOf(half.pluginId)
-    // Invalidate-then-register keeps re-loading legal: the module table throws
-    // loudly on a duplicate factory registration.
-    this.env.modules.invalidate(moduleId)
-    const sink = (globalThis as ModuleLoaderSink).__ModuleLoader__
-    if (sink === undefined) {
-      throw new Error('cordis-client-runner: window.__ModuleLoader__ is missing (booted outside the web shell?)')
-    }
-    sink.load({ id: moduleId, factory: () => surface })
-
-    const entryId = await this.env.loader.create({ name: moduleId })
-    const fiber = this.env.loader.resolve(entryId).fiber
-    if (fiber === undefined) {
-      await this.teardown(half.pluginId, entryId, styles)
-      return { ok: false, cause: 'module-import', message: 'module import failed (see the browser console)' }
-    }
+    // Mount the guarded plugin as a child fiber of the runner's own ctx: the
+    // child inherits the runner's Loader entry (fiber.parent[Entry.key]), which
+    // is what stamps every contribution with the runner package's ownerPackage.
+    let fiber: PackageFiber | undefined
     try {
+      fiber = this.env.ctx.plugin(surface)
       await fiber.await()
     } catch (error) {
-      await this.teardown(half.pluginId, entryId, styles)
+      if (fiber !== undefined) await this.teardown(half.pluginId, fiber, styles)
       return { ok: false, cause: 'activate', ...errorDetails(error), error }
     }
     // Settled but not active = legal pending on an unsatisfied declaration. The
     // record is seated only now, so an error mirrored during `apply` cannot
     // claim the package is already live.
     const waitingFor = Object.keys(fiber.inject).filter(name => this.env.ctx.get(name) === undefined)
-    const record: LivePackage = { pkg, entryId, styles, ledger, waitingFor }
+    const record: LivePackage = { pkg, fiber, styles, ledger, waitingFor }
     this.live.set(half.pluginId, record)
     // A fresh load answers for itself: whatever this page last showed as crashed
     // is no longer true of what is mounted now.
@@ -442,17 +422,16 @@ export class DynamicCordisPackageRunner {
    */
   private async teardown(
     id: CordisDynamicPluginId,
-    entryId: string,
+    fiber: PackageFiber,
     styles: DynamicCordisStyles,
   ): Promise<void> {
     this.live.delete(id)
     // Nothing of this package renders here any more, so a crash row would outlive
     // the thing it described.
     this.failures.delete(id)
-    // Entry removal disposes the fiber (slot entries and facade effects
-    // cascade); the factory invalidation makes a later re-load legal.
-    await this.env.loader.remove(entryId)
-    this.env.modules.invalidate(moduleIdOf(id))
+    // Fiber disposal tears down the package's effects (slot entries and facade
+    // effects cascade); the styles go with it.
+    await fiber.dispose()
     styles.dispose()
   }
 }

@@ -854,23 +854,29 @@ export class SlotCore {
       else this.handleScopes.set(options.store, { scope: spec.scope, count: 1 })
     }
 
-    const entry: StoredEntry = {
+    // The stored entry and its options are frozen at registration: after this
+    // point nothing — typed or untyped, caller or framework — can add, replace,
+    // or remove a field. The provenance stamp is ALWAYS an own property, even
+    // when no entry was derived, so a forged ownerPackage can neither overwrite
+    // a stamped value nor be added where none was derived (a strict-mode write
+    // throws, a sloppy-mode one is a silent no-op — both cannot stick).
+    const entry: StoredEntry = Object.freeze({
       component,
-      options: {
+      options: Object.freeze({
         ...(options.key !== undefined ? { key: options.key } : {}),
         ...(options.id !== undefined ? { id: options.id } : {}),
         ...(options.order !== undefined ? { order: options.order } : {}),
         ...(options.label !== undefined ? { label: options.label } : {}),
         ...(options.priority !== undefined ? { priority: options.priority } : {}),
-      },
+      }),
       ...(options.select !== undefined ? { select: options.select } : {}),
       ...(options.inject !== undefined ? { inject: options.inject } : {}),
       ...(options.children !== undefined ? { children: options.children } : {}),
       ...(options.store !== undefined ? { store: options.store } : {}),
       ...(options.locale !== undefined ? { locale: options.locale } : {}),
       ...(options.registrant !== undefined ? { registrant: options.registrant } : {}),
-      ...(ownerPackage !== undefined ? { ownerPackage } : {}),
-    }
+      ownerPackage,
+    })
     const next = [...rec.entries, entry]
     // Stable sorts: priority ascending for every kind, ties keep registration
     // sequence — a cell's winner is its first occurrence, chain tries lower
@@ -879,7 +885,11 @@ export class SlotCore {
     next.sort(spec.kind === 'list'
       ? (a, b) => ((a.options.priority ?? 0) - (b.options.priority ?? 0)) || ((a.options.order ?? 0) - (b.options.order ?? 0))
       : (a, b) => (a.options.priority ?? 0) - (b.options.priority ?? 0))
-    rec.entries = next
+    // The live array is frozen AFTER sorting (a frozen array cannot be sorted
+    // in place). The record swaps whole arrays instead of mutating one, so
+    // entries() keeps returning the same stable reference between mutations
+    // while a forged entry can neither be pushed nor replace an existing slot.
+    rec.entries = Object.freeze(next)
     this.markDirty(options.name, rec)
     if (options.children) {
       const declarations: [key: string, record: SlotRecord][] = []
