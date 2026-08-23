@@ -1,0 +1,116 @@
+/* Workspace Apps settings tab. */
+.tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.heading {
+  margin: 0;
+}
+
+.profile {
+  margin: 0;
+  color: var(--dsw-alias-brand-text);
+}
+
+.addRow {
+  display: flex;
+  gap: 8px;
+}
+
+.addInput {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-brand-text);
+  font: inherit;
+}
+
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.rowMain {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.packageName {
+  font-size: 12px;
+  color: var(--dsw-alias-brand-text);
+  opacity: 0.7;
+}
+
+.health {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.health[data-health='ready'] {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.recovery {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.operation {
+  margin: 0;
+  color: var(--dsw-alias-brand-text);
+}
+
+.error {
+  margin: 0;
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.empty {
+  margin: 0;
+  color: var(--dsw-alias-brand-text);
+  opacity: 0.7;
+}

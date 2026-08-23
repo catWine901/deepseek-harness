@@ -5,6 +5,7 @@
 // DSH seat must never depend on remote readiness — spec §3).
 import { Context } from '@deepseek-ai/cordis'
 import { beforeEach, describe, expect, it } from 'vitest'
+import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import { apply, PageAppShell, type PageAppShellInjected, inject } from '@deepseek-ai/dsh-client-ui-page-app-manager/client'
 
@@ -16,6 +17,8 @@ async function bench() {
   const ctx = new Context()
   const slotsFiber = ctx.plugin(SlotRegistry)
   await slotsFiber.await()
+  const locale = new LocaleRuntime(ctx)
+  ctx.provide('locale', locale)
   // The controller's seam reads the runtime's slots/changed event; the remote
   // namespace is deliberately absent in this bench to prove the built-in seat
   // does not block on it.
@@ -24,8 +27,9 @@ async function bench() {
 
 describe('ui-page-app-manager client apply', () => {
   it('declares its service dependencies', () => {
-    // slots (registration) is required; remote/modules are read defensively.
-    expect(inject).toEqual(['slots'])
+    // slots (registration) and locale (tab copy) are required; remote/modules
+    // are read defensively.
+    expect(inject).toEqual(['slots', 'locale'])
   })
 
   it('registers exactly one root contribution declaring both child seats', async () => {

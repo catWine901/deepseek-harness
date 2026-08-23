@@ -14,6 +14,11 @@
 
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
+// Type-only: pulls the settings slot declarations ('settings.plugins.tab')
+// into this program. Cross-plugin collaboration goes through the slot ledger.
+import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+// Type-only: pulls ctx.locale into this program.
+import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {
   PageAppClientInstanceId, PageAppInstallSource, PageAppManagerSnapshot,
 } from '@deepseek-ai/dsh-page-app-manager/types'
@@ -22,6 +27,19 @@ import type {
   PageAppManagerRemoteMethods, PageAppRemoteEvents, PageAppRemoteResult, PageAppSlotsSeam,
 } from './contracts.ts'
 import { PageAppShell, type PageAppShellInjected } from './PageAppShell.tsx'
+import { PageAppSettingsTab, type PageAppSettingsTabInjected } from './PageAppSettingsTab.tsx'
+import { parsePageAppInstallSourceClient } from './source.ts'
+import { en, zh, type PageAppSettingsKey } from './locales.ts'
+
+/** Dictionary namespace owned by this plugin (Workspace Apps settings copy). */
+export const NS = 'settings.pageApp'
+
+declare module '@deepseek-ai/dsh-client-ui-slots' {
+  interface LocaleNamespaceMap {
+    /** Workspace Apps settings tab copy. */
+    'settings.pageApp': PageAppSettingsKey
+  }
+}
 
 /** Empty remote projection when the generated namespace is not mounted yet. */
 const EMPTY_SNAPSHOT: PageAppManagerSnapshot = Object.freeze({
@@ -119,31 +137,58 @@ function shellInjected(controller: PageAppController): PageAppShellInjected {
   }
 }
 
-/** Required services: the slot registry (remote/modules are read defensively). */
-export const inject = ['slots']
+/** The Settings tab's inject face: the controller observable plus mutations. */
+function settingsInjected(controller: PageAppController): PageAppSettingsTabInjected {
+  return {
+    hooks: { pageApp: controller.observable },
+    install: (source, signal) => controller.install(parsePageAppInstallSourceClient(source), signal),
+    setEnabled: (pageId, enabled, signal) => controller.setEnabled(pageId, enabled, signal),
+    setHidden: (pageId, hidden) => controller.setHidden(pageId, hidden),
+    uninstall: (pageId, signal) => controller.uninstall(pageId, signal),
+    recover: () => controller.recover(),
+  }
+}
+
+/** Required services: the slot registry and the locale face (remote/modules are read defensively). */
+export const inject = ['slots', 'locale']
 
 /**
  * Register the Workspace App shell into the built-in `root` seat and declare
- * both child seats. The controller starts with the registration and stops with
- * its fiber; the built-in DSH seat mounts immediately regardless of remote
- * readiness (spec §3 guarantees the permanent fallback surface).
+ * both child seats, and contribute the Workspace Apps tab to Settings →
+ * Plugins (spec §21/§22). The controller starts with the registration and
+ * stops with its fiber; the built-in DSH seat mounts immediately regardless of
+ * remote readiness (spec §3 guarantees the permanent fallback surface). The
+ * Settings tab and the shell share one controller, so state and mutations
+ * stay consistent across both surfaces.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
   const controller = createController(ctx)
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-page-app-manager: dictionaries')
   ctx.effect(() => {
     const stopController = controller.start()
-    const disposeRegistration = ctx.slots.register({
-      name: 'root',
-      children: {
-        'page-app.shell.builtin': { kind: 'single', scope: 'root' },
-        'page-app.shell.surface': { kind: 'keyed', scope: 'root' },
-      },
-      inject: () => shellInjected(controller),
-    }, PageAppShell)
+    const disposers = [
+      ctx.slots.register({
+        name: 'root',
+        children: {
+          'page-app.shell.builtin': { kind: 'single', scope: 'root' },
+          'page-app.shell.surface': { kind: 'keyed', scope: 'root' },
+        },
+        inject: () => shellInjected(controller),
+      }, PageAppShell),
+      // The Workspace tab registers after the read-only `all` tab (order 10).
+      ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
+        name: 'settings.plugins.tab',
+        id: 'workspace-apps',
+        order: 20,
+        label: () => (ctx.locale.bind(NS)('tab')),
+        locale: NS,
+        inject: () => settingsInjected(controller),
+      }, PageAppSettingsTab)),
+    ]
     return () => {
-      disposeRegistration()
+      for (const dispose of disposers.reverse()) dispose()
       stopController()
     }
-  }, 'ui-page-app-manager: shell + seats')
+  }, 'ui-page-app-manager: shell + seats + settings tab')
 }

@@ -24,7 +24,13 @@
       "path": "../runtime"
     },
     {
+      "path": "../locale"
+    },
+    {
       "path": "../ui-slots"
+    },
+    {
+      "path": "../ui-settings"
     },
     {
       "path": "../modules"
