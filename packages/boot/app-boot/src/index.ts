@@ -20,6 +20,7 @@ import { createLaunchEnvironmentSnapshot, type LaunchEnvironmentSnapshot } from 
 import type {} from '@deepseek-ai/cordis-plugin-hmr'
 // Side-effect type import: resolves `ctx.get('systemPrompt')` to the service.
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import { PROFILE_RUNTIME_SERVICE, ProfileRuntime } from './profile-runtime.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -48,6 +49,26 @@ export {
   type ProfileLayer,
   type ProfileManifest,
 } from './profile.ts'
+
+export {
+  canonicalManagedRootHash,
+  composeProfilePatches,
+  deriveSafeRuntimeLayer,
+  prepareManagerRuntimeLayer,
+  PROFILE_RUNTIME_SERVICE,
+  ProfileRuntime,
+  readManagerLayerPatches,
+  type ActiveProfileIdentity,
+  type DerivedRuntimeLayer,
+  type ExpectedManagedRoot,
+  type ManagerLayerStartup,
+  type ManagedRootOmissionReason,
+  type OmittedManagedRoot,
+  type ProfileLayerInputs,
+  type ProfileRuntimeApplyRequest,
+  type ProfileRuntimeApplyResult,
+  type ProfileRuntimeOptions,
+} from './profile-runtime.ts'
 
 /**
  * Resolve the config to boot. Replay swaps a `cordis.yml` basename for
@@ -220,6 +241,14 @@ export interface UserPatchWatchOptions {
    * is the whole patch list.
    */
   compose?: (userPatches: PatchOptions[]) => PatchOptions[]
+  /**
+   * Serialized recomposition path replacing the built-in root-Include update:
+   * the {@link ProfileRuntime} queue, so user-patch generations share the
+   * manager's serialized `entry.update` writer and cannot race it. When set,
+   * the watcher calls `apply()` instead of composing and updating the Include
+   * itself; `compose` is then unused.
+   */
+  apply?: () => Promise<void>
 }
 
 /**
@@ -233,12 +262,18 @@ export async function watchUserPatches(
   ctx: Context,
   options: UserPatchWatchOptions,
 ): Promise<() => Promise<void>> {
-  const { binName, filename, compose = (patches: PatchOptions[]) => patches } = options
+  const { binName, filename, compose = (patches: PatchOptions[]) => patches, apply } = options
   const hmr = ctx.get('hmr')
   if (hmr === undefined) throw new Error(`${binName}: user patch-layer watching requires the Cordis HMR service`)
   const entry = bootstrapIncludes.get(ctx)
   if (entry === undefined) throw new Error(`${binName}: user patch-layer watching requires the root Include entry`)
   const register = hmr.registerConfig(filename, async () => {
+    if (apply !== undefined) {
+      // The serialized recomposition path owns the entry.update; the launcher
+      // routes both user watchers and manager generations through one queue.
+      await apply()
+      return
+    }
     // Re-read the include's non-patch options per refresh: a writer that
     // updates the root Include's other options between refreshes (none exists
     // today) must not have them silently reverted by a user-layer reload.
@@ -771,7 +806,15 @@ export async function boot(
     await ctx.plugin(Loader)
     await prepare?.(ctx)
     stage = 'plugin tree failed to load'
-    await mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl)
+    const includeEntry = await mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl)
+    // Bind the launcher-provided profile runtime to the root Include right
+    // after it resolves: the manager plugin may inject the service during
+    // boot but cannot mutate until the initial tree settles (markSettled
+    // below), so a manager-layer call before binding fails loudly.
+    const runtime: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
+    if (runtime instanceof ProfileRuntime) {
+      runtime.bindRootInclude(includeEntry)
+    }
     // A surface can finish and dispose the whole tree while startup is still
     // in flight, before the last entry settles. The Loader service goes with
     // it, and the activation audit describes a live tree — reading `ctx.loader`
@@ -782,6 +825,9 @@ export async function boot(
     await ctx.get('loader')?.await()
     if (ctx.get('loader') === undefined) return ctx
     await assertEntriesActivated(ctx, binName)
+    if (runtime instanceof ProfileRuntime) {
+      runtime.markSettled()
+    }
     return ctx
   } catch (cause) {
     // Root-fiber disposal contains cleanup failures per observer (Cordis

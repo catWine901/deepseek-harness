@@ -20,13 +20,18 @@ import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import {
   boot,
   composeEntries,
+  composeProfilePatches,
   healProfilesModuleFallback,
   installFailLoud,
   loadOptionalPatches,
   loadOverlayPatches,
   loadProfile,
+  prepareManagerRuntimeLayer,
   PROFILE_PATCH_FILENAME,
+  ProfileRuntime,
+  readManagerLayerPatches,
   watchUserPatches,
+  type ManagerLayerStartup,
   type Profile,
 } from '@deepseek-ai/dsh-app-boot'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
@@ -103,9 +108,9 @@ export function prepareProfile(name: string, userLayer = true): Profile {
 }
 
 /** One profile's patch layers (application order) and the row index of its pre-flag composition. */
-interface ComposedProfile {
+export interface ComposedProfile {
   profile: Profile
-  /** Bundle layers concatenated — the part below the user layers on a live reload. */
+  /** Bundle layers concatenated — the part below the manager and user layers on a live reload. */
   bundlePatches: PatchOptions[]
   /** The home-level user layer (`$DSH_HOME/cordis.patch.yml`), applied after the profile's own. */
   homePatches: PatchOptions[]
@@ -116,16 +121,6 @@ interface ComposedProfile {
    * launcher's own row checks.
    */
   rows: ReadonlyMap<string, EntryOptions>
-}
-
-/** The full patch stack of one composed profile, in application order. */
-function allPatches(composed: ComposedProfile): PatchOptions[] {
-  return [
-    ...composed.bundlePatches,
-    ...composed.profile.patches,
-    ...composed.homePatches,
-    ...composed.overlays,
-  ]
 }
 
 /**
@@ -139,7 +134,7 @@ function allPatches(composed: ComposedProfile): PatchOptions[] {
  * @param patchFiles - `--patch` overlay paths, in argv order.
  * @returns the profile, its patch layers, and the composed row index.
  */
-function composeProfile(
+export function composeProfile(
   name: string,
   patchFiles: readonly string[],
 ): ComposedProfile {
@@ -170,6 +165,26 @@ function composeProfile(
   return { profile, bundlePatches, homePatches, overlays: composedOverlays, rows }
 }
 
+/**
+ * Compose one fresh full generation of one composed profile — the single
+ * recomposition function shared by the initial boot, the user-patch watchers,
+ * and the manager's acknowledged applies. It reads the CURRENT manager layer
+ * between the bundle layers and the user layers, re-reads both user patch
+ * files per generation, and returns a fresh structured clone so mounted
+ * insert rows can never leak across generations.
+ * @param composed - the launcher-composed profile layers.
+ * @returns one fresh generation patch list (bundles → manager → profile → home → overlays).
+ */
+export function composeLivePatches(composed: ComposedProfile): PatchOptions[] {
+  return composeProfilePatches({
+    bundlePatches: composed.bundlePatches,
+    managerPatches: readManagerLayerPatches(NAME, composed.profile.dir),
+    profilePatches: loadOptionalPatches(NAME, composed.profile.patchPath) ?? [],
+    homePatches: loadOptionalPatches(NAME, homePatchPath()) ?? [],
+    overlays: composed.overlays,
+  })
+}
+
 /** Options for {@link runProfile}. */
 export interface RunProfileOptions {
   /** This run's frozen environment snapshot, provided before any entry mounts. */
@@ -198,6 +213,63 @@ function suppressShutdownError(ctx: Context, signal: AbortSignal, error: unknown
   throw error
 }
 
+/** The settled root context and the launcher-provided profile runtime of one boot. */
+export interface ProfileBootResult {
+  ctx: Context
+  runtime: ProfileRuntime | undefined
+}
+
+/**
+ * Boot one composed profile over its empty root config with the
+ * launcher-provided profile runtime: the compose callback is
+ * {@link composeLivePatches}, so the initial tree carries the current manager
+ * layer between the bundle and user layers. The runtime is provided beside
+ * the launch environment and cmdline facts before any config-tree entry
+ * mounts; `boot()` binds it to the root Include and settles it, so the
+ * manager plugin may inject it during boot but cannot mutate until then.
+ * @param composed - the launcher-composed profile layers.
+ * @param managerLayer - the startup manager-layer outcome ({@link prepareManagerRuntimeLayer}).
+ * @param environment - this run's frozen environment snapshot.
+ * @param args - the invocation's inner arguments for `ctx.cmdlineArgs`.
+ * @param onPrepare - host-setup hook run first inside `boot(..., prepare)`
+ * (the launcher records the in-flight context for signal teardown).
+ * @param exit - the bounded exit request handed to `provideCmdline`.
+ * @returns the settled root context and the provided runtime (undefined only
+ * when a surface disposed the tree during startup).
+ */
+export async function bootComposedProfile(
+  composed: ComposedProfile,
+  managerLayer: ManagerLayerStartup,
+  environment: LaunchEnvironmentSnapshot,
+  args: readonly string[],
+  onPrepare: (hostCtx: Context) => void,
+  exit: (code: number) => void,
+): Promise<ProfileBootResult> {
+  const rootConfig = join(composed.profile.dir, PROFILE_ROOT_FILENAME)
+  let runtime: ProfileRuntime | undefined
+  const ctx = await boot(NAME, rootConfig, composeLivePatches(composed), (hostCtx) => {
+    onPrepare(hostCtx)
+    // Before any config-tree entry mounts, so plugins resolve all launch-time
+    // environment values from the same immutable provenance snapshot.
+    hostCtx.provide(DSH_LAUNCH_ENVIRONMENT_KEY, environment)
+    // The command line and bounded exit request are launcher facts available
+    // to every app plugin that injects the argument snapshot.
+    provideCmdline(hostCtx, {
+      args,
+      exit,
+    })
+    // Launcher-owned profile runtime: immutable identity plus the sole
+    // acknowledged live-recomposition API, beside the launch facts.
+    runtime = new ProfileRuntime(hostCtx, {
+      identity: { name: composed.profile.name, directory: composed.profile.dir },
+      compose: () => composeLivePatches(composed),
+      ...managerLayer.recoveryError === undefined ? {} : { recoveryError: managerLayer.recoveryError },
+      omittedRoots: managerLayer.omitted,
+    })
+  })
+  return { ctx, runtime }
+}
+
 /**
  * Boot one profile invocation end to end and leave process lifetime to the
  * mounted plugins (or to a one-shot runner the composition mounts).
@@ -206,6 +278,10 @@ function suppressShutdownError(ctx: Context, signal: AbortSignal, error: unknown
  */
 export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Context; shutdown: ProcessShutdown }> {
   const composed = composeProfile(options.profile, options.patchFiles)
+  // Startup manager-layer preparation: regenerate a missing/corrupt/stale
+  // derived layer from a valid registry before the initial composition; a
+  // corrupt registry fails managed roots closed and exposes a recovery error.
+  const managerLayer = await prepareManagerRuntimeLayer(NAME, composed.profile.dir)
   const app: { current?: Context } = {}
   const shutdown = createProcessShutdown(async () => { await app.current?.fiber.dispose() })
   const signalShutdown = new AbortController()
@@ -224,39 +300,14 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
     await app.current?.fiber.dispose()
   })
 
-  const rootConfig = join(composed.profile.dir, PROFILE_ROOT_FILENAME)
-  // Recomposition for the live user layers: bundle layers below, overlays
-  // above, so a user edit can never displace them. Parsed app arguments are
-  // not in here at all — they live in app-provided services that survive a
-  // recomposition. BOTH
-  // user files are re-read per generation (the HMR watcher hands us only the
-  // changed file's patches, which one of the reads duplicates — fresh reads
-  // keep the two watchers from stitching in each other's stale copy).
-  // Fresh clones per generation: the include pushes `insert` rows into the
-  // mounted tree BY REFERENCE and later id-targeted patches mutate those
-  // objects in place. Reusing one parsed patch object across applications
-  // would bake a user override into the bundle's in-memory insert row, so
-  // removing the override could never revert the row to the bundle default.
-  const composeLive = (): PatchOptions[] => structuredClone([
-    ...composed.bundlePatches,
-    ...loadOptionalPatches(NAME, composed.profile.patchPath) ?? [],
-    ...loadOptionalPatches(NAME, homePatchPath()) ?? [],
-    ...composed.overlays,
-  ])
-  // Cloned for the same insert-aliasing reason as composeLive: the boot
-  // application must not mutate the objects later reloads recompose from.
-  const ctx = await boot(NAME, rootConfig, structuredClone(allPatches(composed)), (hostCtx) => {
-    app.current = hostCtx
-    // Before any config-tree entry mounts, so plugins resolve all launch-time
-    // environment values from the same immutable provenance snapshot.
-    hostCtx.provide(DSH_LAUNCH_ENVIRONMENT_KEY, options.environment)
-    // The command line and bounded exit request are launcher facts available
-    // to every app plugin that injects the argument snapshot.
-    provideCmdline(hostCtx, {
-      args: options.args,
-      exit: code => void shutdown.shutdown(code),
-    })
-  })
+  const { ctx, runtime } = await bootComposedProfile(
+    composed,
+    managerLayer,
+    options.environment,
+    options.args,
+    (hostCtx) => { app.current = hostCtx },
+    code => void shutdown.shutdown(code),
+  )
   app.current = ctx
   // A surface can dispose the whole tree while boot or this post-boot watcher
   // setup is still in flight — a signal, or a fast one-shot's appExit. Loader
@@ -282,15 +333,18 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
         }
         await ctx.loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
       }
+      // Both user-patch watchers and the manager route through the runtime's
+      // serialized recomposition queue: no independent entry.update writers.
+      const recompose = runtime === undefined ? undefined : (): Promise<void> => runtime.recompose()
       await watchUserPatches(ctx, {
         binName: NAME,
         filename: composed.profile.patchPath,
-        compose: composeLive,
+        ...recompose === undefined ? {} : { apply: recompose },
       })
       await watchUserPatches(ctx, {
         binName: NAME,
         filename: homePatchPath(),
-        compose: composeLive,
+        ...recompose === undefined ? {} : { apply: recompose },
       })
     } catch (error) {
       suppressShutdownError(ctx, signalShutdown.signal, error)

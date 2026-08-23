@@ -8,11 +8,14 @@ import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import * as yaml from 'js-yaml'
 import {
   composeEntries,
+  deriveSafeRuntimeLayer,
   healProfilesModuleFallback,
   initProfile,
   loadProfile,
+  prepareManagerRuntimeLayer,
   PROFILE_PATCH_FILENAME,
   PROFILE_TEMPLATES,
   readProfileManifest,
@@ -268,5 +271,221 @@ describe('healProfilesModuleFallback', () => {
     healProfilesModuleFallback(anchor, home) // second healer sees the correct link
     const fallback = join(home, 'profiles', 'node_modules')
     expect(lstatSync(join(fallback, 'dsh-app')).isSymbolicLink()).toBe(true)
+  })
+})
+
+describe('manager runtime layer startup', () => {
+  const MANAGER_DIR = '.workspace-manager'
+
+  /** Stage one installed manager package with a workspace manifest and bundle patch. */
+  function stageManagerPackage(profileDir: string, name: string, version: string, rootEntryId = 'fixture-root'): void {
+    const dir = join(profileDir, 'node_modules', name)
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name,
+      version,
+      dsh: {
+        workspace: {
+          schemaVersion: 1,
+          id: 'fixture-page',
+          name: 'Fixture Page',
+          description: 'fixture page app',
+          defaultOrder: 0,
+          rootEntryId,
+        },
+        bundle: { patch: './cordis.patch.yml' },
+      },
+    }, null, 2))
+    writeFileSync(join(dir, 'cordis.patch.yml'), [
+      '- insert:',
+      `    - id: ${rootEntryId}`,
+      "      name: '@acme/fixture-client'",
+      '      config:',
+      '        marker: fixture',
+      '',
+    ].join('\n'))
+  }
+
+  /** A valid registry v1 document with the given entries. */
+  function registry(entries: Array<Record<string, unknown>>): string {
+    return JSON.stringify({ schemaVersion: 1, revision: 1, entries }, null, 2)
+  }
+
+  function registryEntry(packageName: string, version: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      packageName,
+      source: { kind: 'registry', display: 'https://registry.example/fixture' },
+      resolvedVersion: version,
+      page: { id: 'fixture-page', name: 'Fixture Page', description: 'fixture page app', defaultOrder: 0, rootEntryId: 'fixture-root' },
+      order: 0,
+      enabled: true,
+      hidden: false,
+      installedAt: '2026-08-22T00:00:00.000Z',
+      updatedAt: '2026-08-22T00:00:00.000Z',
+      ...extra,
+    }
+  }
+
+  function writeRegistry(profileDir: string, content: string): void {
+    mkdirSync(join(profileDir, MANAGER_DIR), { recursive: true })
+    writeFileSync(join(profileDir, MANAGER_DIR, 'registry.json'), content)
+  }
+
+  function readLayer(profileDir: string): Array<{ insert: Array<Record<string, unknown>> }> {
+    const content = readFileSync(join(profileDir, MANAGER_DIR, 'runtime-layer.yml'), 'utf8')
+    return yaml.load(content) as Array<{ insert: Array<Record<string, unknown>> }>
+  }
+
+  it('regenerates a missing derived layer from a valid registry', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.recoveryError).toBeUndefined()
+    expect(startup.omitted).toEqual([])
+    expect(readLayer(profile)).toEqual([
+      { insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] },
+    ])
+  })
+
+  it('regenerates a corrupt derived layer from a valid registry', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
+    mkdirSync(join(profile, MANAGER_DIR), { recursive: true })
+    writeFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), 'invalid: [unclosed\n')
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.omitted).toEqual([])
+    expect(readLayer(profile)).toEqual([
+      { insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] },
+    ])
+  })
+
+  it('fails managed roots closed on a corrupt registry: preserves the registry, drops the stale layer, exposes recovery', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, 'not json')
+    // A stale layer from a previous good state must not mount orphaned roots.
+    mkdirSync(join(profile, MANAGER_DIR), { recursive: true })
+    writeFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), '- insert:\n    - id: orphan\n      name: @acme/orphan\n')
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.recoveryError).toMatch(/corrupt/i)
+    expect(readFileSync(join(profile, MANAGER_DIR, 'registry.json'), 'utf8')).toBe('not json')
+    expect(() => readFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), 'utf8'))
+      .toThrow(/ENOENT/)
+  })
+
+  it('omits a root whose dependency is missing from the profile install', async () => {
+    const profile = tmp()
+    // No @acme/ghost is installed anywhere in the profile.
+    writeRegistry(profile, registry([registryEntry('@acme/ghost', '1.0.0')]))
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.omitted).toEqual([{ rootEntryId: 'fixture-root', reason: 'missing-dependency' }])
+    expect(readLayer(profile)).toEqual([])
+  })
+
+  it('omits a root whose installed version drifts from the registry revision', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.1.0')
+    writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.omitted).toEqual([{ rootEntryId: 'fixture-root', reason: 'version-drift' }])
+    expect(readLayer(profile)).toEqual([])
+  })
+
+  it('omits a root with an invalid manifest and keeps the other enabled roots', async () => {
+    const profile = tmp()
+    // @acme/broken carries a workspace manifest but the bundle patch names a
+    // different root row than the registry row.
+    const brokenDir = join(profile, 'node_modules', '@acme', 'broken')
+    mkdirSync(brokenDir, { recursive: true })
+    writeFileSync(join(brokenDir, 'package.json'), JSON.stringify({
+      name: '@acme/broken',
+      version: '1.0.0',
+      dsh: {
+        workspace: {
+          schemaVersion: 1, id: 'broken-page', name: 'Broken', description: 'broken', defaultOrder: 0, rootEntryId: 'missing-root',
+        },
+        bundle: { patch: './cordis.patch.yml' },
+      },
+    }, null, 2))
+    writeFileSync(join(brokenDir, 'cordis.patch.yml'), "- insert:\n    - id: other-row\n      name: '@acme/other'\n")
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, registry([
+      registryEntry('@acme/broken', '1.0.0', { page: { id: 'broken-page', name: 'Broken', description: 'broken', defaultOrder: 0, rootEntryId: 'missing-root' } }),
+      registryEntry('@acme/page', '1.0.0'),
+    ]))
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.omitted).toEqual([{ rootEntryId: 'missing-root', reason: 'invalid-manifest' }])
+    expect(readLayer(profile)).toEqual([
+      { insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] },
+    ])
+  })
+
+  it('omits a root whose manifest fails v1 workspace validation', async () => {
+    const profile = tmp()
+    const brokenDir = join(profile, 'node_modules', '@acme', 'broken')
+    mkdirSync(brokenDir, { recursive: true })
+    writeFileSync(join(brokenDir, 'package.json'), JSON.stringify({
+      name: '@acme/broken',
+      version: '1.0.0',
+      dsh: {
+        workspace: {
+          schemaVersion: 2, id: 'broken-page', name: 'Broken', description: 'broken', defaultOrder: 0, rootEntryId: 'missing-root',
+        },
+        bundle: { patch: './cordis.patch.yml' },
+      },
+    }, null, 2))
+    writeFileSync(join(brokenDir, 'cordis.patch.yml'), "- insert:\n    - id: missing-root\n      name: '@acme/broken-client'\n")
+    writeRegistry(profile, registry([registryEntry('@acme/broken', '1.0.0', {
+      page: { id: 'broken-page', name: 'Broken', description: 'broken', defaultOrder: 0, rootEntryId: 'missing-root' },
+    })]))
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.omitted).toEqual([{ rootEntryId: 'missing-root', reason: 'invalid-manifest' }])
+    expect(readLayer(profile)).toEqual([])
+  })
+
+  it('omits disabled registry rows from the derived layer', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageManagerPackage(profile, '@acme/hidden', '1.0.0', 'hidden-root')
+    writeRegistry(profile, registry([
+      registryEntry('@acme/page', '1.0.0'),
+      registryEntry('@acme/hidden', '1.0.0', {
+        enabled: false,
+        page: { id: 'hidden-page', name: 'Hidden', description: 'hidden', defaultOrder: 0, rootEntryId: 'hidden-root' },
+      }),
+    ]))
+
+    const startup = await prepareManagerRuntimeLayer('t', profile)
+    expect(startup.omitted).toEqual([])
+    const rows = readLayer(profile).flatMap(patch => patch.insert)
+    expect(rows.map(row => row.id)).toEqual(['fixture-root'])
+  })
+
+  it('leaves a profile with no registry untouched', async () => {
+    const startup = await prepareManagerRuntimeLayer('t', tmp())
+    expect(startup.recoveryError).toBeUndefined()
+    expect(startup.omitted).toEqual([])
+  })
+
+  it('derives the same safe roots independently of write timing', async () => {
+    const profile = tmp()
+    stageManagerPackage(profile, '@acme/page', '1.0.0')
+    writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
+
+    const before = await deriveSafeRuntimeLayer('t', profile)
+    await prepareManagerRuntimeLayer('t', profile)
+    const after = await deriveSafeRuntimeLayer('t', profile)
+    expect(before.layer).toBe(after.layer)
+    expect(before.omitted).toEqual(after.omitted)
+    expect(before.recoveryError).toBeUndefined()
   })
 })
