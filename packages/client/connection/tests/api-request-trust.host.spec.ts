@@ -1,10 +1,36 @@
 /** Behavior of the /api browser-trust fence (rebinding + cross-site defense). */
 
 import { describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { RpcId, type ClientRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { assertTrustedAuthority, isTrustedApiRequest } from '../src/api-request-trust.ts'
+import type { FetchHandler } from '../src/http-bridge.ts'
+import { PRIVILEGED_METHODS } from '../src/privileged-methods.ts'
+import { HostConnectionService } from '../src/rpc-host.ts'
 
 function request(headers: Record<string, string | undefined>): { headers: Record<string, string | undefined> } {
   return { headers }
+}
+
+/** The seven page-app manager mutations, in Typert `${namespace}/${method}` wire form. */
+const PAGE_APP_MANAGER_METHODS: readonly string[] = [
+  'pageAppManager/install',
+  'pageAppManager/setEnabled',
+  'pageAppManager/setHidden',
+  'pageAppManager/reorder',
+  'pageAppManager/uninstall',
+  'pageAppManager/ackClientActivation',
+  'pageAppManager/recover',
+]
+
+/** One fetch request with a complete client-request envelope and a spoofed Host. */
+function envelopeRequest(method: string, host: string): Request {
+  const envelope: ClientRequest = { type: 'client-request', rpcId: RpcId('fence'), method, payload: {} }
+  return new Request(`http://dsh.internal/api/${method}`, {
+    method: 'POST',
+    headers: { host, 'content-type': 'application/json' },
+    body: JSON.stringify(envelope),
+  })
 }
 
 describe('isTrustedApiRequest', () => {
@@ -104,5 +130,95 @@ describe('isTrustedApiRequest', () => {
     expect(isTrustedApiRequest(request({ ...markers, host: 'bad host' }), [])).toBe(false)
     expect(isTrustedApiRequest(request({ ...markers, host: '127.0.0.999' }), [])).toBe(false)
     expect(isTrustedApiRequest(request({ ...markers, host: '128.0.0.1' }), [])).toBe(false)
+  })
+})
+
+describe('shared fetch handler dispatcher order (privileged fence first)', () => {
+  /**
+   * One honest shared dispatcher seam: a counting interceptor matcher that
+   * claims every exact page-app manager endpoint, a counting gateway handler
+   * that forwards to a separately counted manager executor, and a direct
+   * fallback FetchHandler that claims every row it receives (it answers 200
+   * for anything, unlike the legacy API Proxy carrier, whose route table has
+   * no slash names and would 404 an unclaimed slash row before touching the
+   * proxy). Every dispatch surface is therefore observable on its own.
+   */
+  function sharedDispatcher(): {
+    handler: ReturnType<HostConnectionService['createSharedFetchHandler']>
+    remove: () => Promise<void>
+    matcherCalls: string[]
+    gatewayCalls: string[]
+    executorCalls: string[]
+    fallbackCalls: string[]
+  } {
+    const ctx = new Context()
+    const connection = new HostConnectionService(ctx, [])
+    const matcherCalls: string[] = []
+    const gatewayCalls: string[] = []
+    const executorCalls: string[] = []
+    const fallbackCalls: string[] = []
+    const remove = connection.rpc.intercept('/api', (endpoint) => {
+      matcherCalls.push(endpoint)
+      return PAGE_APP_MANAGER_METHODS.includes(endpoint)
+    }, async (endpoint) => {
+      // The Typert gateway dispatch, which forwards to the manager executor.
+      gatewayCalls.push(endpoint)
+      executorCalls.push(endpoint)
+      return { ok: true, value: { accepted: true } }
+    }, { authority: 'trusted-host' })
+    const fallback: FetchHandler = {
+      fetch: async (received) => {
+        fallbackCalls.push(new URL(received.url).pathname)
+        return new Response('fallback', { status: 200 })
+      },
+    }
+    const handler = connection.createSharedFetchHandler('/api', fallback)
+    return { handler, remove, matcherCalls, gatewayCalls, executorCalls, fallbackCalls }
+  }
+
+  it('rejects every non-loopback page-app manager mutation before matcher, gateway, fallback, or executor runs', async () => {
+    const dispatch = sharedDispatcher()
+    try {
+      for (const method of PAGE_APP_MANAGER_METHODS) {
+        expect(PRIVILEGED_METHODS.has(method)).toBe(true)
+        const response = await dispatch.handler.fetch(envelopeRequest(method, 'harness.example'))
+        expect([method, response.status]).toEqual([method, 403])
+      }
+      // The fence answered before any dispatch surface was consulted: the
+      // interceptor matcher was never asked, the gateway never dispatched,
+      // the fallback never ran, and the manager executor never fired.
+      expect([dispatch.matcherCalls, dispatch.gatewayCalls, dispatch.fallbackCalls, dispatch.executorCalls])
+        .toEqual([[], [], [], []])
+    } finally {
+      await dispatch.remove()
+    }
+  })
+
+  it('lets a loopback page-app manager mutation through the interceptor, gateway, and executor', async () => {
+    const dispatch = sharedDispatcher()
+    try {
+      const response = await dispatch.handler.fetch(envelopeRequest('pageAppManager/install', '127.0.0.1:3080'))
+      expect(response.status).toBe(200)
+      expect([dispatch.matcherCalls, dispatch.gatewayCalls, dispatch.executorCalls, dispatch.fallbackCalls])
+        .toEqual([['pageAppManager/install'], ['pageAppManager/install'], ['pageAppManager/install'], []])
+    } finally {
+      await dispatch.remove()
+    }
+  })
+
+  it('lets a non-privileged non-loopback row fall through to the fallback dispatcher', async () => {
+    const dispatch = sharedDispatcher()
+    try {
+      // The matcher does not claim this Typert-shaped row, and the fence does
+      // not pin it, so the fallback dispatcher answers — the pin is exact, not
+      // a blanket slash-endpoint block.
+      const response = await dispatch.handler.fetch(envelopeRequest('goals/create', 'harness.example'))
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('fallback')
+      expect([dispatch.matcherCalls, dispatch.fallbackCalls, dispatch.gatewayCalls, dispatch.executorCalls])
+        .toEqual([['goals/create'], ['/api/goals/create'], [], []])
+    } finally {
+      await dispatch.remove()
+    }
   })
 })

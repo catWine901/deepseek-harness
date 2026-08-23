@@ -769,8 +769,10 @@ async function bootWatcherTree(options: {
   gateMode: GateSpec['mode']
   /** Additional per-create-name gates; win over gateName/gateMode. */
   gates?: Record<string, GateSpec>
-  fakeHmr?: 'ok' | 'hold' | 'fail' | 'fail-third' | 'inactive-second' | 'dispose-on-resolve' | 'dispose-after-second'
+  fakeHmr?: 'ok' | 'hold' | 'fail' | 'fail-second' | 'fail-third' | 'inactive-second' | 'dispose-on-resolve' | 'dispose-after-second'
   fakeTimer?: boolean
+  /** Returned watcher disposers throw when invoked (rollback cleanup failure). */
+  disposerThrows?: boolean
   /** Number of launcher watcher paths; defaults to 1. */
   watchCount?: number
 }): Promise<WatcherBoot> {
@@ -825,6 +827,7 @@ async function bootWatcherTree(options: {
           configReachedResolve()
           const index = capturedConfigs.length
           if (options.fakeHmr === 'fail') throw new Error('pinned registration failure')
+          if (options.fakeHmr === 'fail-second' && index >= 1) throw new Error('pinned registration failure')
           if (options.fakeHmr === 'fail-third' && index >= 2) throw new Error('pinned registration failure')
           if (options.fakeHmr === 'inactive-second' && index >= 1) {
             throw Object.assign(new Error('cannot create effect on inactive context'), { code: 'INACTIVE_EFFECT' })
@@ -843,7 +846,10 @@ async function bootWatcherTree(options: {
           } else if (options.fakeHmr === 'hold') {
             await new Promise<void>((resolve) => { releaseConfig = resolve })
           }
-          return async () => { disposerCalls.push(index) }
+          return async () => {
+            disposerCalls.push(index)
+            if (options.disposerThrows) throw new Error('rollback disposer failure')
+          }
         },
       })
     }
@@ -1004,6 +1010,26 @@ describe('ProfileRuntime watcher setup and the settled gate', () => {
       // disposed exactly the two owned watchers, newest first.
       expect(capturedConfigs.length).toBe(2)
       expect(disposerCalls).toEqual([1, 0])
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('keeps the original setup failure when a rollback disposer throws', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      fakeHmr: 'fail-second',
+      disposerThrows: true,
+      watchCount: 2,
+    })
+    const { bootPromise, rootCtx, disposerCalls } = tree
+    try {
+      // The first watcher registered; the second failed. Rollback invokes the
+      // first disposer, which throws — but a cleanup failure must not hide
+      // the original setup failure.
+      await expect(bootPromise).rejects.toThrow(/pinned registration failure/)
+      expect(disposerCalls).toEqual([0])
     } finally {
       if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
     }

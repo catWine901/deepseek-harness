@@ -210,24 +210,16 @@ describe('connection node half', () => {
     await dispose()
   })
 
-  it('pins page-app manager mutations to loopback before the Typert gateway or API proxy can claim them', async () => {
+  it('pins page-app manager mutations to loopback before the Typert gateway can claim them', async () => {
     const ctx = new Context()
     const routes: WebRoute[] = []
     ctx.provide('webServer', fakeHttpServer(routes, []) as WebServer)
-    // A counting API Proxy: any fallback dispatch would touch one of its
-    // methods through toFetchHandler, so an empty record proves the fallback
-    // never ran (and the 403 is not the proxy's answer).
-    const apiCalls: string[] = []
-    const apiProxy = new Proxy({}, {
-      get(_target, prop) {
-        if (typeof prop === 'symbol') return undefined
-        apiCalls.push(prop)
-        if (prop === 'events') return { mux: async () => new Response(), host: async () => new Response() }
-        if (prop === 'downloads') return { sessionLog: async () => new Response(null, { status: 200 }) }
-        return async () => Response.json({ ok: true, value: null })
-      },
-    }) as unknown as ApiProxy
-    ctx.provide('apiProxy', apiProxy)
+    // The legacy API Proxy carrier has no slash names in its route table, so
+    // an unclaimed slash row would answer 404 without touching the proxy — a
+    // proxy counter cannot prove whether the fallback was entered. The
+    // load-bearing assertions here are the 403 answer (not the fallback's 404)
+    // and the zero dispatcher counters below.
+    ctx.provide('apiProxy', {} as unknown as ApiProxy)
     const fiber = ctx.plugin({ inject: [...inject], apply }, { trustedHosts: ['harness.example'] })
     await fiber.await()
     const connection = ctx.get('connection') as HostConnectionHandle
@@ -235,11 +227,15 @@ describe('connection node half', () => {
     // dispatch, which forwards to the page-app manager executor — the exact
     // shape of the real dispatch chain, so a non-zero counter would prove the
     // fence was bypassed.
-    let gatewayCalls = 0
-    let executorCalls = 0
-    const remove = connection.rpc.intercept('/api', () => true, async () => {
-      gatewayCalls += 1
-      executorCalls += 1
+    const matcherCalls: string[] = []
+    const gatewayCalls: string[] = []
+    const executorCalls: string[] = []
+    const remove = connection.rpc.intercept('/api', (endpoint) => {
+      matcherCalls.push(endpoint)
+      return true
+    }, async (endpoint) => {
+      gatewayCalls.push(endpoint)
+      executorCalls.push(endpoint)
       return { ok: true, value: { accepted: true } }
     }, { authority: 'trusted-host' })
     const route = routes.find(candidate => candidate.path === API_PATH)!
@@ -252,10 +248,10 @@ describe('connection node half', () => {
       await route.handler(fakePost({ host: 'harness.example' }, `${API_PATH}/${method}`, request), response.response)
       expect([method, response.state.status]).toEqual([method, 403])
     }
-    // No dispatch surface ran for any row: the Typert gateway was never
-    // consulted, the legacy API proxy never answered, and the manager
+    // No dispatch surface ran for any row: the interceptor matcher was never
+    // consulted, the Typert gateway never dispatched, and the manager
     // executor never fired.
-    expect([gatewayCalls, apiCalls.length, executorCalls]).toEqual([0, 0, 0])
+    expect([matcherCalls, gatewayCalls, executorCalls]).toEqual([[], [], []])
     // The pin is loopback-only: the same endpoint from loopback still reaches
     // the gateway and the executor.
     const loopback = fakeResponse()
@@ -263,7 +259,15 @@ describe('connection node half', () => {
       type: 'client-request', rpcId: RpcId('page-app-loopback'), method: PAGE_APP_MANAGER_METHODS[0], payload: {},
     }), loopback.response)
     expect(loopback.state.status).toBe(200)
-    expect([gatewayCalls, apiCalls.length, executorCalls]).toEqual([1, 0, 1])
+    expect([matcherCalls, gatewayCalls, executorCalls])
+      .toEqual([[PAGE_APP_MANAGER_METHODS[0]], [PAGE_APP_MANAGER_METHODS[0]], [PAGE_APP_MANAGER_METHODS[0]]])
+    // An ordinary non-loopback row still dispatches: the pin pins the exact
+    // privileged set, not slash endpoints as a class.
+    const ordinary = fakeResponse()
+    await route.handler(fakePost({ host: 'harness.example' }, `${API_PATH}/goals/create`, {
+      type: 'client-request', rpcId: RpcId('page-app-ordinary'), method: 'goals/create', payload: {},
+    }), ordinary.response)
+    expect(ordinary.state.status).toBe(200)
     await remove()
     await fiber.dispose()
   })
