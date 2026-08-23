@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Context } from '@deepseek-ai/cordis'
+import { Context, symbols } from '@deepseek-ai/cordis'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import {
@@ -23,6 +23,7 @@ import {
   PROFILE_RUNTIME_SERVICE,
   ProfileRuntime,
   readManagerLayerPatches,
+  watchUserPatches,
   type ActiveProfileIdentity,
   type ExpectedManagedRoot,
   type ProfileRuntimeApplyRequest,
@@ -449,7 +450,7 @@ describe('ProfileRuntime mutation gates', () => {
         .rejects.toThrow(/before the initial tree has settled/i)
       await expect(runtime.restoreManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
         .rejects.toThrow(/before the initial tree has settled/i)
-      control.markSettled()
+      await control.markSettled()
       // Once settled, the gates pass and the call proceeds to the staging
       // verification (no layer file was staged here).
       await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
@@ -618,5 +619,110 @@ describe('ProfileRuntime runtime privacy', () => {
   it('exposes no launcher control accessor on the package entry surface', async () => {
     const appBoot = await import('../src/index.ts')
     expect((appBoot as Record<string, unknown>).profileRuntimeControl).toBeUndefined()
+  })
+})
+
+describe('ProfileRuntime proxy poisoning and watcher surface', () => {
+  it('does not trust a writable symbols.original on a raw instance', async () => {
+    const dir = tmp()
+    writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
+    writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
+    mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
+    let runtime: ProfileRuntime | undefined
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
+      runtime = new ProfileRuntime(hostCtx, {
+        identity: { name: 'demo', directory: dir },
+        compose: managerPatches => composeProfilePatches({
+          bundlePatches: [],
+          managerPatches,
+          profilePatches: [],
+          homePatches: [],
+          overlays: [],
+        }),
+        initialManagerPatches: [],
+      })
+    })
+    if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
+    const attackerDir = tmp()
+    const attackerCtx = new Context()
+    try {
+      // A second registered runtime used as the poisoned alias.
+      const attacker = new ProfileRuntime(attackerCtx, {
+        identity: { name: 'attacker', directory: attackerDir },
+        compose: () => [],
+        initialManagerPatches: [],
+      })
+      // A consumer can read the global `symbols.original` key from the public
+      // cordis export and write it onto the RAW victim instance; the victim's
+      // identity, state, and behavior must stay bound to the victim.
+      ;(runtime as unknown as Record<symbol, unknown>)[symbols.original] = attacker
+      expect(runtime.identity).toEqual({ name: 'demo', directory: dir })
+
+      // The traceable proxy cannot be poisoned the same way: its set trap
+      // refuses `symbols.original` outright (the assignment throws in strict
+      // mode), so the proxy keeps unwrapping to the real target.
+      const viaProxy: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
+      expect(() => {
+        ;(viaProxy as Record<symbol, unknown>)[symbols.original] = attacker
+      }).toThrow()
+      expect((viaProxy as Record<symbol, unknown>)[symbols.original]).not.toBe(attacker)
+    } finally {
+      await ctx.fiber.dispose()
+      await attackerCtx.fiber.dispose()
+    }
+  })
+
+  it('cannot route a user-patch watcher to the runtime through the public watchUserPatches API', async () => {
+    const dir = tmp()
+    writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
+    writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
+    mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
+    const patchFile = join(dir, PROFILE_PATCH_FILENAME)
+    writeFileSync(patchFile, '[]\n')
+    let runtime: ProfileRuntime | undefined
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
+      runtime = new ProfileRuntime(hostCtx, {
+        identity: { name: 'demo', directory: dir },
+        compose: managerPatches => composeProfilePatches({
+          bundlePatches: [],
+          managerPatches,
+          profilePatches: loadOptionalPatches(NAME, patchFile) ?? [],
+          homePatches: [],
+          overlays: [],
+        }),
+        initialManagerPatches: [],
+      })
+    })
+    if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
+    try {
+      // A fake HMR captures the registered config callback deterministically
+      // (no chokidar timing), so invoking the callback simulates one refresh.
+      let captured: (() => Promise<void>) | undefined
+      ctx.provide('hmr', {
+        registerConfig: async (_filename: string, callback: () => Promise<void>) => {
+          captured = callback
+          return async () => {}
+        },
+      })
+      const { layer, expected } = singleRootLayer('page', 1)
+      writeFileSync(join(dir, '.workspace-manager', 'runtime-layer.yml'), layer)
+      await runtime.applyManagerLayer(applyRequest(layer, [expected]))
+
+      const trigger = join(dir, 'consumer-trigger.yml')
+      writeFileSync(trigger, '[]\n')
+      // @ts-expect-error the public watcher API has no runtime-routing option
+      await watchUserPatches(ctx, { binName: NAME, filename: trigger, runtime })
+      expect(captured).toBeDefined()
+      await captured!()
+
+      // A public watcher must not have recomposed the runtime: the root
+      // include's patch list must not contain the acknowledged manager layer.
+      const include = [...ctx.loader.entries()].find(entry => entry.options.name === 'cordis:include')
+      const config = include?.options.config as { patches?: Array<Record<string, unknown>> } | undefined
+      const patches = config?.patches ?? []
+      expect(patches.some(patch => JSON.stringify(patch).includes('page'))).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 })

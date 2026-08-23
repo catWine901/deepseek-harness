@@ -88,7 +88,11 @@ describe('launcher startup with a corrupt registry', () => {
         managerLayer,
         createLaunchEnvironmentSnapshot([]),
         [],
-        () => {},
+        // The runtime registers its watcher paths at settle; a fake HMR keeps
+        // the source-tree test from resolving the unbuilt timer package.
+        (hostCtx) => {
+          hostCtx.provide('hmr', { registerConfig: async () => async () => {} })
+        },
         () => {},
       )
       try {
@@ -175,7 +179,11 @@ describe('launcher startup with a valid registry', () => {
         managerLayer,
         createLaunchEnvironmentSnapshot([]),
         [],
-        () => {},
+        // The runtime registers its watcher paths at settle; a fake HMR keeps
+        // the source-tree test from resolving the unbuilt timer package.
+        (hostCtx) => {
+          hostCtx.provide('hmr', { registerConfig: async () => async () => {} })
+        },
         () => {},
       )
       try {

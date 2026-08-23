@@ -14,7 +14,7 @@
 import { writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { FiberState, type Context } from '@deepseek-ai/cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import type { PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import {
@@ -30,7 +30,6 @@ import {
   PROFILE_PATCH_FILENAME,
   ProfileRuntime,
   readManagerLayerPatches,
-  watchUserPatches,
   type ManagerLayerStartup,
   type Profile,
 } from '@deepseek-ai/dsh-app-boot'
@@ -200,22 +199,6 @@ export interface RunProfileOptions {
   args: readonly string[]
 }
 
-/**
- * Re-throw a watcher-setup failure unless a shutdown already owns the tree:
- * a signal aborted this invocation, or an app requested exit (`ctx.appExit`
- * from a fast one-shot) and the root's disposal rejected the in-flight setup
- * await. Either way the failure describes a tree that is exiting as asked,
- * not a broken watch.
- * @param ctx - the booted root context.
- * @param signal - this invocation's signal-shutdown fact.
- * @param error - the setup failure.
- */
-function suppressShutdownError(ctx: Context, signal: AbortSignal, error: unknown): void {
-  if (signal.aborted) return
-  if (ctx.fiber.state !== FiberState.ACTIVE || ctx.get('loader') === undefined) return
-  throw error
-}
-
 /** The settled root context and the launcher-provided profile runtime of one boot. */
 export interface ProfileBootResult {
   ctx: Context
@@ -266,11 +249,18 @@ export async function bootComposedProfile(
       exit,
     })
     // Launcher-owned profile runtime: immutable identity plus the sole
-    // acknowledged live-recomposition API, beside the launch facts.
+    // acknowledged live-recomposition API, beside the launch facts. The
+    // user-patch watcher paths are immutable construction-time configuration
+    // the runtime consumes internally at settle — the CLI never receives or
+    // imports a launcher control.
     runtime = new ProfileRuntime(hostCtx, {
       identity: { name: composed.profile.name, directory: composed.profile.dir },
       compose: managerPatches => composeLivePatches(composed, managerPatches),
       initialManagerPatches,
+      watchPatches: [
+        { binName: NAME, filename: composed.profile.patchPath },
+        { binName: NAME, filename: homePatchPath() },
+      ],
       ...managerLayer.recoveryError === undefined ? {} : { recoveryError: managerLayer.recoveryError },
       omittedRoots: managerLayer.omitted,
     })
@@ -308,7 +298,7 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
     await app.current?.fiber.dispose()
   })
 
-  const { ctx, runtime } = await bootComposedProfile(
+  const { ctx } = await bootComposedProfile(
     composed,
     managerLayer,
     options.environment,
@@ -317,47 +307,8 @@ export async function runProfile(options: RunProfileOptions): Promise<{ ctx: Con
     code => void shutdown.shutdown(code),
   )
   app.current = ctx
-  // A surface can dispose the whole tree while boot or this post-boot watcher
-  // setup is still in flight — a signal, or a fast one-shot's appExit. Loader
-  // presence and fiber state own liveness; the initial check skips a tree
-  // that already exited, and the catch below re-checks for an exit that
-  // landed mid-setup. Watching is unconditional: a one-shot surface exits
-  // through its bounded shutdown, which disposes the watchers before the
-  // loop drains.
-  if (!signalShutdown.signal.aborted
-    && ctx.fiber.state === FiberState.ACTIVE
-    && ctx.get('loader') !== undefined) {
-    try {
-      // Config-only HMR for the live profile patch layer: the web bundle
-      // disables the shared module-reload `hmr` row (its reload lifecycle is
-      // untested), so when the composition leaves no HMR service, mount a
-      // watch-only instance with no module roots — cordis.patch.yml edits stay
-      // live on every long-lived surface. A silent skip would break the
-      // documented hot-reload contract. HMR injects the timer service, which a
-      // bare custom profile may not mount either.
-      if (ctx.get('hmr') === undefined) {
-        if (ctx.get('timer') === undefined) {
-          await ctx.loader.create({ name: '@deepseek-ai/cordis-plugin-timer' })
-        }
-        await ctx.loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
-      }
-      // Both user-patch watchers and the manager route through the runtime's
-      // serialized recomposition queue — app-boot resolves the boot-only
-      // control internally, so the injected service surface exposes no
-      // un-audited recomposition: no independent entry.update writers.
-      await watchUserPatches(ctx, {
-        binName: NAME,
-        filename: composed.profile.patchPath,
-        ...runtime === undefined ? {} : { runtime },
-      })
-      await watchUserPatches(ctx, {
-        binName: NAME,
-        filename: homePatchPath(),
-        ...runtime === undefined ? {} : { runtime },
-      })
-    } catch (error) {
-      suppressShutdownError(ctx, signalShutdown.signal, error)
-    }
-  }
+  // The runtime registers its launcher-owned user-patch watchers internally
+  // once the tree settles (inside boot), routing every generation through the
+  // serialized queue; nothing further is set up here.
   return { ctx, shutdown }
 }

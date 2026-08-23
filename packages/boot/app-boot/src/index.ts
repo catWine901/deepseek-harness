@@ -241,14 +241,6 @@ export interface UserPatchWatchOptions {
    * is the whole patch list.
    */
   compose?: (userPatches: PatchOptions[]) => PatchOptions[]
-  /**
-   * Route this watcher through the profile runtime's serialized
-   * recomposition queue (the boot-only control, resolved inside this package):
-   * user-patch generations then compose the acknowledged manager layer
-   * snapshot and share the manager's single `entry.update` writer, so no
-   * independent writers can race. When set, `compose` is unused.
-   */
-  runtime?: ProfileRuntime
 }
 
 /**
@@ -262,22 +254,12 @@ export async function watchUserPatches(
   ctx: Context,
   options: UserPatchWatchOptions,
 ): Promise<() => Promise<void>> {
-  const { binName, filename, compose = (patches: PatchOptions[]) => patches, runtime } = options
+  const { binName, filename, compose = (patches: PatchOptions[]) => patches } = options
   const hmr = ctx.get('hmr')
   if (hmr === undefined) throw new Error(`${binName}: user patch-layer watching requires the Cordis HMR service`)
   const entry = bootstrapIncludes.get(ctx)
   if (entry === undefined) throw new Error(`${binName}: user patch-layer watching requires the root Include entry`)
   const register = hmr.registerConfig(filename, async () => {
-    if (runtime !== undefined) {
-      // The serialized recomposition path owns the entry.update; the launcher
-      // routes both user watchers and manager generations through one queue.
-      const control = profileRuntimeControl(runtime)
-      if (control === undefined) {
-        throw new Error(`${binName}: profile runtime control is unavailable for user-patch watching`)
-      }
-      await control.recompose()
-      return
-    }
     // Re-read the include's non-patch options per refresh: a writer that
     // updates the root Include's other options between refreshes (none exists
     // today) must not have them silently reverted by a user-layer reload.
@@ -831,7 +813,10 @@ export async function boot(
     if (ctx.get('loader') === undefined) return ctx
     await assertEntriesActivated(ctx, binName)
     if (runtime instanceof ProfileRuntime) {
-      profileRuntimeControl(runtime)?.markSettled()
+      // Settle the runtime (and register its launcher-owned user-patch
+      // watchers on the serialized queue) only after the initial tree has
+      // been fully audited.
+      await profileRuntimeControl(runtime)?.markSettled()
     }
     return ctx
   } catch (cause) {

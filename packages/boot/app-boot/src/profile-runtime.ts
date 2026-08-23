@@ -411,6 +411,15 @@ export interface ProfileRuntimeOptions {
    * snapshot until a manager-layer apply/restore audit promotes a new one.
    */
   readonly initialManagerPatches: readonly PatchOptions[]
+  /**
+   * Launcher-owned user-patch files routed through the serialized queue.
+   * Consumed internally when the tree settles (after the boot activation
+   * audit): the runtime ensures an HMR service and registers one watcher per
+   * path that recomposes the acknowledged snapshot. The public watcher API
+   * deliberately has no runtime-routing option, so this configuration is the
+   * only way a watcher reaches the queue.
+   */
+  readonly watchPatches?: readonly { binName: string; filename: string }[]
   /** Startup recovery error when the registry is corrupt; managed roots failed closed. */
   readonly recoveryError?: string
   /** Roots the safe derived layer omitted at startup, with their reasons. */
@@ -422,8 +431,10 @@ export interface ProfileRuntimeOptions {
  * absent from the injected service surface: a service consumer can read the
  * manager-facing API but can never bind, settle, or trigger the un-audited
  * watcher recomposition. `boot()` binds and settles through
- * {@link profileRuntimeControl}; the launcher routes the user-patch watchers
- * through the same control's {@link ProfileRuntimeControl.recompose}.
+ * {@link profileRuntimeControl}; the runtime consumes its launcher-owned
+ * watcher configuration internally at settle, and the launcher may still
+ * trigger one watcher-path recomposition through
+ * {@link ProfileRuntimeControl.recompose}.
  */
 export interface ProfileRuntimeControl {
   /**
@@ -435,10 +446,11 @@ export interface ProfileRuntimeControl {
    */
   bindRootInclude(entry: Entry | undefined): void
   /**
-   * Mark the initial tree as settled. Called by `boot()` after the activation
-   * audit; the manager may not mutate the profile before this.
+   * Mark the initial tree as settled and register the launcher-owned watcher
+   * paths. Called by `boot()` after the activation audit; the manager may not
+   * mutate the profile before this, and the watchers only exist afterwards.
    */
-  markSettled(): void
+  markSettled(): Promise<void>
   /**
    * Run one full-generation recomposition through the serialized queue
    * without an audit, composing the acknowledged manager layer snapshot: the
@@ -463,6 +475,8 @@ class ProfileRuntimeState {
   readonly recoveryError: string | undefined
   readonly omittedRoots: readonly OmittedManagedRoot[]
   readonly compose: (managerPatches: readonly PatchOptions[]) => readonly PatchOptions[]
+  /** Launcher-owned user-patch files watched through the serialized queue. */
+  readonly watchPatches: readonly { binName: string; filename: string }[]
   /** The launcher/boot-only control, built once over this state's closures. */
   readonly control: ProfileRuntimeControl
 
@@ -482,10 +496,47 @@ class ProfileRuntimeState {
     this.omittedRoots = Object.freeze([...options.omittedRoots ?? []])
     this.compose = options.compose
     this.managerPatches = [...options.initialManagerPatches]
+    this.watchPatches = Object.freeze([...options.watchPatches ?? []].map(watch => Object.freeze({ ...watch })))
     this.control = {
       bindRootInclude: (entry): void => { this.entry = entry },
-      markSettled: (): void => { this.settled = true },
+      markSettled: async (): Promise<void> => {
+        this.settled = true
+        await this.registerWatchPatches()
+      },
       recompose: (): Promise<void> => this.recomposeInternal(),
+    }
+  }
+
+  /**
+   * Register the launcher-owned user-patch watchers on the serialized queue.
+   * Runs when the tree settles (boot's post-audit mark): an absent HMR
+   * service is mounted watch-only (no module roots), then one config watcher
+   * per path recomposes the acknowledged snapshot. The tree may be disposing
+   * exactly as asked (a signal or a fast one-shot), in which case
+   * registration stops or an `INACTIVE_EFFECT` failure is treated as the exit
+   * it is; any other setup failure fails loud.
+   */
+  private async registerWatchPatches(): Promise<void> {
+    if (this.watchPatches.length === 0) return
+    if (this.ctx.get('hmr') === undefined) {
+      const loader = this.ctx.get('loader')
+      if (loader === undefined) return // the tree exited while settling
+      if (this.ctx.get('timer') === undefined) {
+        await loader.create({ name: '@deepseek-ai/cordis-plugin-timer' })
+      }
+      await loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
+    }
+    const hmr = this.ctx.get('hmr')
+    if (hmr === undefined) {
+      throw new Error('page-app profile runtime: the HMR service is unavailable for user-patch watching')
+    }
+    for (const watch of this.watchPatches) {
+      try {
+        await hmr.registerConfig(watch.filename, () => this.recomposeInternal())
+      } catch (error) {
+        if ((error as { code?: string } | null)?.code === 'INACTIVE_EFFECT') continue
+        throw error
+      }
     }
   }
 
@@ -631,25 +682,27 @@ class ProfileRuntimeState {
 const states = new WeakMap<ProfileRuntime, ProfileRuntimeState>()
 
 /**
- * Resolve the raw service instance behind any Cordis access path: the raw
- * instance, the traceable proxy `ctx.get` returns, or the shadow context a
- * proxied method receives as `this`. The traceable proxy exposes the raw
- * target under `symbols.original`; anything else is already raw.
+ * Resolve the module-private state for a service instance, validating every
+ * proxy step. A direct registry hit takes precedence: a raw instance's own
+ * properties — including a consumer-written `symbols.original` key — can
+ * never redirect state, because the raw instance is the registry key and a
+ * direct hit is returned first. Only objects that are NOT directly registered
+ * may be unwrapped through the traceable proxy's `symbols.original` escape
+ * hatch, and the unwrapped target must itself resolve to registered state;
+ * anything else fails loud. `this` inside a proxied method arrives as the
+ * shadow receiver, which also unwraps to the registered raw instance.
  * @param runtime - the service instance in any proxy form.
- * @returns the raw instance.
+ * @returns the module-private state.
  */
-function unwrapProfileRuntime(runtime: ProfileRuntime): ProfileRuntime {
-  const target = (runtime as unknown as Record<symbol, unknown>)[symbols.original]
-  return (target as ProfileRuntime | undefined) ?? runtime
-}
-
-/** Resolve one runtime's module-private state, failing loud on foreign instances. */
 function stateOf(runtime: ProfileRuntime): ProfileRuntimeState {
-  const state = states.get(unwrapProfileRuntime(runtime))
-  if (state === undefined) {
-    throw new Error('page-app profile runtime: state is unavailable for this instance')
+  const direct = states.get(runtime)
+  if (direct !== undefined) return direct
+  const target = (runtime as unknown as Record<symbol, unknown>)[symbols.original] as ProfileRuntime | undefined
+  if (target !== undefined) {
+    const viaOriginal = states.get(target)
+    if (viaOriginal !== undefined) return viaOriginal
   }
-  return state
+  throw new Error('page-app profile runtime: state is unavailable for this instance')
 }
 
 /**
@@ -657,12 +710,22 @@ function stateOf(runtime: ProfileRuntime): ProfileRuntimeState {
  * lives in the module-private state registry; it is not exported from the
  * package entry surface, so consumers of the injected service cannot reach
  * bind/settle/recompose through any public string, symbol, or package API.
+ * Directly registered raw instances are resolved without consulting any
+ * writable own property; only non-registered proxy forms are unwrapped, and
+ * only when the unwrapped target is itself registered.
  * @param runtime - the service instance (raw or the traceable proxy).
  * @returns the control, or undefined when the instance was not constructed by
  * this module (never happens for instances built through {@link ProfileRuntime}).
  */
 export function profileRuntimeControl(runtime: ProfileRuntime): ProfileRuntimeControl | undefined {
-  return states.get(unwrapProfileRuntime(runtime))?.control
+  const direct = states.get(runtime)
+  if (direct !== undefined) return direct.control
+  const target = (runtime as unknown as Record<symbol, unknown>)[symbols.original] as ProfileRuntime | undefined
+  if (target !== undefined) {
+    const viaOriginal = states.get(target)
+    if (viaOriginal !== undefined) return viaOriginal.control
+  }
+  return undefined
 }
 
 /**
