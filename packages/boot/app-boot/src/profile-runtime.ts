@@ -7,8 +7,9 @@
  * tree's manager plugin may inject the service during boot but cannot mutate
  * the profile until the initial tree has settled — a settled mark that opens
  * the mutation gate only after launcher watcher setup fully succeeds, and
- * that treats a tree exiting mid-setup as the exit it is, never a boot
- * failure. Every generation — the
+ * that treats a tree exiting mid-setup — or a watcher failing with
+ * `INACTIVE_EFFECT` — as the exit it is, never a boot failure and never a
+ * settled partial setup. Every generation — the
  * manager's apply/restore and both user-patch watchers — runs through one
  * serialized recomposition queue, so no independent `entry.update` writers
  * can race on the root Include.
@@ -453,8 +454,11 @@ export interface ProfileRuntimeControl {
    * paths. Called by `boot()` after the activation audit; the manager may not
    * mutate the profile before this, and the watchers only exist afterwards.
    * The mutation gate opens only after watcher setup fully succeeds: a setup
-   * failure on a live tree keeps the gate closed and fails boot, and a tree
-   * that exits during setup never opens the gate.
+   * failure on a live tree keeps the gate closed and fails boot; an
+   * `INACTIVE_EFFECT` create or registration is the exit in flight and keeps
+   * the gate closed without failing boot (a partial watcher set is never
+   * settled); and a tree that exits during setup — including between the
+   * final registration resolving and setup returning — never opens the gate.
    */
   markSettled(): Promise<void>
   /**
@@ -535,10 +539,16 @@ class ProfileRuntimeState {
    * shutdown-aware — the tree may be disposing exactly as asked (a signal or
    * a fast one-shot) while a `loader.create` or `registerConfig` await is in
    * flight, in which case setup stops and the exit is not a boot failure; an
-   * `INACTIVE_EFFECT` registration failure is that same exit; any other setup
-   * error on a still-active tree fails loud.
-   * @returns false when the tree exited during setup (the mutation gate stays
-   * closed for a tree that never settled), true otherwise.
+   * `INACTIVE_EFFECT` failure — of a create or of any registration — is that
+   * same exit and never continues, because one missing watcher is a partial
+   * setup that must not open the gate even when the tree still looks live;
+   * any other setup error on a still-active tree fails loud. The tree is
+   * re-checked after every registration and once more at the end, so a
+   * disposal that lands between a registration resolving and setup returning
+   * keeps the gate closed.
+   * @returns false when the tree exited during setup or a watcher failed with
+   * `INACTIVE_EFFECT` (the mutation gate stays closed for a tree that never
+   * fully settled), true only when every watcher is registered on a live tree.
    */
   private async registerWatchPatches(): Promise<boolean> {
     if (this.watchPatches.length === 0) return !this.treeExited()
@@ -553,6 +563,10 @@ class ProfileRuntimeState {
         await loader.create({ name: '@deepseek-ai/cordis-plugin-hmr', config: { root: [] } })
       }
     } catch (error) {
+      // INACTIVE_EFFECT is the exit itself, even before liveness has visibly
+      // flipped: the created service is not there, so setup cannot complete
+      // and the gate must stay closed.
+      if ((error as { code?: string } | null)?.code === 'INACTIVE_EFFECT') return false
       // A create that fails because the tree is going away is the exit itself;
       // the same error on an active tree is a real watcher-setup failure.
       if (this.treeExited()) return false
@@ -567,12 +581,18 @@ class ProfileRuntimeState {
       try {
         await hmr.registerConfig(watch.filename, () => this.recomposeInternal())
       } catch (error) {
-        if ((error as { code?: string } | null)?.code === 'INACTIVE_EFFECT') continue
+        // An INACTIVE_EFFECT registration is a missing watcher: earlier paths
+        // may already be registered, but a partial set must never open the
+        // gate, so fail closed instead of continuing to a partial setup.
+        if ((error as { code?: string } | null)?.code === 'INACTIVE_EFFECT') return false
         if (this.treeExited()) return false
         throw error
       }
+      // The tree can exit right after a registration resolves; the gate opens
+      // only when every watcher is registered and the tree is still live.
+      if (this.treeExited()) return false
     }
-    return true
+    return !this.treeExited()
   }
 
   /**

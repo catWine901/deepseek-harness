@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { Context, symbols } from '@deepseek-ai/cordis'
+import { Context, FiberState, symbols } from '@deepseek-ai/cordis'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import {
@@ -741,6 +741,8 @@ interface WatcherBoot {
   configReached: Promise<void>
   /** Release the held registerConfig. */
   releaseConfig: () => void
+  /** Config callbacks the fake HMR registered, in call order (only successes). */
+  capturedConfigs: (() => Promise<void>)[]
 }
 
 /**
@@ -753,9 +755,11 @@ interface WatcherBoot {
 async function bootWatcherTree(options: {
   /** Loader.create name the gate intercepts ('pass' disables interception). */
   gateName: string
-  gateMode: 'pass' | 'hold' | 'fail'
-  fakeHmr?: 'ok' | 'hold' | 'fail'
+  gateMode: 'pass' | 'hold' | 'fail' | 'fail-inactive'
+  fakeHmr?: 'ok' | 'hold' | 'fail' | 'inactive-second' | 'dispose-on-resolve'
   fakeTimer?: boolean
+  /** Number of launcher watcher paths; defaults to 1. */
+  watchCount?: number
 }): Promise<WatcherBoot> {
   const dir = tmp()
   writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
@@ -769,6 +773,8 @@ async function bootWatcherTree(options: {
   const configReached = new Promise<void>((resolve) => { configReachedResolve = resolve })
   let readyResolve!: () => void
   const ready = new Promise<void>((resolve) => { readyResolve = resolve })
+  const watchCount = options.watchCount ?? 1
+  const capturedConfigs: (() => Promise<void>)[] = []
   let runtime: ProfileRuntime | undefined
   let rootCtx: Context | undefined
   const gate = { mode: options.gateMode, targetName: options.gateName }
@@ -786,6 +792,10 @@ async function bootWatcherTree(options: {
         gate.mode = 'pass'
         throw new Error('pinned watcher setup failure')
       }
+      if (gate.mode === 'fail-inactive') {
+        gate.mode = 'pass'
+        throw Object.assign(new Error('cannot create effect on inactive context'), { code: 'INACTIVE_EFFECT' })
+      }
       gate.mode = 'pass'
       createReachedResolve()
       await new Promise<void>((resolve) => { releaseCreate = resolve })
@@ -793,12 +803,21 @@ async function bootWatcherTree(options: {
     }
     if (options.fakeHmr !== undefined) {
       hostCtx.provide('hmr', {
-        registerConfig: async () => {
+        registerConfig: async (_filename: string, callback: () => Promise<void>) => {
           configReachedResolve()
           if (options.fakeHmr === 'fail') throw new Error('pinned registration failure')
-          if (options.fakeHmr === 'hold') {
+          if (options.fakeHmr === 'inactive-second' && capturedConfigs.length >= 1) {
+            throw Object.assign(new Error('cannot create effect on inactive context'), { code: 'INACTIVE_EFFECT' })
+          }
+          if (options.fakeHmr === 'dispose-on-resolve') {
+            // The app exits exactly as asked immediately before this
+            // registration resolves; the tree is really gone by the time the
+            // runtime's await lands.
+            await hostCtx.fiber.dispose()
+          } else if (options.fakeHmr === 'hold') {
             await new Promise<void>((resolve) => { releaseConfig = resolve })
           }
+          capturedConfigs.push(callback)
           return async () => {}
         },
       })
@@ -814,7 +833,10 @@ async function bootWatcherTree(options: {
         overlays: [],
       }),
       initialManagerPatches: [],
-      watchPatches: [{ binName: NAME, filename: join(dir, PROFILE_PATCH_FILENAME) }],
+      watchPatches: Array.from({ length: watchCount }, (_, index) => ({
+        binName: NAME,
+        filename: join(dir, index === 0 ? PROFILE_PATCH_FILENAME : `home-${index}.patch.yml`),
+      })),
     })
     readyResolve()
   })
@@ -830,6 +852,7 @@ async function bootWatcherTree(options: {
     releaseCreate: () => { releaseCreate() },
     configReached,
     releaseConfig: () => { releaseConfig() },
+    capturedConfigs,
   }
 }
 
@@ -915,5 +938,85 @@ describe('ProfileRuntime watcher setup and the settled gate', () => {
     } finally {
       if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
     }
+  })
+
+  it('does not treat a partial watcher registration (INACTIVE_EFFECT) as settled', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      fakeHmr: 'inactive-second',
+      watchCount: 2,
+    })
+    const { bootPromise, runtime, rootCtx, capturedConfigs, managerLayerPath } = tree
+    try {
+      // The first watcher path registers; the second fails with INACTIVE_EFFECT
+      // while the tree still looks live. Setup is partial — one watcher is
+      // missing — so the mutation gate must stay closed and no manager apply
+      // may be accepted or treated as settled.
+      const { layer, expected } = singleRootLayer('page', 1)
+      writeFileSync(managerLayerPath, layer)
+      const ctx = await bootPromise
+      expect(capturedConfigs.length).toBe(1)
+      expect(rootCtx.get('loader')).toBeDefined()
+      await expect(runtime.applyManagerLayer(applyRequest(layer, [expected])))
+        .rejects.toThrow(/before the initial tree has settled/i)
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'page')).toBe(false)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('does not escalate an INACTIVE_EFFECT timer create into a boot failure', async () => {
+    const tree = await bootWatcherTree({
+      gateName: '@deepseek-ai/cordis-plugin-timer',
+      gateMode: 'fail-inactive',
+    })
+    const { bootPromise, runtime, rootCtx } = tree
+    try {
+      // The timer create fails with INACTIVE_EFFECT while the tree still looks
+      // live: the exit is in flight but has not visibly flipped, so boot must
+      // not fail, and the gate must not open.
+      const ctx = await bootPromise
+      expect(rootCtx.fiber.state).toBe(FiberState.ACTIVE)
+      expect(ctx.get('loader')).toBeDefined()
+      await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+        .rejects.toThrow(/before the initial tree has settled/i)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('does not escalate an INACTIVE_EFFECT HMR create into a boot failure', async () => {
+    const tree = await bootWatcherTree({
+      gateName: '@deepseek-ai/cordis-plugin-hmr',
+      gateMode: 'fail-inactive',
+      fakeTimer: true, // skip timer creation so the HMR create is the failing one
+    })
+    const { bootPromise, runtime, rootCtx } = tree
+    try {
+      const ctx = await bootPromise
+      expect(rootCtx.fiber.state).toBe(FiberState.ACTIVE)
+      expect(ctx.get('loader')).toBeDefined()
+      await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+        .rejects.toThrow(/before the initial tree has settled/i)
+    } finally {
+      if (rootCtx.get('loader') !== undefined) await rootCtx.fiber.dispose()
+    }
+  })
+
+  it('keeps the gate closed when the tree exits right before the final registration resolves', async () => {
+    const tree = await bootWatcherTree({
+      gateName: 'pass',
+      gateMode: 'pass',
+      fakeHmr: 'dispose-on-resolve',
+    })
+    const { bootPromise, runtime } = tree
+    // The real tree is disposed inside the final registerConfig call, so by
+    // the time the await lands the exit already happened; the final liveness
+    // recheck must keep the gate closed instead of settling an exited tree.
+    const ctx = await bootPromise
+    expect(ctx.get('loader')).toBeUndefined()
+    await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
+      .rejects.toThrow(/before the initial tree has settled/i)
   })
 })
