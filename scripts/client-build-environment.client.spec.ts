@@ -12,7 +12,7 @@ import {
   resolveClientBuildEnvironment,
   writeClientBuildRecord,
 } from './client-build-environment.ts'
-import { clientBundle } from '../packages/client/tsdown.client.ts'
+import { clientBundle, REPOSITORY_ROOT } from '../packages/client/tsdown.client.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const PROBE_NAME = 'DSH_CLIENT_BUILD_TEST'
@@ -52,6 +52,10 @@ function buildFixture(environment: Record<string, string>): string {
 }
 
 describe('client build environment', () => {
+  it('resolves the client build preset repository root to the repository root', () => {
+    expect(resolve(REPOSITORY_ROOT)).toBe(root)
+  })
+
   it('requires an exact public environment for a named artifact profile', () => {
     const expected = {
       DSH_CLIENT_BUILD_PROFILE: 'official',

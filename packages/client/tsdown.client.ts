@@ -78,11 +78,11 @@ const GENERATED_REMOTE = /^@deepseek-ai\/dsh-[a-z0-9]+(?:-[a-z0-9]+)*\/remote$/
 const SKIP_WORKSPACE_BUILD: UserConfig = { entry: '' }
 
 // This file lives at `packages/client/tsdown.client.ts`; the repository root
-// is THREE levels up (`packages/client` → `packages` → root). `../..` would
-// land on `packages/`, breaking the workspace manifest scan (the glob
-// `packages/*/*/package.json` is relative to this root) and the browser
-// source rebase.
-const REPOSITORY_ROOT = fileURLToPath(new URL('../../..', import.meta.url))
+// is TWO directory hops up (`packages/client` → `packages` → root). `../../..`
+// would land on the repository's parent, breaking the workspace manifest
+// scan (the glob `packages/*/*/package.json` is relative to this root) and
+// the browser source rebase.
+export const REPOSITORY_ROOT = fileURLToPath(new URL('../..', import.meta.url))
 
 /** Rebase a physical lib-relative source onto a browser URL that mirrors the repository directories. */
 function browserSourcePath(source: string, sourcemapPath: string): string {
