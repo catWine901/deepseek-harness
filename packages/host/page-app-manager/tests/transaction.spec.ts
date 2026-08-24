@@ -112,7 +112,14 @@ function fakeRuntime(): { runtime: ProfileRuntime; applySpy: ReturnType<typeof v
 }
 
 function lifecycle(executor: PageAppPackageExecutor, runtime: ProfileRuntime = fakeRuntime().runtime): PageAppLifecycle {
-  return new PageAppLifecycle({ profileDir: dir, executor, runtime, pnpmWorkspaceFile: workspaceYaml })
+  return new PageAppLifecycle({
+    profileDir: dir,
+    executor,
+    runtime,
+    pnpmWorkspaceFile: workspaceYaml,
+    settlementTimeoutMs: 60_000,
+    clientGraphRev: () => 'graph-rev-1',
+  })
 }
 
 /** Drive one install to completion by acknowledging through the targeted activation gate. */
@@ -316,5 +323,136 @@ describe('activation gate', () => {
     expect(lc.activation.acknowledge('txn-2' as never, 'client-1' as never, PKG, 'workspace.valid', 'layer-1')).toMatchObject({ accepted: false, reason: 'wrong-target' })
     expect(lc.activation.acknowledge(transactionId, 'client-1' as never, PKG, 'workspace.valid', 'layer-X')).toMatchObject({ accepted: false, reason: 'wrong-target' })
     lc.activation.discard()
+  })
+})
+
+describe('M1.1 cancellation, graph revision, and lifecycle abort', () => {
+  it('carries the host client-graph revision (not the layer document) in the activation request', async () => {
+    writeWorkspacePackage()
+    const { executor } = fakeExecutor()
+    const lc = new PageAppLifecycle({
+      profileDir: dir,
+      executor,
+      runtime: fakeRuntime().runtime,
+      pnpmWorkspaceFile: workspaceYaml,
+      settlementTimeoutMs: 60_000,
+      clientGraphRev: () => 'graph-rev-42',
+    })
+    const promise = lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      new AbortController().signal,
+    )
+    let revision: number | undefined
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const request = lc.activation.pendingRequest
+      if (request !== undefined) {
+        expect(request.graphRevision).toBe('graph-rev-42')
+        expect(request.graphRevision).not.toMatch(/insert|registry|runtime-layer/)
+        const ack = lc.activation.acknowledge(
+          request.transactionId, 'client-1' as never, request.packageName, request.pageId, request.graphRevision,
+        )
+        expect(ack.accepted).toBe(true)
+        revision = await promise
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    expect(revision).toBe(1)
+  })
+
+  it('refuses a stale acknowledgement whose graph revision does not match the request', async () => {
+    writeWorkspacePackage()
+    const lc = lifecycle(fakeExecutor().executor)
+    const promise = lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      new AbortController().signal,
+    )
+    let revision: number | undefined
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const request = lc.activation.pendingRequest
+      if (request !== undefined) {
+        expect(lc.activation.acknowledge(
+          request.transactionId, 'client-1' as never, request.packageName, request.pageId, 'unrelated-rev',
+        )).toMatchObject({ accepted: false, reason: 'wrong-target' })
+        const ack = lc.activation.acknowledge(
+          request.transactionId, 'client-1' as never, request.packageName, request.pageId, request.graphRevision,
+        )
+        expect(ack.accepted).toBe(true)
+        revision = await promise
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    expect(revision).toBe(1)
+  })
+
+  it('aborts pnpm and the settlement wait when the passed signal aborts', async () => {
+    writeWorkspacePackage()
+    const calls: { args: readonly string[]; aborted: boolean }[] = []
+    const executor: PageAppPackageExecutor = {
+      run: async (args, options) => {
+        calls.push({ args, aborted: options.signal.aborted })
+        if (options.signal.aborted) throw new PageAppCommandAbortedError()
+        // Simulate pnpm's real effect: `add` lands the dependency in the profile manifest.
+        if (args[0] === 'add' && args[1] !== undefined) {
+          const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
+          manifest.dependencies[args[1]] = '1.0.0'
+          writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    const lc = lifecycle(executor)
+    // Phase 1: a pre-aborted signal cancels pnpm before the command runs.
+    const controller = new AbortController()
+    controller.abort()
+    await expect(lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      controller.signal,
+    )).rejects.toBeInstanceOf(PageAppCommandAbortedError)
+    expect(calls.some(call => call.args[0] === 'add' && call.aborted)).toBe(true)
+    // Phase 1 rolled back; clear its retained journal so phase 2 starts clean.
+    rmSync(join(dir, '.workspace-manager', 'transaction.json'), { force: true })
+    // Phase 2: aborting while the activation gate waits rejects the wait.
+    const waitController = new AbortController()
+    const install = lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-2' as never,
+      waitController.signal,
+    )
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (lc.activation.pendingRequest !== undefined) break
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    expect(lc.activation.pending).toBe(true)
+    waitController.abort()
+    await expect(install).rejects.toThrow(/settlement wait aborted/)
+  })
+
+  it('aborts the in-flight transaction when the lifecycle disposes (manager fiber gone)', async () => {
+    writeWorkspacePackage()
+    const lc = lifecycle(fakeExecutor().executor)
+    const promise = lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      new AbortController().signal,
+    )
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (lc.activation.pendingRequest !== undefined) break
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    expect(lc.activation.pending).toBe(true)
+    lc.dispose()
+    await expect(promise).rejects.toThrow(/settlement wait aborted/)
+    expect(readRegistryFile()).toBeNull()
+    // The disposed lifecycle refuses any further mutation.
+    await expect(lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-2' as never,
+      new AbortController().signal,
+    )).rejects.toThrow(/disposed/)
   })
 })

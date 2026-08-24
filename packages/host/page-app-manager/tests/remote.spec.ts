@@ -11,7 +11,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { PageAppManager } from '../src/index.ts'
-import type { PageAppPackageExecutor } from '../src/executor.ts'
+import { PageAppCommandAbortedError, type PageAppPackageExecutor } from '../src/executor.ts'
 
 const PKG = '@fixture/remote-workspace'
 
@@ -61,7 +61,10 @@ function fakeExecutor(): PageAppPackageExecutor {
   }
 }
 
-function buildManager(): { ctx: Context; manager: PageAppManager } {
+function buildManager(config: { settlementTimeoutMs: number } = { settlementTimeoutMs: 60_000 }): {
+  ctx: Context
+  manager: PageAppManager
+} {
   const ctx = new Context()
   // The real ProfileRuntime requires launcher binding/settling; the Remote
   // tests drive the manager's delegation, so the runtime is a structural fake.
@@ -69,7 +72,10 @@ function buildManager(): { ctx: Context; manager: PageAppManager } {
     identity: { name: 'fixture-profile', directory: dir },
     applyManagerLayer: async () => ({ generation: 1, activeRoots: ['workspace.remote'], externallyOverridden: [] }),
   } as unknown as ProfileRuntime
-  const manager = new PageAppManager(ctx, { profileRuntime: runtime, executor: fakeExecutor() })
+  // The install activation request carries the Host client-graph rev; a fake
+  // ClientModuleRegistry provides the graph the manager reads.
+  ctx.reflect.provide('clientModules', { graph: () => ({ rev: 'graph-rev-1' }) })
+  const manager = new PageAppManager(ctx, { profileRuntime: runtime, executor: fakeExecutor(), config })
   return { ctx, manager }
 }
 
@@ -88,7 +94,7 @@ describe('pageAppManager Remote surface', () => {
     writeWorkspacePackage()
     const { manager } = buildManager()
     // The install awaits the targeted ack; drive it through the gate.
-    const installPromise = manager.install(registrySource, 'client-1' as never)
+    const installPromise = manager.install(registrySource, 'client-1' as never, new AbortController().signal)
     let revision: number | undefined
     // Poll for the pending activation request, then acknowledge as the client.
     for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -111,7 +117,7 @@ describe('pageAppManager Remote surface', () => {
   it('refuses a stale or wrong-target acknowledgement through the Remote face', async () => {
     writeWorkspacePackage()
     const { manager } = buildManager()
-    const installPromise = manager.install(registrySource, 'client-1' as never)
+    const installPromise = manager.install(registrySource, 'client-1' as never, new AbortController().signal)
     for (let attempt = 0; attempt < 200; attempt += 1) {
       const pending = manager.activation.pendingRequest
       if (pending !== undefined) {
@@ -166,5 +172,37 @@ describe('pageAppManager Remote surface', () => {
     const outcome = await manager.recover()
     expect(outcome.action).toBe('commit-completed')
     expect(manager.list().revision).toBe(1)
+  })
+
+  it('propagates an aborted signal through the install Remote call', async () => {
+    writeWorkspacePackage()
+    const ctx = new Context()
+    const runtime = {
+      identity: { name: 'fixture-profile', directory: dir },
+      applyManagerLayer: async () => ({ generation: 1, activeRoots: ['workspace.remote'], externallyOverridden: [] }),
+    } as unknown as ProfileRuntime
+    ctx.reflect.provide('clientModules', { graph: () => ({ rev: 'graph-rev-1' }) })
+    const seenAborted: boolean[] = []
+    const executor: PageAppPackageExecutor = {
+      run: async (_args, options) => {
+        seenAborted.push(options.signal.aborted)
+        if (options.signal.aborted) throw new PageAppCommandAbortedError()
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    const manager = new PageAppManager(ctx, { profileRuntime: runtime, executor, config: { settlementTimeoutMs: 60_000 } })
+    const controller = new AbortController()
+    controller.abort()
+    await expect(manager.install(registrySource, 'client-1' as never, controller.signal))
+      .rejects.toBeInstanceOf(PageAppCommandAbortedError)
+    // The Remote signature carried the caller's signal into pnpm.
+    expect(seenAborted).toContain(true)
+  })
+
+  it('reads the settlement timeout from the plugin config', async () => {
+    writeWorkspacePackage()
+    const { manager } = buildManager({ settlementTimeoutMs: 60 })
+    const installPromise = manager.install(registrySource, 'client-1' as never, new AbortController().signal)
+    await expect(installPromise).rejects.toThrow(/settlement wait timed out/)
   })
 })

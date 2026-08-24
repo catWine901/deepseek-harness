@@ -9,6 +9,10 @@
  * profile manifest/lockfile, and converge `node_modules` with a profile-local
  * `pnpm install`. A failed convergence retains the journal and exposes
  * `recovery-required` — the system never pretends to be clean (spec §27).
+ * Cancellation flows end-to-end: the Remote signal and the manager fiber's
+ * lifecycle controller are merged per transaction, so an abort or a manager
+ * reload cancels pnpm and the activation wait, and the acknowledgement wait is
+ * bounded by the configurable `settlementTimeoutMs` (spec §10.3).
  * @module @deepseek-ai/dsh-page-app-manager/transaction
  */
 
@@ -60,6 +64,14 @@ export interface PageAppTransactionDeps {
   readonly runtime: ProfileRuntime
   /** Absolute pnpm-workspace.yaml path (never edited; allowBuilds diagnostics read it). */
   readonly pnpmWorkspaceFile: string
+  /** Host cap on the client activation acknowledgement wait, in milliseconds. */
+  readonly settlementTimeoutMs: number
+  /**
+   * Read the Host client-graph revision the install's activation request
+   * carries. The acknowledgement is only meaningful against the exact graph
+   * the client must converge to, never the runtime-layer document.
+   */
+  readonly clientGraphRev: () => string
   /** Called after each committed registry publication (the manager emits `page-app-manager/changed`). */
   readonly onChanged?: (revision: number) => void
   /** Called when the targeted activation gate opens (the manager emits `page-app-manager/activation-requested`). */
@@ -87,15 +99,29 @@ export interface PageAppStagedState {
  */
 export class PageAppLifecycle {
   private readonly gate = new PageAppActivationGate()
+  /** Aborts the in-flight transaction when the manager fiber unloads. */
+  private readonly inFlight = new AbortController()
+  private disposed = false
 
   /**
-   * @param deps - profile, pnpm seam, runtime, and pnpm-workspace path.
+   * @param deps - profile, pnpm seam, runtime, pnpm-workspace path, settlement
+   * timeout, and the client-graph revision reader.
    */
   constructor(private readonly deps: PageAppTransactionDeps) {}
 
   /** The pending targeted activation (null between transactions). */
   public get activation(): PageAppActivationGate {
     return this.gate
+  }
+
+  /**
+   * Abort the in-flight transaction and refuse further mutations. Wired to the
+   * manager fiber's effect, so a manager reload cannot orphan a running
+   * transaction (the profile lock releases through rollback).
+   */
+  public dispose(): void {
+    this.disposed = true
+    this.inFlight.abort()
   }
 
   /**
@@ -112,9 +138,9 @@ export class PageAppLifecycle {
     clientInstanceId: PageAppClientInstanceId,
     signal: AbortSignal,
   ): Promise<number> {
-    return this.withTransaction(async (transactionId) => {
+    return this.withTransaction(async (transactionId, txSignal) => {
       // pnpm add with the exact validated spec.
-      const add = await this.deps.executor.run(['add', source.spec], { cwd: this.deps.profileDir, signal })
+      const add = await this.deps.executor.run(['add', source.spec], { cwd: this.deps.profileDir, signal: txSignal })
       if (add.exitCode !== 0) {
         if (isAllowBuildsFailure(add.stderr)) {
           throw new PageAppBuildPermissionError(
@@ -131,23 +157,26 @@ export class PageAppLifecycle {
       // Apply the layer through the acknowledged profile runtime.
       await this.applyRuntime(staged)
       // Targeted client activation: only the initiating instance may settle.
+      // The request carries the Host client-graph revision after the
+      // generation — never the runtime-layer document — so the client
+      // converges to an exact rev match before acknowledging.
       const request: ClientActivationRequest = {
         transactionId,
         clientInstanceId,
         packageName: staged.registry.entries.at(-1)?.packageName ?? '',
         pageId: staged.registry.entries.at(-1)?.page.id ?? '',
-        graphRevision: staged.layer,
+        graphRevision: this.deps.clientGraphRev(),
       }
       this.gate.open(request)
       this.deps.onActivationRequested?.(request)
       try {
-        await this.gate.awaitSettlement(signal)
+        await this.gate.awaitSettlement(txSignal, this.deps.settlementTimeoutMs)
       } finally {
         this.gate.discard()
       }
       await this.publish(staged.registry)
       return staged.registry.revision
-    })
+    }, signal)
   }
 
   /**
@@ -177,7 +206,7 @@ export class PageAppLifecycle {
       await this.applyRuntime(staged)
       await this.publish(staged.registry)
       return staged.registry.revision
-    })
+    }, signal)
   }
 
   /**
@@ -199,7 +228,7 @@ export class PageAppLifecycle {
       }
       await this.publish(registry)
       return registry.revision
-    })
+    }, new AbortController().signal)
   }
 
   /**
@@ -224,7 +253,7 @@ export class PageAppLifecycle {
       const registry = { ...current, revision: current.revision + 1, entries }
       await this.publish(registry)
       return registry.revision
-    })
+    }, new AbortController().signal)
   }
 
   /**
@@ -236,7 +265,7 @@ export class PageAppLifecycle {
    * @returns the committed registry revision.
    */
   public async uninstall(pageId: string, signal: AbortSignal): Promise<number> {
-    return this.withTransaction(async () => {
+    return this.withTransaction(async (_transactionId, txSignal) => {
       const current = await this.requireRegistry()
       const row = current.entries.find(entry => entry.page.id === pageId)
       if (row === undefined) throw new Error(`page-app uninstall: unknown page id "${pageId}"`)
@@ -249,7 +278,7 @@ export class PageAppLifecycle {
       await this.writeStagedLayer(staged)
       await this.applyRuntime(staged)
       // 2. pnpm remove the actual package name.
-      const removed = await this.deps.executor.run(['remove', row.packageName], { cwd: this.deps.profileDir, signal })
+      const removed = await this.deps.executor.run(['remove', row.packageName], { cwd: this.deps.profileDir, signal: txSignal })
       if (removed.exitCode !== 0) {
         throw new Error(`page-app uninstall: pnpm remove failed: ${removed.stderr.trim()}`)
       }
@@ -262,33 +291,51 @@ export class PageAppLifecycle {
       await this.writeStagedLayer(final)
       await this.publish(final.registry)
       return final.registry.revision
-    })
+    }, signal)
   }
 
   // --- transaction scaffolding ----------------------------------------------
 
   private async withTransaction<T>(
-    body: (transactionId: PageAppTransactionId) => Promise<T>,
+    body: (transactionId: PageAppTransactionId, signal: AbortSignal) => Promise<T>,
+    signal: AbortSignal,
   ): Promise<T> {
+    if (this.disposed) {
+      throw new Error('page-app transaction: the manager has been disposed; no new mutations')
+    }
     const token = randomUUID()
     return withPageAppProfileLock(this.deps.profileDir, { kind: 'manager', token }, async () => {
-      // Snapshot owned before-state and write the prepared journal FIRST:
-      // recovery forbids any mutation before journal publication.
-      const files = await snapshotPageAppJournalFiles(this.deps.profileDir, OWNED_RELATIVE_FILES)
-      const prepared: PageAppJournalV1 = Object.freeze({
-        schemaVersion: 1,
-        phase: 'prepared',
-        lockOwnerToken: token,
-        files,
-      })
-      await writePageAppJournal(this.deps.profileDir, prepared)
+      // Merge the caller's cancellation with the manager fiber's lifecycle
+      // controller: either abort cancels pnpm and the settlement wait, so a
+      // manager reload cannot orphan a running transaction.
+      const merged = new AbortController()
+      if (signal.aborted || this.inFlight.signal.aborted) merged.abort()
+      const onCallerAbort = (): void => { merged.abort() }
+      const onLifecycleAbort = (): void => { merged.abort() }
+      signal.addEventListener('abort', onCallerAbort, { once: true })
+      this.inFlight.signal.addEventListener('abort', onLifecycleAbort, { once: true })
       try {
-        const result = await body(token as PageAppTransactionId)
-        await removePageAppJournal(this.deps.profileDir)
-        return result
-      } catch (error) {
-        await this.rollback(token, error)
-        throw error
+        // Snapshot owned before-state and write the prepared journal FIRST:
+        // recovery forbids any mutation before journal publication.
+        const files = await snapshotPageAppJournalFiles(this.deps.profileDir, OWNED_RELATIVE_FILES)
+        const prepared: PageAppJournalV1 = Object.freeze({
+          schemaVersion: 1,
+          phase: 'prepared',
+          lockOwnerToken: token,
+          files,
+        })
+        await writePageAppJournal(this.deps.profileDir, prepared)
+        try {
+          const result = await body(token as PageAppTransactionId, merged.signal)
+          await removePageAppJournal(this.deps.profileDir)
+          return result
+        } catch (error) {
+          await this.rollback(token, error)
+          throw error
+        }
+      } finally {
+        signal.removeEventListener('abort', onCallerAbort)
+        this.inFlight.signal.removeEventListener('abort', onLifecycleAbort)
       }
     })
   }

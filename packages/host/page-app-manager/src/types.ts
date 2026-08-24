@@ -11,6 +11,12 @@
 /** How a managed package's source spec was stated at install time (wire copy). */
 export type PageAppSourceKind = 'registry' | 'file' | 'link' | 'tarball' | 'git'
 
+/** Plugin configuration of the Host page-app manager (validated by the zod `Config` in `index.ts`). */
+export interface PageAppManagerConfig {
+  /** Host cap on the client activation acknowledgement wait, in milliseconds. */
+  readonly settlementTimeoutMs?: number
+}
+
 /** Redacted source record persisted in the registry (wire copy; never carries credentials). */
 export interface PageAppRegistrySource {
   readonly kind: PageAppSourceKind
