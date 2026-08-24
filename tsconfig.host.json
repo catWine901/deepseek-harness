@@ -251,6 +251,7 @@
     { "path": "./packages/test-support/agent-loop-testkit" },
     { "path": "./packages/acp/acp" },
     { "path": "./packages/examples/acp-demo" },
+    { "path": "./packages/examples/page-app-fixture" },
     { "path": "./packages/bundle/base" },
     { "path": "./packages/bundle/headless" },
     { "path": "./packages/bundle/web-app" },

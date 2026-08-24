@@ -10,7 +10,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { PageAppRegistryV1 } from '@deepseek-ai/dsh-page-app-profile'
+import { parsePageAppManifest, type PageAppRegistryV1 } from '@deepseek-ai/dsh-page-app-profile'
+import { SUPPORTED_CONTRACT_VERSIONS } from '../src/contract.ts'
 import { validateInstalledPageAppPackage, type PageAppValidationContext } from '../src/validation.ts'
 
 const PKG = '@fixture/valid-workspace'
@@ -24,7 +25,7 @@ interface FixturePackage {
   rootName?: string
   extra?: Record<string, unknown>
   clientExternal?: string[]
-  workspaceSchemaVersion?: number
+  workspaceSchemaVersion?: unknown
   clientPlatform?: string
   /** node_modules key the package is installed under (alias test). */
   dirKey?: string
@@ -120,6 +121,66 @@ describe('static validation', () => {
     expect(record.clientRowCount).toBe(1)
   })
 
+  it('rejects a package declaring a direct cordis dependency', () => {
+    writeProfileManifest()
+    writePackage(PKG, { extra: { dependencies: { cordis: '^4.0.1' } } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/declares a direct cordis dependency/)
+  })
+
+  it('rejects a package declaring a direct @deepseek-ai/cordis dependency', () => {
+    writeProfileManifest()
+    writePackage(PKG, { extra: { dependencies: { '@deepseek-ai/cordis': '^4.0.1' } } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/declares a direct @deepseek-ai\/cordis dependency/)
+  })
+
+  it('rejects a package declaring a direct cordis devDependency', () => {
+    writeProfileManifest()
+    writePackage(PKG, { extra: { devDependencies: { cordis: '^4.0.1' } } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/declares a direct cordis dependency \(devDependencies\)/)
+  })
+
+  it('rejects a package declaring a direct @deepseek-ai/cordis peerDependency', () => {
+    writeProfileManifest()
+    writePackage(PKG, { extra: { peerDependencies: { '@deepseek-ai/cordis': '^4.0.1' } } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/declares a direct @deepseek-ai\/cordis dependency \(peerDependencies\)/)
+  })
+
+  it('rejects a package declaring a direct cordis optionalDependency', () => {
+    writeProfileManifest()
+    writePackage(PKG, { extra: { optionalDependencies: { cordis: '^4.0.1' } } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/declares a direct cordis dependency \(optionalDependencies\)/)
+  })
+
+  it('accepts a package whose dependencies are cordis-free', () => {
+    writeProfileManifest()
+    writePackage(PKG, { extra: { dependencies: { 'some-lib': '^1.0.0' } } })
+    const record = validateInstalledPageAppPackage(dir, PKG, context())
+    expect(record.packageName).toBe(PKG)
+  })
+
+  it('rejects a package whose dependencies field is not a record', () => {
+    writeProfileManifest()
+    // A string dependencies field is malformed durable data; the boundary must
+    // fail loud instead of silently treating it as cordis-free.
+    writePackage(PKG, { extra: { dependencies: 'cordis@^4.0.1' } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/dependencies must be a record/)
+    // An array form is equally non-record.
+    writePackage(PKG, { extra: { dependencies: ['cordis'] } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/dependencies must be a record/)
+    // Every dependency section shares the record requirement; the diagnostic
+    // names the offending section.
+    writePackage(PKG, { extra: { devDependencies: 'cordis@^4.0.1' } })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/devDependencies must be a record/)
+  })
+
   it('rejects a missing dependency (no auto-adoption in v1)', () => {
     writeProfileManifest()
     writePackage(PKG)
@@ -164,9 +225,50 @@ describe('static validation', () => {
     expect(() => validateInstalledPageAppPackage(dir, PKG, context())).toThrow(/resolves outside the installed package/)
   })
 
-  it('rejects a workspace manifest that is not schema v1', () => {
+  it('refuses an unsupported contract version through the supportedContractVersions constant', () => {
     writeProfileManifest()
     writePackage(PKG, { workspaceSchemaVersion: 2 })
+    expect(() => validateInstalledPageAppPackage(dir, PKG, context()))
+      .toThrow(/unsupported contract version 2/)
+  })
+
+  it('keeps the manager contract constant compatible with the shared v1 manifest parser', () => {
+    writeProfileManifest()
+    // Both authorities must admit the same versions: the manager constant and
+    // the shared parser's z.literal(1). Every constant member parses through
+    // the parser, so the two cannot silently drift apart.
+    for (const version of SUPPORTED_CONTRACT_VERSIONS) {
+      const pkg = {
+        dsh: {
+          workspace: {
+            schemaVersion: version,
+            id: 'workspace.valid',
+            name: 'Fixture Valid',
+            description: 'A valid fixture',
+            defaultOrder: 100,
+            rootEntryId: 'workspace.valid',
+          },
+        },
+      }
+      expect(() => parsePageAppManifest(PKG, pkg)).not.toThrow()
+    }
+    // A version the parser rejects is diagnosed by the constant BEFORE the
+    // shared parse would report its own shape error: the manager prechecks
+    // numeric schema versions so the diagnostic names the unsupported version.
+    writePackage(PKG, { workspaceSchemaVersion: 2 })
+    let message = ''
+    try {
+      validateInstalledPageAppPackage(dir, PKG, context())
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error)
+    }
+    expect(message).toMatch(/unsupported contract version 2/)
+    expect(message).not.toMatch(/page-app manifest/)
+  })
+
+  it('preserves the manifest shape error when the schema version is not numeric', () => {
+    writeProfileManifest()
+    writePackage(PKG, { workspaceSchemaVersion: 'two' })
     expect(() => validateInstalledPageAppPackage(dir, PKG, context())).toThrow(/page-app manifest/)
   })
 
