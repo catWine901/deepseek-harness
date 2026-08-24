@@ -59,11 +59,11 @@ function stubRemote(): PageAppManagerRemoteMethods & PageAppRemoteEvents {
   const never = (): Promise<PageAppRemoteResult<never>> => Promise.resolve(ok(undefined as never))
   return {
     list: () => Promise.resolve(ok(EMPTY_SNAPSHOT)),
-    install: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId) => never(),
-    setEnabled: (_pageId: string, _enabled: boolean) => never(),
+    install: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId, _signal: AbortSignal) => never(),
+    setEnabled: (_pageId: string, _enabled: boolean, _signal: AbortSignal) => never(),
     setHidden: (_pageId: string, _hidden: boolean) => never(),
     reorder: (_pageIds: readonly string[]) => never(),
-    uninstall: (_pageId: string) => never(),
+    uninstall: (_pageId: string, _signal: AbortSignal) => never(),
     ackClientActivation: () => never(),
     recover: () => never(),
     $on: () => () => {},
@@ -150,6 +150,7 @@ function settingsInjected(controller: PageAppController): PageAppSettingsTabInje
     setHidden: (pageId, hidden) => controller.setHidden(pageId, hidden),
     uninstall: (pageId, signal) => controller.uninstall(pageId, signal),
     recover: () => controller.recover(),
+    cancelInstall: () => { controller.cancelInstall() },
   }
 }
 

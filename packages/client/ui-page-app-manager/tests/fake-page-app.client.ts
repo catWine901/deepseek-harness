@@ -84,12 +84,13 @@ export class FakeRemote implements PageAppManagerRemoteMethods, PageAppRemoteEve
   readonly calls: { method: string; args: unknown[] }[] = []
 
   onList: () => Promise<PageAppRemoteResult<PageAppManagerSnapshot>> = () => Promise.resolve(ok(fakeSnapshot([])))
-  onInstall: (source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId) => Promise<PageAppRemoteResult<number>> =
-    () => Promise.resolve(ok(2))
-  onSetEnabled: (pageId: string, enabled: boolean) => Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
+  onInstall: (source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId, signal: AbortSignal) =>
+  Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
+  onSetEnabled: (pageId: string, enabled: boolean, signal: AbortSignal) =>
+  Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
   onSetHidden: (pageId: string, hidden: boolean) => Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
   onReorder: (pageIds: readonly string[]) => Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
-  onUninstall: (pageId: string) => Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
+  onUninstall: (pageId: string, signal: AbortSignal) => Promise<PageAppRemoteResult<number>> = () => Promise.resolve(ok(2))
   onAckClientActivation: (
     transactionId: PageAppTransactionId, clientInstanceId: PageAppClientInstanceId,
     packageName: string, pageId: string, graphRevision: string,
@@ -105,14 +106,18 @@ export class FakeRemote implements PageAppManagerRemoteMethods, PageAppRemoteEve
     return this.onList()
   }
 
-  public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<PageAppRemoteResult<number>> {
-    this.calls.push({ method: 'install', args: [source, clientInstanceId] })
-    return this.onInstall(source, clientInstanceId)
+  public install(
+    source: PageAppInstallSource,
+    clientInstanceId: PageAppClientInstanceId,
+    signal: AbortSignal,
+  ): Promise<PageAppRemoteResult<number>> {
+    this.calls.push({ method: 'install', args: [source, clientInstanceId, signal] })
+    return this.onInstall(source, clientInstanceId, signal)
   }
 
-  public setEnabled(pageId: string, enabled: boolean): Promise<PageAppRemoteResult<number>> {
-    this.calls.push({ method: 'setEnabled', args: [pageId, enabled] })
-    return this.onSetEnabled(pageId, enabled)
+  public setEnabled(pageId: string, enabled: boolean, signal: AbortSignal): Promise<PageAppRemoteResult<number>> {
+    this.calls.push({ method: 'setEnabled', args: [pageId, enabled, signal] })
+    return this.onSetEnabled(pageId, enabled, signal)
   }
 
   public setHidden(pageId: string, hidden: boolean): Promise<PageAppRemoteResult<number>> {
@@ -125,9 +130,9 @@ export class FakeRemote implements PageAppManagerRemoteMethods, PageAppRemoteEve
     return this.onReorder(pageIds)
   }
 
-  public uninstall(pageId: string): Promise<PageAppRemoteResult<number>> {
-    this.calls.push({ method: 'uninstall', args: [pageId] })
-    return this.onUninstall(pageId)
+  public uninstall(pageId: string, signal: AbortSignal): Promise<PageAppRemoteResult<number>> {
+    this.calls.push({ method: 'uninstall', args: [pageId, signal] })
+    return this.onUninstall(pageId, signal)
   }
 
   public ackClientActivation(

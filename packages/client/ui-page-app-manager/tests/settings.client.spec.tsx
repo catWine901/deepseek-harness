@@ -9,14 +9,19 @@
  */
 import { Context, Service } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { useSyncExternalStore } from 'react'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import { resolveSlotLabel } from '@deepseek-ai/dsh-client-ui-slots'
 import { usePinnedBrowserLanguages } from '@deepseek-ai/dsh-client-test-runtime'
 import { apply, inject, NS } from '../src/client/index.ts'
-import { PageAppSettingsTab, type PageAppSettingsTabInjected } from '../src/client/PageAppSettingsTab.tsx'
+import { PageAppSettingsTab, type PageAppSettingsTabInjected, type PageAppSettingsTabProps } from '../src/client/PageAppSettingsTab.tsx'
+import type { PageAppClientSnapshot } from '../src/client/controller.ts'
+import { zh } from '../src/client/locales.ts'
+import { MutableObservable } from '../src/client/stores.ts'
 import { parsePageAppInstallSourceClient } from '../src/client/source.ts'
+import { deferred } from './fake-page-app.client.ts'
 
 usePinnedBrowserLanguages('zh-CN')
 afterEach(cleanup)
@@ -87,6 +92,95 @@ describe('ui-page-app-manager settings tab apply', () => {
     declare(b.slots)
     await vi.waitFor(() => { expect(b.slots.entries('settings.plugins.tab')).toHaveLength(1) })
     await fiber.dispose()
+  })
+})
+
+
+/** A controller-like snapshot with one managed row (for busy non-install actions). */
+function snapshotWithRow(): PageAppClientSnapshot {
+  return {
+    registry: {
+      profile: { name: 'p', directory: 'd' },
+      revision: 1,
+      entries: [{
+        packageName: '@scope/a', page: { id: 'page-a', name: 'A', description: '', defaultOrder: 1, rootEntryId: 'r' },
+        order: 1, enabled: true, hidden: false, installedAt: '', updatedAt: '',
+        source: { kind: 'registry', display: 'x' }, resolvedVersion: '1.0.0', health: 'ready',
+      }],
+      operation: null,
+      recovery: null,
+    },
+    eligible: new Map(),
+    activePageId: null,
+    visitedPageIds: [],
+    activation: null,
+    failedPageIds: [],
+  }
+}
+
+/** Render the tab against stub injections and the zh dictionary (zh-CN pinned). */
+function renderTab(over: Partial<PageAppSettingsTabInjected> = {}) {
+  const store = new MutableObservable(snapshotWithRow())
+  const install = vi.fn<PageAppSettingsTabInjected['install']>(() => Promise.resolve())
+  const setEnabled = vi.fn<PageAppSettingsTabInjected['setEnabled']>(() => Promise.resolve())
+  const setHidden = vi.fn<PageAppSettingsTabInjected['setHidden']>(() => Promise.resolve())
+  const uninstall = vi.fn<PageAppSettingsTabInjected['uninstall']>(() => Promise.resolve())
+  const recover = vi.fn<PageAppSettingsTabInjected['recover']>(() => Promise.resolve())
+  const cancelInstall = vi.fn<PageAppSettingsTabInjected['cancelInstall']>(() => {})
+  const t = ((key: string) => (zh as Record<string, string>)[key] ?? key) as PageAppSettingsTabProps['t']
+  const props: PageAppSettingsTabProps = {
+    usePageApp: (sel: (s: PageAppClientSnapshot) => unknown) => sel(useSyncExternalStore(store.subscribe, store.getSnapshot)),
+    t,
+    install,
+    setEnabled,
+    setHidden,
+    uninstall,
+    recover,
+    cancelInstall,
+    ...over,
+  } as PageAppSettingsTabProps
+  const utils = render(<PageAppSettingsTab {...props} />)
+  return { store, install, setEnabled, setHidden, uninstall, recover, cancelInstall, ...utils }
+}
+
+describe('Settings install cancellation (M1.2, D9)', () => {
+  it('cancel button aborts the in-flight install and clears the busy state', async () => {
+    const gate = deferred<undefined>()
+    const install = vi.fn<PageAppSettingsTabInjected['install']>(() => gate.promise)
+    const cancelInstall = vi.fn()
+    const utils = renderTab({ install, cancelInstall })
+    // Idle: no cancel action.
+    expect(utils.queryByRole('button', { name: '取消安装' })).toBeNull()
+    // Start an install: the submit row flips to the busy label and the cancel
+    // button appears while the install is in flight.
+    fireEvent.change(utils.getByRole('textbox'), { target: { value: '@example/script-workspace' } })
+    fireEvent.click(utils.getByRole('button', { name: '安装' }))
+    expect(install).toHaveBeenCalled()
+    expect(utils.getByRole('button', { name: '正在安装…' })).toBeTruthy()
+    const cancel = utils.getByRole('button', { name: '取消安装' })
+    act(() => { fireEvent.click(cancel) })
+    expect(cancelInstall).toHaveBeenCalledTimes(1)
+    // The in-flight promise rejects with the abort reason; the busy state
+    // clears and the cancel action disappears (flush the rejection microtask).
+    await act(async () => {
+      gate.reject(new DOMException('The operation was aborted', 'AbortError'))
+      await Promise.resolve()
+    })
+    expect(utils.queryByRole('button', { name: '取消安装' })).toBeNull()
+    expect(utils.getByRole('button', { name: '安装' })).toBeTruthy()
+    // A cancelled install shows no error row.
+    expect(utils.queryByRole('alert')).toBeNull()
+  })
+
+  it('cancel button is absent when no install is running', () => {
+    const utils = renderTab()
+    expect(utils.queryByRole('button', { name: '取消安装' })).toBeNull()
+    // A NON-install busy action (row mutation) does not surface the install
+    // cancel: the action is install-specific, not generic busy.
+    fireEvent.click(utils.getByRole('button', { name: '停用' }))
+    expect(utils.queryByRole('button', { name: '取消安装' })).toBeNull()
+    expect(utils.getByRole('button', { name: '停用' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '停用' }).getAttribute('disabled')).not.toBeNull()
   })
 })
 
