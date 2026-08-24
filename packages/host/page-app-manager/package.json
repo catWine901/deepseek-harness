@@ -51,7 +51,8 @@
     "@deepseek-ai/dsh-app-boot": "workspace:^",
     "@deepseek-ai/dsh-page-app-profile": "workspace:^",
     "@deepseek-ai/dsh-typert-protocol": "workspace:^",
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.2.0",
+    "zod": "^4.0.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "workspace:^",
@@ -68,7 +69,6 @@
     "@deepseek-ai/cordis": "workspace:^",
     "@deepseek-ai/cordis-plugin-include": "workspace:^",
     "@deepseek-ai/cordis-plugin-loader": "workspace:^",
-    "@deepseek-ai/dsh-invariants": "workspace:^",
-    "zod": "^4.0.0"
+    "@deepseek-ai/dsh-invariants": "workspace:^"
   }
 }
