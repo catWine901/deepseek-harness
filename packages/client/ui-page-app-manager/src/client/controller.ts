@@ -35,6 +35,12 @@ export interface PageAppClientSnapshot {
   readonly visitedPageIds: readonly string[]
   /** The pending targeted activation, when one is open. */
   readonly activation: PageAppActivationView | null
+  /**
+   * Managed surface page ids whose entries abdicated after a crash (slot
+   * `reportEntryError` with `abdicate`); the shell renders a manager-owned
+   * failure surface for each until a select (retry) or eviction clears it.
+   */
+  readonly failedPageIds: readonly string[]
 }
 
 /** Controller dependencies: remote, slot ledger, identity, and graph convergence. */
@@ -75,6 +81,8 @@ function sameSnapshot(a: PageAppClientSnapshot, b: PageAppClientSnapshot): boole
     && sameEligible(a.eligible, b.eligible)
     && a.visitedPageIds.length === b.visitedPageIds.length
     && a.visitedPageIds.every((id, index) => id === b.visitedPageIds[index])
+    && a.failedPageIds.length === b.failedPageIds.length
+    && a.failedPageIds.every((id, index) => id === b.failedPageIds[index])
 }
 
 /**
@@ -91,6 +99,7 @@ export class PageAppController {
     activePageId: null,
     visitedPageIds: [],
     activation: null,
+    failedPageIds: [],
   })
   private registry: PageAppManagerSnapshot | null = null
   private activation: PageAppActivationRequestedEvent | null = null
@@ -102,6 +111,7 @@ export class PageAppController {
   } | null = null
   private readonly visited = new Set<string>()
   private visitedOrder: string[] = []
+  private readonly failed = new Set<string>()
   private activePageId: string | null = PAGE_APP_DSH_PAGE
   private disposed = false
   private readonly disposers: Array<() => void> = []
@@ -156,6 +166,8 @@ export class PageAppController {
       this.visited.add(id)
       this.visitedOrder = [...this.visitedOrder, id]
     }
+    // Retry = re-select: the failure record clears so the shell remounts.
+    this.failed.delete(id)
     this.rebuild()
   }
 
@@ -222,6 +234,18 @@ export class PageAppController {
     await this.refresh()
   }
 
+  /**
+   * Record one abdicated managed surface (slot entry crash). The shell swaps
+   * the crashed cell for a manager-owned failure surface; a later select
+   * (retry) or eviction clears the record.
+   * @param pageId - the crashed surface's page id (the keyed slot key).
+   */
+  public recordEntryError(pageId: string): void {
+    if (this.disposed) return
+    this.failed.add(pageId)
+    this.rebuild()
+  }
+
   /** Re-read the registry from the remote and rebuild the projection. */
   private async refresh(): Promise<void> {
     if (this.disposed) return
@@ -261,6 +285,7 @@ export class PageAppController {
       activePageId: this.activePageId === PAGE_APP_DSH_PAGE ? null : this.activePageId,
       visitedPageIds: [...this.visitedOrder],
       activation: this.activationView(),
+      failedPageIds: [...this.failed],
     }
     // Spec §14: the snapshot reference stays put until committed registry or
     // eligible-slot facts change (noise rebuilds keep the previous object).
@@ -333,6 +358,7 @@ export class PageAppController {
   /** Evict one page from visited (disable/uninstall lifecycle). */
   private evict(pageId: string): void {
     this.visited.delete(pageId)
+    this.failed.delete(pageId)
     this.visitedOrder = this.visitedOrder.filter(id => id !== pageId)
     if (this.activePageId === pageId) this.activePageId = PAGE_APP_DSH_PAGE
   }

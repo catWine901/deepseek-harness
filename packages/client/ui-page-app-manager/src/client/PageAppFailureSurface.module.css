@@ -1,0 +1,21 @@
+/* Manager-owned failure face for one abdicated managed surface. */
+.failure {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  padding: 24px;
+  color: var(--dsw-alias-text-secondary);
+}
+
+.message {
+  margin: 0;
+  text-align: center;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}

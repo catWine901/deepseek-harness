@@ -14,7 +14,7 @@ import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { apply as themeApply, inject as themeInject, ThemeRuntime } from '@deepseek-ai/dsh-client-ui-theme/client'
 import { apply, inject, LayoutController } from '@deepseek-ai/dsh-client-ui-layout/client'
 import { AppFrame } from '@deepseek-ai/dsh-client-ui-layout/src/client/AppFrame.tsx'
-import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
+import type { SlotRendererHost, StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
 import { apply as nodeApply } from '@deepseek-ai/dsh-client-ui-layout'
 import * as invariant from '@deepseek-ai/dsh-client-ui-layout/invariant'
 
@@ -235,6 +235,83 @@ describe('dual-path root fallback (M3, D5)', () => {
     expect(slots.entries('root')[0]!.options.priority).toBe(1)
     expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
     await fiber2.dispose()
+  })
+
+  it('a disabled manager (registration disposed) leaves the fallback owning root and Native DSH rendering', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // Manager disabled after serving: its root registration collapses and the
+    // fallback re-takes the cell with the four children (Native DSH renders).
+    const shell = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    shell()
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.options.priority).toBe(1)
+    expect(slots.entries('root')[0]!.component).toBe(AppFrame)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
+    expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    await fiber.dispose()
+  })
+
+  it('a root crash abdicates the manager entry and the fallback wins without a refresh', async () => {
+    const { ctx, slots } = await bench()
+    // The renderer host face is the sanctioned crash-report path; the host
+    // resolves the standard session/workspace kits lazily.
+    ctx.provide('sessions', { list: () => [], currentProvideInfo: () => undefined } as never)
+    ctx.provide('workspaces', { list: () => [] } as never)
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    const shell = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('root')).toHaveLength(1)
+    // The manager shell crashes: the renderer boundary retires the root entry
+    // from its cell (the exact reportEntryError path RootOutlet uses).
+    let host: SlotRendererHost | undefined
+    slots.install({ renderRoot: (h: SlotRendererHost) => { host = h; return null } })
+    slots.renderSlot('root', {})
+    const managerEntry = slots.entries('root')[0]!
+    host!.reportEntryError('root', managerEntry, new Error('boom'), { abdicate: true })
+    // No re-registration happened — the fallback already owned its priority —
+    // and it wins the cell now that the manager entry is skipped.
+    expect(slots.entries('root')).toHaveLength(2)
+    expect(slots.entriesOfSlot('root')).toHaveLength(1)
+    expect(slots.entriesOfSlot('root')[0]!.component).toBe(AppFrame)
+    expect(slots.entriesOfSlot('root')[0]!.options.priority).toBe(1)
+    // The abdicated entry stays on the ledger (disposal authority remains the
+    // manager); the fallback owns the four children exactly once.
+    expect(slots.entries('root').some(entry => entry === managerEntry)).toBe(true)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
+    expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    // The manager coming back live (reload) replaces the abdicated entry; the
+    // fallback yields back to the builtin path.
+    shell()
+    const shell2 = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('page-app.shell.builtin')[0]!.component).toBe(AppFrame)
+    expect(slots.entriesOfSlot('root')[0]!.component).not.toBe(AppFrame)
+    shell2()
+    await fiber.dispose()
+  })
+
+  it('drops the slots/changed subscription with the fiber (no listener or registration leak)', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    expect(slots.entries('root')).toHaveLength(1)
+    await fiber.dispose()
+    // After teardown a manager arriving must not resurrect any registration:
+    // the reconcile listener is gone, so the fallback cannot re-enter.
+    expect(slots.entries('root')).toHaveLength(0)
+    const shell = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
+    shell()
   })
 })
 

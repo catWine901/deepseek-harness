@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
-import type { SlotRenderer, SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
+import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
 import { apply, PageAppShell, type PageAppShellInjected, inject } from '@deepseek-ai/dsh-client-ui-page-app-manager/client'
 import { fakeEntry } from './fake-page-app.client.ts'
 
@@ -83,7 +83,7 @@ describe('ui-page-app-manager client apply', () => {
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     let host: SlotRendererHost | undefined
-    slots.install({ renderRoot: (h: SlotRendererHost) => { host = h; return null } } as SlotRenderer)
+    slots.install({ renderRoot: (h: SlotRendererHost) => { host = h; return null } })
     slots.renderSlot('root', {})
     const injected = (slots.entries('root')[0]!.inject as unknown as () => PageAppShellInjected)()
     const observable = injected.hooks.pageApp
