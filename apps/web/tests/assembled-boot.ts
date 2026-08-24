@@ -185,15 +185,27 @@ export function installAssembledBootEnv(): void {
 
 /**
  * Mount the assembled application on the fixture transport; the teardown
- * registered by installAssembledBootEnv disposes it.
+ * registered by installAssembledBootEnv disposes it. An excluded entry id
+ * drops out of the boot roster entirely (its bundle is never fetched), which
+ * is how a composition without a row (e.g. the page-app manager) is booted.
  * @param search - fixture query string used to select deterministic host behavior.
+ * @param options - `exclude` entry ids to leave out of the boot roster.
  */
-export function mountAssembledApp(search = '?fixture'): void {
+export function mountAssembledApp(
+  search = '?fixture',
+  options: { exclude?: readonly string[] } = {},
+): void {
+  const exclude = new Set(options.exclude ?? [])
   history.replaceState(null, '', `/${search}`)
   const root = document.createElement('div')
   root.id = 'root'
   document.body.appendChild(root)
-  win.__DSH_BOOT__ = { rev: 'fx', entries: PLUGINS.map(({ bundlePath: _bundlePath, ...plugin }) => plugin) }
+  win.__DSH_BOOT__ = {
+    rev: 'fx',
+    entries: PLUGINS
+      .filter(plugin => !exclude.has(plugin.id))
+      .map(({ bundlePath: _bundlePath, ...plugin }) => plugin),
+  }
   const [facadeRow] = bootInjections(win.__DSH_BOOT__)
   if (facadeRow?.kind !== 'script') throw new Error('missing injected ModuleLoader facade row')
   ;(0, eval)(facadeRow.text)
@@ -216,6 +228,15 @@ export function mountAssembledApp(search = '?fixture'): void {
     void entry.run()
     unmount = () => entry.dispose()
   })
+}
+
+/**
+ * Dispose the currently mounted assembled application (the stop side of a
+ * start/stop cycle; installAssembledBootEnv also calls this on teardown).
+ */
+export async function disposeAssembledApp(): Promise<void> {
+  await unmount?.()
+  unmount = undefined
 }
 
 /**

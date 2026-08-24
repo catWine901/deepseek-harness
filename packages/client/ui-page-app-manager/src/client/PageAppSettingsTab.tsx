@@ -34,6 +34,8 @@ export interface PageAppSettingsTabInjected {
   uninstall: (pageId: string, signal: AbortSignal) => Promise<void>
   /** Run startup/operator recovery over the profile journal. */
   recover: () => Promise<void>
+  /** Cancel the in-flight install (aborts the controller's per-call signal). */
+  cancelInstall: () => void
 }
 
 /** Full composed props: runtime share + locale seat + inject face. */
@@ -41,6 +43,16 @@ export type PageAppSettingsTabProps =
   & PropsRuntime<'settings.plugins.tab'>
   & PropsLocale<'settings.pageApp'>
   & InjectFace<PageAppSettingsTabInjected>
+
+/**
+ * Whether a mutation failure is a cancellation. The abort reason is a
+ * DOMException (AbortError) which jsdom does NOT subclass Error, so the name
+ * check must not rely on `instanceof Error`.
+ */
+function isAbort(failure: unknown): boolean {
+  return typeof failure === 'object' && failure !== null && 'name' in failure
+    && (failure as { name?: unknown }).name === 'AbortError'
+}
 
 /** Health display keys (one per manager health value that Settings shows). */
 const HEALTH_KEYS: Record<string, PageAppSettingsKey> = {
@@ -56,11 +68,14 @@ const HEALTH_KEYS: Record<string, PageAppSettingsKey> = {
 
 /** Render the Workspace Apps settings tab. */
 export function PageAppSettingsTab(
-  { usePageApp, t, install, setEnabled, setHidden, uninstall, recover }: PageAppSettingsTabProps,
+  { usePageApp, t, install, setEnabled, setHidden, uninstall, recover, cancelInstall }: PageAppSettingsTabProps,
 ): ReactNode {
   const snapshot = usePageApp((state: PageAppClientSnapshot) => state)
   const [source, setSource] = useState('')
   const [busy, setBusy] = useState(false)
+  // Install-specific in-flight flag: the cancel action is visible only while
+  // an install is running (other busy row actions never show it).
+  const [installing, setInstalling] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirming, setConfirming] = useState<string | null>(null)
 
@@ -71,19 +86,25 @@ export function PageAppSettingsTab(
     event.preventDefault()
     setError(null)
     setBusy(true)
+    setInstalling(true)
     try {
       // Classify locally for the typed Remote; the Host re-validates on its side.
       void parsePageAppInstallSourceClient(source)
     } catch (failure) {
       setBusy(false)
+      setInstalling(false)
       setError(String(failure instanceof Error ? failure.message : failure))
       return
     }
     void install(source.trim(), new AbortController().signal).then(
-      () => { setBusy(false); setSource('') },
+      () => { setBusy(false); setInstalling(false); setSource('') },
       (failure: unknown) => {
         setBusy(false)
-        setError(String(failure instanceof Error ? failure.message : failure))
+        setInstalling(false)
+        // A cancelled install is user intent, not an error.
+        if (!isAbort(failure)) {
+          setError(String(failure instanceof Error ? failure.message : failure))
+        }
       },
     )
   }
@@ -145,6 +166,11 @@ export function PageAppSettingsTab(
         <button type="submit" disabled={busy || source.trim().length === 0}>
           {busy ? t('addProgress') : t('addAction')}
         </button>
+        {installing ? (
+          <button type="button" onClick={cancelInstall}>
+            {t('cancelInstall')}
+          </button>
+        ) : null}
       </form>
 
       {ordered.length === 0 ? <p className={css.empty}>{t('empty')}</p> : null}

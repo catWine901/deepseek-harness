@@ -35,6 +35,12 @@ export interface PageAppClientSnapshot {
   readonly visitedPageIds: readonly string[]
   /** The pending targeted activation, when one is open. */
   readonly activation: PageAppActivationView | null
+  /**
+   * Managed surface page ids whose entries abdicated after a crash (slot
+   * `reportEntryError` with `abdicate`); the shell renders a manager-owned
+   * failure surface for each until a select (retry) or eviction clears it.
+   */
+  readonly failedPageIds: readonly string[]
 }
 
 /** Controller dependencies: remote, slot ledger, identity, and graph convergence. */
@@ -75,6 +81,8 @@ function sameSnapshot(a: PageAppClientSnapshot, b: PageAppClientSnapshot): boole
     && sameEligible(a.eligible, b.eligible)
     && a.visitedPageIds.length === b.visitedPageIds.length
     && a.visitedPageIds.every((id, index) => id === b.visitedPageIds[index])
+    && a.failedPageIds.length === b.failedPageIds.length
+    && a.failedPageIds.every((id, index) => id === b.failedPageIds[index])
 }
 
 /**
@@ -91,6 +99,7 @@ export class PageAppController {
     activePageId: null,
     visitedPageIds: [],
     activation: null,
+    failedPageIds: [],
   })
   private registry: PageAppManagerSnapshot | null = null
   private activation: PageAppActivationRequestedEvent | null = null
@@ -102,6 +111,9 @@ export class PageAppController {
   } | null = null
   private readonly visited = new Set<string>()
   private visitedOrder: string[] = []
+  private readonly failed = new Set<string>()
+  /** The tracked in-flight install controller (Settings cancel targets it). */
+  private installAbort: AbortController | null = null
   private activePageId: string | null = PAGE_APP_DSH_PAGE
   private disposed = false
   private readonly disposers: Array<() => void> = []
@@ -156,19 +168,37 @@ export class PageAppController {
       this.visited.add(id)
       this.visitedOrder = [...this.visitedOrder, id]
     }
+    // Retry = re-select: the failure record clears so the shell remounts.
+    this.failed.delete(id)
     this.rebuild()
   }
 
   /**
-   * Install one workspace package (Settings add-flow).
+   * Install one workspace package (Settings add-flow). The remote receives a
+   * per-call AbortController signal linked to the caller's signal; controller
+   * disposal and a later cancelInstall() abort the same controller.
    * @param source - the validated install source.
    * @param signal - cancellation.
    */
   public async install(source: PageAppInstallSource, signal: AbortSignal): Promise<void> {
-    void signal
-    const revision = unwrap(await this.deps.remote.install(source, this.deps.clientInstanceId))
-    void revision
-    await this.refresh()
+    const ctrl = new AbortController()
+    // A new install replaces the previous in-flight one (one at a time).
+    this.installAbort?.abort()
+    this.installAbort = ctrl
+    this.disposers.push(() => { ctrl.abort() })
+    const unlink = this.linkAbort(ctrl, signal)
+    if (ctrl.signal.aborted) {
+      if (this.installAbort === ctrl) this.installAbort = null
+      throw ctrl.signal.reason
+    }
+    try {
+      const revision = unwrap(await this.deps.remote.install(source, this.deps.clientInstanceId, ctrl.signal))
+      void revision
+      await this.refresh()
+    } finally {
+      if (this.installAbort === ctrl) this.installAbort = null
+      unlink()
+    }
   }
 
   /**
@@ -178,10 +208,17 @@ export class PageAppController {
    * @param signal - cancellation.
    */
   public async setEnabled(pageId: string, enabled: boolean, signal: AbortSignal): Promise<void> {
-    void signal
-    unwrap(await this.deps.remote.setEnabled(pageId, enabled))
-    this.rebuild()
-    await this.refresh()
+    const ctrl = new AbortController()
+    this.disposers.push(() => { ctrl.abort() })
+    const unlink = this.linkAbort(ctrl, signal)
+    if (ctrl.signal.aborted) throw ctrl.signal.reason
+    try {
+      unwrap(await this.deps.remote.setEnabled(pageId, enabled, ctrl.signal))
+      this.rebuild()
+      await this.refresh()
+    } finally {
+      unlink()
+    }
   }
 
   /**
@@ -210,16 +247,44 @@ export class PageAppController {
    * @param signal - cancellation.
    */
   public async uninstall(pageId: string, signal: AbortSignal): Promise<void> {
-    void signal
-    unwrap(await this.deps.remote.uninstall(pageId))
-    this.evict(pageId)
-    await this.refresh()
+    const ctrl = new AbortController()
+    this.disposers.push(() => { ctrl.abort() })
+    const unlink = this.linkAbort(ctrl, signal)
+    if (ctrl.signal.aborted) throw ctrl.signal.reason
+    try {
+      unwrap(await this.deps.remote.uninstall(pageId, ctrl.signal))
+      this.evict(pageId)
+      await this.refresh()
+    } finally {
+      unlink()
+    }
   }
 
   /** Run the startup/operator recovery over the profile journal. */
   public async recover(): Promise<void> {
     unwrap(await this.deps.remote.recover())
     await this.refresh()
+  }
+
+  /**
+   * Cancel the in-flight install (Settings cancel action). Aborts the tracked
+   * install controller; the remote call rejects with the abort reason and the
+   * Settings busy state clears through the install promise.
+   */
+  public cancelInstall(): void {
+    this.installAbort?.abort()
+  }
+
+  /**
+   * Record one abdicated managed surface (slot entry crash). The shell swaps
+   * the crashed cell for a manager-owned failure surface; a later select
+   * (retry) or eviction clears the record.
+   * @param pageId - the crashed surface's page id (the keyed slot key).
+   */
+  public recordEntryError(pageId: string): void {
+    if (this.disposed) return
+    this.failed.add(pageId)
+    this.rebuild()
   }
 
   /** Re-read the registry from the remote and rebuild the projection. */
@@ -234,6 +299,26 @@ export class PageAppController {
       void error
     }
     this.rebuild()
+  }
+
+  /**
+   * Link one per-call AbortController to the caller's signal: a pre-aborted
+   * signal aborts immediately; a later external abort forwards. The remote
+   * receives the per-call signal, so disposal and external cancellation share
+   * one abort consumer.
+   * @param controller - the per-call controller.
+   * @param signal - the caller's cancellation signal.
+   * @returns a disposer unlinking the forwarded abort listener.
+   */
+  private linkAbort(controller: AbortController, signal: AbortSignal): () => void {
+    if (signal.aborted) {
+      controller.abort()
+      return () => {}
+    }
+    if (signal === controller.signal) return () => {}
+    const onAbort = (): void => { controller.abort() }
+    signal.addEventListener('abort', onAbort, { once: true })
+    return () => { signal.removeEventListener('abort', onAbort) }
   }
 
   /** Rebuild the snapshot from current registry, activation, and selection state. */
@@ -261,6 +346,7 @@ export class PageAppController {
       activePageId: this.activePageId === PAGE_APP_DSH_PAGE ? null : this.activePageId,
       visitedPageIds: [...this.visitedOrder],
       activation: this.activationView(),
+      failedPageIds: [...this.failed],
     }
     // Spec §14: the snapshot reference stays put until committed registry or
     // eligible-slot facts change (noise rebuilds keep the previous object).
@@ -333,6 +419,7 @@ export class PageAppController {
   /** Evict one page from visited (disable/uninstall lifecycle). */
   private evict(pageId: string): void {
     this.visited.delete(pageId)
+    this.failed.delete(pageId)
     this.visitedOrder = this.visitedOrder.filter(id => id !== pageId)
     if (this.activePageId === pageId) this.activePageId = PAGE_APP_DSH_PAGE
   }

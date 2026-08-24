@@ -103,8 +103,11 @@
     # Profile-scoped Workspace Apps manager: ownership registry, lifecycle
     # transactions, and the pageAppManager Remote surface. Injects the
     # launcher-owned profile runtime (identity + acknowledged recomposition).
+    # The settlement timeout bounds the client activation acknowledgement.
     - id: page-app-manager
       name: '@deepseek-ai/dsh-page-app-manager'
+      config:
+        settlementTimeoutMs: 60000
 
     # The API gateway: the transport-agnostic dispatch face every client shape
     # shares. The base layer's agent-default-model service owns the default model.

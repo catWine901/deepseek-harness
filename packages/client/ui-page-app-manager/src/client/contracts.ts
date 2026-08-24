@@ -23,11 +23,15 @@ export type PageAppRemoteResult<T> = {
 /** The generated `pageAppManager` namespace methods the controller calls. */
 export interface PageAppManagerRemoteMethods {
   list(): Promise<PageAppRemoteResult<PageAppManagerSnapshot>>
-  install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<PageAppRemoteResult<number>>
-  setEnabled(pageId: string, enabled: boolean): Promise<PageAppRemoteResult<number>>
+  install(
+    source: PageAppInstallSource,
+    clientInstanceId: PageAppClientInstanceId,
+    signal: AbortSignal,
+  ): Promise<PageAppRemoteResult<number>>
+  setEnabled(pageId: string, enabled: boolean, signal: AbortSignal): Promise<PageAppRemoteResult<number>>
   setHidden(pageId: string, hidden: boolean): Promise<PageAppRemoteResult<number>>
   reorder(pageIds: readonly string[]): Promise<PageAppRemoteResult<number>>
-  uninstall(pageId: string): Promise<PageAppRemoteResult<number>>
+  uninstall(pageId: string, signal: AbortSignal): Promise<PageAppRemoteResult<number>>
   ackClientActivation(
     transactionId: PageAppTransactionId,
     clientInstanceId: PageAppClientInstanceId,

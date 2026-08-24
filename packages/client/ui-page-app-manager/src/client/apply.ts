@@ -23,6 +23,7 @@ import type {
   PageAppClientInstanceId, PageAppInstallSource, PageAppManagerSnapshot,
 } from '@deepseek-ai/dsh-page-app-manager/types'
 import { PageAppController, type PageAppControllerDeps } from './controller.ts'
+import { PAGE_APP_SURFACE_SLOT } from './contracts.ts'
 import type {
   PageAppManagerRemoteMethods, PageAppRemoteEvents, PageAppRemoteResult, PageAppSlotsSeam,
 } from './contracts.ts'
@@ -58,11 +59,11 @@ function stubRemote(): PageAppManagerRemoteMethods & PageAppRemoteEvents {
   const never = (): Promise<PageAppRemoteResult<never>> => Promise.resolve(ok(undefined as never))
   return {
     list: () => Promise.resolve(ok(EMPTY_SNAPSHOT)),
-    install: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId) => never(),
-    setEnabled: (_pageId: string, _enabled: boolean) => never(),
+    install: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId, _signal: AbortSignal) => never(),
+    setEnabled: (_pageId: string, _enabled: boolean, _signal: AbortSignal) => never(),
     setHidden: (_pageId: string, _hidden: boolean) => never(),
     reorder: (_pageIds: readonly string[]) => never(),
-    uninstall: (_pageId: string) => never(),
+    uninstall: (_pageId: string, _signal: AbortSignal) => never(),
     ackClientActivation: () => never(),
     recover: () => never(),
     $on: () => () => {},
@@ -129,11 +130,14 @@ function createController(ctx: ClientContext): PageAppController {
   return new PageAppController(deps)
 }
 
-/** The shell's inject face: the controller observable as a hook plus select. */
+/** The shell's inject face: the controller observable plus the recovery actions. */
 function shellInjected(controller: PageAppController): PageAppShellInjected {
   return {
     hooks: { pageApp: controller.observable },
     select: (pageId) => { controller.select(pageId) },
+    // The failure surface's uninstall runs the same flow as Settings (no
+    // cancellation UI on the shell; a fresh signal keeps the call valid).
+    uninstall: (pageId) => { void controller.uninstall(pageId, new AbortController().signal) },
   }
 }
 
@@ -146,6 +150,7 @@ function settingsInjected(controller: PageAppController): PageAppSettingsTabInje
     setHidden: (pageId, hidden) => controller.setHidden(pageId, hidden),
     uninstall: (pageId, signal) => controller.uninstall(pageId, signal),
     recover: () => controller.recover(),
+    cancelInstall: () => { controller.cancelInstall() },
   }
 }
 
@@ -168,12 +173,22 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     const stopController = controller.start()
     const disposers = [
+      // One entry-error subscription per fiber: an abdicating managed surface
+      // is recorded on the controller (the shell swaps in the failure face);
+      // root crashes are NOT recorded here — the priority-1 fallback owns the
+      // root cell and renders Native DSH.
+      ctx.slots.onEntryError((key, entry) => {
+        if (key === PAGE_APP_SURFACE_SLOT && entry.options.key !== undefined) {
+          controller.recordEntryError(entry.options.key)
+        }
+      }),
       ctx.slots.register({
         name: 'root',
         children: {
           'page-app.shell.builtin': { kind: 'single', scope: 'root' },
           'page-app.shell.surface': { kind: 'keyed', scope: 'root' },
         },
+        locale: NS,
         inject: () => shellInjected(controller),
       }, PageAppShell),
       // The Workspace tab registers after the read-only `all` tab (order 10).

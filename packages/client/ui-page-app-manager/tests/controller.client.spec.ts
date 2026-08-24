@@ -3,8 +3,10 @@
 // disable/uninstall eviction, registry invalidation of current selection, and
 // the closed activation acknowledgement contract (spec §10.1 step 8, §14).
 import { describe, expect, it } from 'vitest'
-import type { PageAppActivationRequestedEvent, PageAppClientInstanceId } from '@deepseek-ai/dsh-page-app-manager/types'
+import type { PageAppActivationRequestedEvent, PageAppClientInstanceId, PageAppInstallSource } from '@deepseek-ai/dsh-page-app-manager/types'
 import { PageAppController, type PageAppControllerDeps } from '../src/client/controller.ts'
+import type { PageAppRemoteResult } from '../src/client/contracts.ts'
+import { parsePageAppInstallSourceClient } from '../src/client/source.ts'
 import {
   FakeRemote, FakeSlots, deferred, err, fakeEntry, fakeRow, fakeSnapshot, ok,
 } from './fake-page-app.client.ts'
@@ -49,6 +51,11 @@ async function flush(): Promise<void> {
   await Promise.resolve()
   await Promise.resolve()
   await Promise.resolve()
+}
+
+/** One validated install-source fixture. */
+function installSource(): PageAppInstallSource {
+  return parsePageAppInstallSourceClient('@example/script-workspace')
 }
 
 describe('state machine', () => {
@@ -132,6 +139,28 @@ describe('state machine', () => {
     expect(snap.activePageId).toBeNull()
     expect(snap.visitedPageIds).toEqual([])
     expect(snap.eligible.size).toBe(0)
+    dispose()
+  })
+
+  it('records an abdicated managed surface and clears the failure on select (retry) and eviction', async () => {
+    const remote = new FakeRemote()
+    const slots = new FakeSlots()
+    remote.onList = () => Promise.resolve(ok(fakeSnapshot([
+      fakeRow({ packageName: '@scope/a', pageId: 'page-a', enabled: true }),
+    ])))
+    slots.setEntries([fakeEntry('page-a', '@scope/a')])
+    const { controller, dispose } = await harness(remote, slots)
+    // A managed surface abdicates: the controller records the failed page.
+    controller.recordEntryError('page-a')
+    expect(controller.observable.getSnapshot().failedPageIds).toEqual(['page-a'])
+    // Retry = re-select: the failure record clears so the shell remounts.
+    controller.select('page-a')
+    expect(controller.observable.getSnapshot().failedPageIds).toEqual([])
+    // A disabled/uninstalled page's failure record dies with its eviction.
+    controller.recordEntryError('page-a')
+    remote.onList = () => Promise.resolve(ok(fakeSnapshot([])))
+    await controller.uninstall('page-a', new AbortController().signal)
+    expect(controller.observable.getSnapshot().failedPageIds).toEqual([])
     dispose()
   })
 
@@ -310,6 +339,73 @@ describe('targeted activation acknowledgement', () => {
     remote.emitChanged(2)
     await flush()
     expect(controller.observable.getSnapshot().activation).toBeNull()
+    dispose()
+  })
+})
+
+describe('real cancellation signals (M1.2, D8/D9)', () => {
+  it('passes a real AbortController signal to install and aborts on controller disposal', async () => {
+    const remote = new FakeRemote()
+    const slots = new FakeSlots()
+    // The install hangs until the test settles it; the remote honors the
+    // signal it received (the real abort consumer of the mutation).
+    const gate = deferred<undefined>()
+    let installSignal: AbortSignal | undefined
+    remote.onInstall = (source, clientInstanceId, signal) => {
+      void source
+      void clientInstanceId
+      installSignal = signal
+      return new Promise<PageAppRemoteResult<number>>((resolve, reject) => {
+        signal.addEventListener('abort', () => { reject(new DOMException('The operation was aborted', 'AbortError')) }, { once: true })
+        void gate.promise.then(() => { resolve(ok(2)) })
+      })
+    }
+    const { controller, dispose } = await harness(remote, slots)
+    const pending = controller.install(installSource(), new AbortController().signal)
+    await Promise.resolve()
+    // The remote received a REAL signal, not undefined (void-signal bug).
+    expect(installSignal).toBeInstanceOf(AbortSignal)
+    expect(installSignal?.aborted).toBe(false)
+    // Controller disposal aborts the in-flight call through that signal.
+    dispose()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('aborts setEnabled and uninstall through the controller signal', async () => {
+    const remote = new FakeRemote()
+    const slots = new FakeSlots()
+    const enableGate = deferred<undefined>()
+    const uninstallGate = deferred<undefined>()
+    remote.onSetEnabled = (_pageId, _enabled, signal) => new Promise<PageAppRemoteResult<number>>((resolve, reject) => {
+      signal.addEventListener('abort', () => { reject(new DOMException('The operation was aborted', 'AbortError')) }, { once: true })
+      void enableGate.promise.then(() => { resolve(ok(2)) })
+    })
+    remote.onUninstall = (_pageId, signal) => new Promise<PageAppRemoteResult<number>>((resolve, reject) => {
+      signal.addEventListener('abort', () => { reject(new DOMException('The operation was aborted', 'AbortError')) }, { once: true })
+      void uninstallGate.promise.then(() => { resolve(ok(2)) })
+    })
+    const { controller, dispose } = await harness(remote, slots)
+    const external = new AbortController()
+    const enable = controller.setEnabled('page-a', true, external.signal)
+    const remove = controller.uninstall('page-b', external.signal)
+    await Promise.resolve()
+    // One external abort propagates to both in-flight mutations.
+    external.abort()
+    await expect(enable).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(remove).rejects.toMatchObject({ name: 'AbortError' })
+    dispose()
+  })
+
+  it('a pre-aborted signal rejects the mutation without reaching the remote', async () => {
+    const remote = new FakeRemote()
+    const slots = new FakeSlots()
+    const { controller, dispose } = await harness(remote, slots)
+    const external = new AbortController()
+    external.abort()
+    await expect(controller.install(installSource(), external.signal))
+      .rejects.toMatchObject({ name: 'AbortError' })
+    // The remote was never asked: the mutation rejected before the call.
+    expect(remote.calls.filter(call => call.method === 'install')).toHaveLength(0)
     dispose()
   })
 })

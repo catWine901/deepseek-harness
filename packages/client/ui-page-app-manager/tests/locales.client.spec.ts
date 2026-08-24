@@ -18,4 +18,11 @@ describe('settings.pageApp locale pair', () => {
       expect(value.length, `en.${key}`).toBeGreaterThan(0)
     }
   })
+
+  it('carries the explicit cancel-install copy in both locales', () => {
+    // The Settings add-flow cancel action is user-visible: the zh source and
+    // the en alignment stay pinned together.
+    expect(zh.cancelInstall).toBe('取消安装')
+    expect(en.cancelInstall).toBe('Cancel install')
+  })
 })

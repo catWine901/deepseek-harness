@@ -27,6 +27,7 @@ function snapshot(over: Partial<PageAppClientSnapshot> = {}): PageAppClientSnaps
     activePageId: null,
     visitedPageIds: [],
     activation: null,
+    failedPageIds: [],
     ...over,
   }
 }
@@ -40,6 +41,12 @@ function makeStore(initial: PageAppClientSnapshot) {
 /** Render the shell against a recording renderSlot and a store-backed hook. */
 function mountShell(store: MutableObservable<PageAppClientSnapshot>) {
   const select = vi.fn()
+  const uninstall = vi.fn()
+  const t = ((key: string) => ({
+    surfaceCrashed: 'This page failed',
+    retry: 'Retry',
+    uninstall: 'Uninstall',
+  })[key] ?? key) as PageAppShellProps['t']
   const slotCalls: { key: string; entryKey?: string }[] = []
   const renderSlot = ((key: string, _owner: object, opts?: { entryKey?: string }) => {
     const entryKey = opts?.entryKey
@@ -49,10 +56,12 @@ function mountShell(store: MutableObservable<PageAppClientSnapshot>) {
   const props: PageAppShellProps = {
     usePageApp: (sel: (s: PageAppClientSnapshot) => unknown) => sel(useSyncExternalStore(store.subscribe, store.getSnapshot)),
     select,
+    uninstall,
+    t,
     renderSlot,
   } as PageAppShellProps
   const utils = render(<PageAppShell {...props} />)
-  return { select, slotCalls, ...utils }
+  return { select, uninstall, t, slotCalls, ...utils }
 }
 
 beforeEach(() => {
@@ -179,6 +188,56 @@ describe('PageAppShell keep-mounted behavior', () => {
     expect(queryByTestId('slot-page-app.shell.surface-page-a')).toBeNull()
     // DSH remains mounted throughout.
     expect(container.querySelector('[data-page-id="dsh"]')).not.toBeNull()
+  })
+
+  it('renders a manager-owned failure surface with retry and uninstall actions when a managed surface abdicates', () => {
+    const { store } = makeStore(snapshot({
+      eligible: new Map([['page-a', entry('page-a', '@scope/a')]]),
+      activePageId: 'page-a',
+      visitedPageIds: ['page-a'],
+      failedPageIds: ['page-a'],
+    }))
+    const { container, getByRole, select, uninstall } = mountShell(store)
+    // The failure face replaces the bare data-slot-error cell of the crashed
+    // surface; the keyed wrapper stays mounted.
+    expect(container.querySelector('[data-page-id="page-a"]')).not.toBeNull()
+    expect(container.querySelector('[data-page-app-failure]')).not.toBeNull()
+    const retry = getByRole('button', { name: 'Retry' })
+    const uninstallButton = getByRole('button', { name: 'Uninstall' })
+    act(() => { retry.click() })
+    expect(select).toHaveBeenCalledWith('page-a')
+    act(() => { uninstallButton.click() })
+    expect(uninstall).toHaveBeenCalledWith('page-a')
+  })
+
+  it('the rail and DSH stay usable while one surface shows the failure face', () => {
+    const { store } = makeStore(snapshot({
+      registry: {
+        profile: { name: 'p', directory: 'd' },
+        revision: 1,
+        entries: [
+          { packageName: '@scope/a', page: { id: 'page-a', name: 'A', description: '', defaultOrder: 1, rootEntryId: 'r' }, order: 1, enabled: true, hidden: false, installedAt: '', updatedAt: '', source: { kind: 'registry', display: 'x' }, resolvedVersion: '1.0.0', health: 'ready' },
+          { packageName: '@scope/b', page: { id: 'page-b', name: 'B', description: '', defaultOrder: 2, rootEntryId: 'r' }, order: 2, enabled: true, hidden: false, installedAt: '', updatedAt: '', source: { kind: 'registry', display: 'x' }, resolvedVersion: '1.0.0', health: 'ready' },
+        ],
+        operation: null, recovery: null,
+      },
+      eligible: new Map([
+        ['page-a', entry('page-a', '@scope/a')],
+        ['page-b', entry('page-b', '@scope/b')],
+      ]),
+      activePageId: 'page-a',
+      visitedPageIds: ['page-a', 'page-b'],
+      failedPageIds: ['page-a'],
+    }))
+    const { container, getByTestId } = mountShell(store)
+    // DSH stays mounted; the rail still lists both pages; the healthy page-b
+    // renders its surface while page-a shows the failure face.
+    expect(container.querySelector('[data-page-id="dsh"]')).not.toBeNull()
+    const railRows = [...container.querySelectorAll('[data-page-app-rail-item]')]
+      .map(el => el.textContent ?? '')
+    expect(railRows).toEqual(['DSH / Agent', 'A', 'B'])
+    expect(container.querySelector('[data-page-app-failure]')).not.toBeNull()
+    expect(getByTestId('slot-page-app.shell.surface-page-b')).toBeTruthy()
   })
 
   it('hides the active fallback to DSH when the page becomes hidden (no eviction)', () => {

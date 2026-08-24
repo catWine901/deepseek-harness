@@ -26,6 +26,7 @@ export class PageAppActivationGate {
     reject: (error: Error) => void
     signal: AbortSignal
     onAbort: () => void
+    timer: ReturnType<typeof setTimeout> | undefined
   }> = []
 
   /** Whether an activation is currently pending. */
@@ -52,12 +53,15 @@ export class PageAppActivationGate {
   }
 
   /**
-   * Wait for the first valid acknowledgement. Rejects when the gate is
-   * discarded before any acknowledgement arrives or the signal aborts.
+   * Wait for the first valid acknowledgement, bounded by a Host timeout.
+   * Rejects when the gate is discarded before any acknowledgement arrives,
+   * when the signal aborts, or when the timeout elapses first — a vanished
+   * client can never hold the profile lock indefinitely in a live process.
    * @param signal - cancellation; an aborted wait rejects.
+   * @param timeoutMs - Host cap on the settlement wait; elapsing rejects.
    * @returns the settled request.
    */
-  public awaitSettlement(signal: AbortSignal): Promise<ClientActivationRequest> {
+  public awaitSettlement(signal: AbortSignal, timeoutMs: number): Promise<ClientActivationRequest> {
     return new Promise<ClientActivationRequest>((resolve, reject) => {
       if (this.request === undefined) {
         reject(new Error('page-app activation: no pending activation to await'))
@@ -71,11 +75,17 @@ export class PageAppActivationGate {
         reject(new Error('page-app activation: settlement wait aborted'))
         return
       }
+      const onTimeout = (): void => {
+        signal.removeEventListener('abort', onAbort)
+        reject(new Error('page-app activation: settlement wait timed out'))
+      }
+      const timer = setTimeout(onTimeout, timeoutMs)
       const onAbort = (): void => {
+        clearTimeout(timer)
         reject(new Error('page-app activation: settlement wait aborted'))
       }
       signal.addEventListener('abort', onAbort, { once: true })
-      this.waiters.push({ resolve, reject, signal, onAbort })
+      this.waiters.push({ resolve, reject, signal, onAbort, timer })
     })
   }
 
@@ -115,6 +125,7 @@ export class PageAppActivationGate {
     const waiters = this.waiters.splice(0)
     for (const waiter of waiters) {
       waiter.signal.removeEventListener('abort', waiter.onAbort)
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
       waiter.resolve(request)
     }
     return { accepted: true }
@@ -127,6 +138,7 @@ export class PageAppActivationGate {
     const waiters = this.waiters.splice(0)
     for (const waiter of waiters) {
       waiter.signal.removeEventListener('abort', waiter.onAbort)
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer)
       waiter.reject(new Error('page-app activation: gate discarded before settlement'))
     }
   }

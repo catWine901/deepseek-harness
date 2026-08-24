@@ -5,7 +5,10 @@
  * create entries — and every mutation (install/enable/disable/uninstall)
  * arrives in the transaction task (Task 8). The manager root is constructed
  * from the profile runtime and Loader facts only, so management-API readiness
- * can never gate the built-in DSH shell (SR-09).
+ * can never gate the built-in DSH shell (SR-09). Mutating Remote methods carry
+ * a final `signal` the transaction honors, the activation acknowledgement is
+ * bounded by the configurable `settlementTimeoutMs`, and the lifecycle is
+ * disposed with the manager fiber so a reload cannot orphan a transaction.
  * @module @deepseek-ai/dsh-page-app-manager
  */
 
@@ -15,6 +18,7 @@ import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Loader } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
+import { z } from 'zod'
 import {
   canonicalManagedRootHash,
   loadOverlayPatches,
@@ -29,7 +33,7 @@ import {
   type PageAppRegistryEntry,
   type PageAppRegistryV1,
 } from '@deepseek-ai/dsh-page-app-profile'
-import type { PageAppClientInstanceId, PageAppTransactionId } from './types.ts'
+import type { PageAppClientInstanceId, PageAppManagerConfig, PageAppTransactionId } from './types.ts'
 import type { PageAppManagerSnapshot, PageAppView, PageAppInstallSource } from './types.ts'
 import { parsePageAppInstallSource } from './source.ts'
 import { PageAppLifecycle } from './transaction.ts'
@@ -112,7 +116,12 @@ export class PageAppManager extends TypertRemoteService {
   private readonly profileRuntime: ProfileRuntime
   private readonly lifecycle: PageAppLifecycle
 
-  constructor(ctx: Context, options: { profileRuntime: ProfileRuntime; executor?: PageAppPackageExecutor }) {
+  constructor(ctx: Context, options: {
+    profileRuntime: ProfileRuntime
+    executor?: PageAppPackageExecutor
+    /** The resolved plugin config: the Host settlement-wait cap. */
+    config: { settlementTimeoutMs: number }
+  }) {
     super(ctx, 'pageAppManager')
     this.profileRuntime = options.profileRuntime
     this.lifecycle = new PageAppLifecycle({
@@ -120,6 +129,17 @@ export class PageAppManager extends TypertRemoteService {
       executor: options.executor ?? createPnpmExecutor(),
       runtime: this.profileRuntime,
       pnpmWorkspaceFile: join(this.profileRuntime.identity.directory, 'pnpm-workspace.yaml'),
+      settlementTimeoutMs: options.config.settlementTimeoutMs,
+      clientGraphRev: () => {
+        // The Host client-modules registry owns the graph served as
+        // `window.__DSH_BOOT__`; the activation request must carry its exact
+        // revision so the acknowledgement proves convergence.
+        const modules = ctx.get('clientModules') as { graph(): { rev: string } } | undefined
+        if (modules === undefined) {
+          throw new Error('page-app install: the host client-modules registry is unavailable; cannot converge the activation graph')
+        }
+        return modules.graph().rev
+      },
       onChanged: (revision) => { ctx.emit('page-app-manager/changed', revision) },
       onActivationRequested: (request) => { ctx.emit('page-app-manager/activation-requested', request) },
     })
@@ -133,6 +153,11 @@ export class PageAppManager extends TypertRemoteService {
   /** The pending targeted client activation gate (install acknowledgement). */
   public get activation(): PageAppLifecycle['activation'] {
     return this.lifecycle.activation
+  }
+
+  /** Abort the in-flight transaction; wired to the manager fiber's effect. */
+  public dispose(): void {
+    this.lifecycle.dispose()
   }
 
   /**
@@ -151,22 +176,24 @@ export class PageAppManager extends TypertRemoteService {
    * Install one managed package (the Remote entry of the Settings add-flow).
    * @param source - the validated install source.
    * @param clientInstanceId - the opaque initiating client instance.
+   * @param signal - cancellation; aborts pnpm and the activation wait.
    * @returns the committed registry revision.
    */
   @Remote('install')
-  public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<number> {
-    return this.lifecycle.install(source, clientInstanceId, new AbortController().signal)
+  public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId, signal: AbortSignal): Promise<number> {
+    return this.lifecycle.install(source, clientInstanceId, signal)
   }
 
   /**
    * Enable or disable one managed page.
    * @param pageId - the managed page id.
    * @param enabled - the new enabled state.
+   * @param signal - cancellation; honored by the shared lock.
    * @returns the committed registry revision.
    */
   @Remote('setEnabled')
-  public setEnabled(pageId: string, enabled: boolean): Promise<number> {
-    return this.lifecycle.setEnabled(pageId, enabled, new AbortController().signal)
+  public setEnabled(pageId: string, enabled: boolean, signal: AbortSignal): Promise<number> {
+    return this.lifecycle.setEnabled(pageId, enabled, signal)
   }
 
   /**
@@ -193,11 +220,12 @@ export class PageAppManager extends TypertRemoteService {
   /**
    * Uninstall one managed page from the current profile.
    * @param pageId - the managed page id.
+   * @param signal - cancellation; aborts pnpm and the activation wait.
    * @returns the committed registry revision.
    */
   @Remote('uninstall')
-  public uninstall(pageId: string): Promise<number> {
-    return this.lifecycle.uninstall(pageId, new AbortController().signal)
+  public uninstall(pageId: string, signal: AbortSignal): Promise<number> {
+    return this.lifecycle.uninstall(pageId, signal)
   }
 
   /**
@@ -233,6 +261,7 @@ export class PageAppManager extends TypertRemoteService {
     return recoverPageAppTransaction(
       this.profileRuntime.identity.directory,
       createPnpmExecutor(),
+      this.profileRuntime,
     ).then(outcome => ({ action: outcome.action, ...outcome.message === undefined ? {} : { message: outcome.message } }))
   }
 
@@ -388,18 +417,30 @@ export const name = 'page-app-manager'
 /** Required services: the launcher-owned profile runtime and the Loader. */
 export const inject = [PROFILE_RUNTIME_SERVICE, 'loader']
 
+/** Validated plugin config: the Host settlement-wait cap (defaults in the schema). */
+export const Config = z.object({
+  settlementTimeoutMs: z.number().int().positive().default(60_000),
+})
+
 /**
  * Mount the Host page-app manager service as a Cordis plugin: reads the
  * launcher-owned profile runtime (the immutable identity and the only
  * acknowledged live-recomposition writer) and constructs the manager over it.
  * The manager must never infer the profile from cwd or browser arguments
  * (spec §8.1). Constructing the TypertRemoteService registers it on the
- * caller's fiber, so it unregisters automatically when the fiber unloads.
+ * caller's fiber, so it unregisters automatically when the fiber unloads; the
+ * effect disposes the lifecycle so an in-flight transaction aborts with the
+ * manager fiber instead of orphaning under a half-dead manager.
  * @param ctx - Host context with the profile runtime and Loader mounted.
+ * @param config - resolved plugin config (Cordis applies the schema default).
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: PageAppManagerConfig): void {
   const runtime = ctx.get(PROFILE_RUNTIME_SERVICE) as ProfileRuntime
   // Constructing the manager provides ctx.pageAppManager on this fiber; the
   // Service base auto-unregisters it when the fiber unloads.
-  new PageAppManager(ctx, { profileRuntime: runtime })
+  const manager = new PageAppManager(ctx, {
+    profileRuntime: runtime,
+    config: { settlementTimeoutMs: config.settlementTimeoutMs ?? 60_000 },
+  })
+  ctx.effect(() => () => { manager.dispose() }, 'page-app-manager: abort in-flight transactions when the manager fiber unloads')
 }

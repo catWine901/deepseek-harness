@@ -105,7 +105,7 @@ function buildManager(options: { registry?: unknown; loaderRows?: LoaderRow[]; j
       for (const row of options.loaderRows ?? []) yield loaderEntry(row)
     },
   })
-  const manager = new PageAppManager(ctx, { profileRuntime: runtime })
+  const manager = new PageAppManager(ctx, { profileRuntime: runtime, config: { settlementTimeoutMs: 60_000 } })
   return { ctx, manager }
 }
 

@@ -7,7 +7,9 @@ import { Context } from '@deepseek-ai/cordis'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
 import { apply, PageAppShell, type PageAppShellInjected, inject } from '@deepseek-ai/dsh-client-ui-page-app-manager/client'
+import { fakeEntry } from './fake-page-app.client.ts'
 
 beforeEach(() => {
   document.head.querySelectorAll('meta[name="theme-color"]').forEach((node) => { node.remove() })
@@ -70,6 +72,30 @@ describe('ui-page-app-manager client apply', () => {
     expect(snapshot.eligible.size).toBe(0)
     expect(snapshot.activePageId).toBeNull()
     await fiber.dispose()
+  })
+
+  it('subscribes to slot entry errors and disposes the subscription with the fiber', async () => {
+    const { ctx, slots } = await bench()
+    // The renderer host face is the sanctioned report path for entry crashes;
+    // the host resolves the standard session/workspace kits lazily.
+    ctx.provide('sessions', { list: () => [], currentProvideInfo: () => undefined } as never)
+    ctx.provide('workspaces', { list: () => [] } as never)
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    let host: SlotRendererHost | undefined
+    slots.install({ renderRoot: (h: SlotRendererHost) => { host = h; return null } })
+    slots.renderSlot('root', {})
+    const injected = (slots.entries('root')[0]!.inject as unknown as () => PageAppShellInjected)()
+    const observable = injected.hooks.pageApp
+    const crashedA = fakeEntry('page-a', '@scope/a')
+    host!.reportEntryError('page-app.shell.surface', crashedA, new Error('boom'), { abdicate: true })
+    expect(observable.getSnapshot().failedPageIds).toEqual(['page-a'])
+    // The subscription dies with the fiber: a later report no longer reaches
+    // the controller (the observable reference stays valid after teardown).
+    await fiber.dispose()
+    const crashedB = fakeEntry('page-b', '@scope/b')
+    host!.reportEntryError('page-app.shell.surface', crashedB, new Error('boom'), { abdicate: true })
+    expect(observable.getSnapshot().failedPageIds).toEqual(['page-a'])
   })
 
   it('controller starts with the registration and stops with the fiber', async () => {

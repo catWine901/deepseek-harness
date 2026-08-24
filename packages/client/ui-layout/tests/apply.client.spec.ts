@@ -13,6 +13,8 @@ import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { apply as themeApply, inject as themeInject, ThemeRuntime } from '@deepseek-ai/dsh-client-ui-theme/client'
 import { apply, inject, LayoutController } from '@deepseek-ai/dsh-client-ui-layout/client'
+import { AppFrame } from '@deepseek-ai/dsh-client-ui-layout/src/client/AppFrame.tsx'
+import type { SlotRendererHost, StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
 import { apply as nodeApply } from '@deepseek-ai/dsh-client-ui-layout'
 import * as invariant from '@deepseek-ai/dsh-client-ui-layout/invariant'
 
@@ -35,18 +37,18 @@ async function bench() {
   return { ctx, slots: ctx.get('slots') as SlotRegistry }
 }
 
+/** The page-app shell (manager) owns 'root' and declares the builtin seat. */
+function declareBuiltinSeat(slots: SlotRegistry): () => void {
+  return slots.register({
+    name: 'root',
+    children: { 'page-app.shell.builtin': { kind: 'single', scope: 'root' } },
+  } as never, () => null)
+}
+
 describe('ui-layout client apply', () => {
   it('declares its service dependencies', () => {
     expect(inject).toEqual(['slots', 'theme'])
   })
-
-  /** The page-app shell (manager) owns 'root' and declares the builtin seat. */
-  function declareBuiltinSeat(slots: SlotRegistry): () => void {
-    return slots.register({
-      name: 'root',
-      children: { 'page-app.shell.builtin': { kind: 'single', scope: 'root' } },
-    } as never, () => null)
-  }
 
   it('provides ctx.layout and registers AppFrame into the builtin seat with the four child declarations', async () => {
     const { ctx, slots } = await bench()
@@ -116,6 +118,199 @@ describe('ui-layout client apply', () => {
     expect(slots.spec('sidebar')).toBeUndefined()
     // The page-app shell's builtin declaration survives entry teardown.
     expect(slots.spec('page-app.shell.builtin')).toEqual({ kind: 'single', scope: 'root' })
+    shell()
+  })
+})
+
+describe('dual-path root fallback (M3, D5)', () => {
+  it('registers AppFrame into root at priority 1 when the builtin seat is absent (no-manager boot)', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // No manager: the fallback owns the built-in root seat at a strictly worse
+    // priority than the manager's default 0, with the same four children.
+    expect(slots.entries('root')).toHaveLength(1)
+    const fallback = slots.entries('root')[0]!
+    expect(fallback.options.priority).toBe(1)
+    expect(fallback.component).toBe(AppFrame)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
+    expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    await fiber.dispose()
+    expect(slots.entries('root')).toHaveLength(0)
+  })
+
+  it('yields to the builtin path when the manager declares the seat (manager-first load order)', async () => {
+    const { ctx, slots } = await bench()
+    const shell = declareBuiltinSeat(slots)
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // Manager-first: AppFrame lands in the builtin seat; root holds only the
+    // manager's entry — the fallback never takes the cell.
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('page-app.shell.builtin')[0]!.component).toBe(AppFrame)
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    shell()
+  })
+
+  it('yields to the builtin path when the manager arrives after ui-layout (layout-first load order)', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.options.priority).toBe(1)
+    const shell = declareBuiltinSeat(slots)
+    // The fallback collapses its own children declarations before the builtin
+    // path re-registers the same four — no duplicate-children throw.
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('page-app.shell.builtin')[0]!.component).toBe(AppFrame)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
+    expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    shell()
+  })
+
+  it('never holds two root occupants (distinct priorities, no same-priority throw)', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // Observe every root-entries state across the manager arrival: the cell
+    // may transiently hold two occupants, always at distinct priorities — the
+    // single-seat same-priority throw can never fire.
+    const observed: Array<readonly StoredEntry[]> = []
+    const off = slots.subscribe('root', () => { observed.push(slots.entries('root')) })
+    const shell = declareBuiltinSeat(slots)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    off()
+    for (const entries of observed) {
+      const priorities = entries.map(entry => entry.options.priority ?? 0)
+      expect(new Set(priorities).size, `priorities ${priorities.join(',')}`).toBe(priorities.length)
+    }
+    // Settled: a single manager occupant at the default priority.
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.options.priority ?? 0).toBe(0)
+    shell()
+  })
+
+  it('survives a manager HMR reload cycle without duplicate child declarations', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // Manager generation 1 arrives; the fallback yields to the builtin path.
+    const shell1 = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    // The manager fiber reloads (dispose + redeclare): the fallback re-takes
+    // root, then yields again — the four children are declared once per path.
+    shell1()
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.options.priority).toBe(1)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    const shell2 = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    shell2()
+  })
+
+  it('survives a StrictMode double-invoke (setup, cleanup, setup) without duplicate registrations', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    await fiber.dispose()
+    const fiber2 = ctx.plugin({ inject: [...inject], apply })
+    await fiber2.await()
+    // setup → cleanup → setup leaves exactly one fallback registration.
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.options.priority).toBe(1)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
+    await fiber2.dispose()
+  })
+
+  it('a disabled manager (registration disposed) leaves the fallback owning root and Native DSH rendering', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // Manager disabled after serving: its root registration collapses and the
+    // fallback re-takes the cell with the four children (Native DSH renders).
+    const shell = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    shell()
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.options.priority).toBe(1)
+    expect(slots.entries('root')[0]!.component).toBe(AppFrame)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
+    expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    await fiber.dispose()
+  })
+
+  it('a root crash abdicates the manager entry and the fallback wins without a refresh', async () => {
+    const { ctx, slots } = await bench()
+    // The renderer host face is the sanctioned crash-report path; the host
+    // resolves the standard session/workspace kits lazily.
+    ctx.provide('sessions', { list: () => [], currentProvideInfo: () => undefined } as never)
+    ctx.provide('workspaces', { list: () => [] } as never)
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    const shell = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('root')).toHaveLength(1)
+    // The manager shell crashes: the renderer boundary retires the root entry
+    // from its cell (the exact reportEntryError path RootOutlet uses).
+    let host: SlotRendererHost | undefined
+    slots.install({ renderRoot: (h: SlotRendererHost) => { host = h; return null } })
+    slots.renderSlot('root', {})
+    const managerEntry = slots.entries('root')[0]!
+    host!.reportEntryError('root', managerEntry, new Error('boom'), { abdicate: true })
+    // No re-registration happened — the fallback already owned its priority —
+    // and it wins the cell now that the manager entry is skipped.
+    expect(slots.entries('root')).toHaveLength(2)
+    expect(slots.entriesOfSlot('root')).toHaveLength(1)
+    expect(slots.entriesOfSlot('root')[0]!.component).toBe(AppFrame)
+    expect(slots.entriesOfSlot('root')[0]!.options.priority).toBe(1)
+    // The abdicated entry stays on the ledger (disposal authority remains the
+    // manager); the fallback owns the four children exactly once.
+    expect(slots.entries('root').some(entry => entry === managerEntry)).toBe(true)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
+    expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
+    expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
+    // The manager coming back live (reload) replaces the abdicated entry; the
+    // fallback yields back to the builtin path.
+    shell()
+    const shell2 = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    expect(slots.entries('page-app.shell.builtin')[0]!.component).toBe(AppFrame)
+    expect(slots.entriesOfSlot('root')[0]!.component).not.toBe(AppFrame)
+    shell2()
+    await fiber.dispose()
+  })
+
+  it('drops the slots/changed subscription with the fiber (no listener or registration leak)', async () => {
+    const { ctx, slots } = await bench()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    expect(slots.entries('root')).toHaveLength(1)
+    await fiber.dispose()
+    // After teardown a manager arriving must not resurrect any registration:
+    // the reconcile listener is gone, so the fallback cannot re-enter.
+    expect(slots.entries('root')).toHaveLength(0)
+    const shell = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(0)
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
     shell()
   })
 })
