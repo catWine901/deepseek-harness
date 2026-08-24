@@ -135,6 +135,28 @@ describe('state machine', () => {
     dispose()
   })
 
+  it('records an abdicated managed surface and clears the failure on select (retry) and eviction', async () => {
+    const remote = new FakeRemote()
+    const slots = new FakeSlots()
+    remote.onList = () => Promise.resolve(ok(fakeSnapshot([
+      fakeRow({ packageName: '@scope/a', pageId: 'page-a', enabled: true }),
+    ])))
+    slots.setEntries([fakeEntry('page-a', '@scope/a')])
+    const { controller, dispose } = await harness(remote, slots)
+    // A managed surface abdicates: the controller records the failed page.
+    controller.recordEntryError('page-a')
+    expect(controller.observable.getSnapshot().failedPageIds).toEqual(['page-a'])
+    // Retry = re-select: the failure record clears so the shell remounts.
+    controller.select('page-a')
+    expect(controller.observable.getSnapshot().failedPageIds).toEqual([])
+    // A disabled/uninstalled page's failure record dies with its eviction.
+    controller.recordEntryError('page-a')
+    remote.onList = () => Promise.resolve(ok(fakeSnapshot([])))
+    await controller.uninstall('page-a', new AbortController().signal)
+    expect(controller.observable.getSnapshot().failedPageIds).toEqual([])
+    dispose()
+  })
+
   it('evicts the visited page when the registry drops the row (external commit or reload)', async () => {
     const remote = new FakeRemote()
     const slots = new FakeSlots()
