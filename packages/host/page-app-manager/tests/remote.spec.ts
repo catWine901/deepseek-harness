@@ -180,6 +180,7 @@ describe('pageAppManager Remote surface', () => {
     const runtime = {
       identity: { name: 'fixture-profile', directory: dir },
       applyManagerLayer: async () => ({ generation: 1, activeRoots: ['workspace.remote'], externallyOverridden: [] }),
+      restoreManagerLayer: async () => ({ generation: 1, activeRoots: ['workspace.remote'], externallyOverridden: [] }),
     } as unknown as ProfileRuntime
     ctx.reflect.provide('clientModules', { graph: () => ({ rev: 'graph-rev-1' }) })
     const seenAborted: boolean[] = []

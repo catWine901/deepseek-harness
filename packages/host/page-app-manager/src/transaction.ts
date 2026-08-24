@@ -21,8 +21,10 @@ import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import { canonicalManagedRootHash, type ExpectedManagedRoot } from '@deepseek-ai/dsh-app-boot'
 import {
   advancePageAppJournalPhase,
+  parsePageAppRegistry,
   readPageAppJournal,
   readPageAppRegistry,
   removePageAppJournal,
@@ -90,6 +92,8 @@ function isAllowBuildsFailure(output: string): boolean {
 export interface PageAppStagedState {
   readonly registry: PageAppRegistryV1
   readonly layer: string
+  /** The runtime-audit expectations of the staged roots (hashes never empty). */
+  readonly expectedRoots: readonly ExpectedManagedRoot[]
 }
 
 /**
@@ -305,6 +309,11 @@ export class PageAppLifecycle {
     }
     const token = randomUUID()
     return withPageAppProfileLock(this.deps.profileDir, { kind: 'manager', token }, async () => {
+      // A durable journal means a crashed transaction owns the profile; never
+      // overwrite its decision — the operator runs recover() first.
+      if ((await readPageAppJournal(this.deps.profileDir)) !== null) {
+        throw new Error('page-app transaction: a journal exists; run recover() first (recovery-required)')
+      }
       // Merge the caller's cancellation with the manager fiber's lifecycle
       // controller: either abort cancels pnpm and the settlement wait, so a
       // manager reload cannot orphan a running transaction.
@@ -387,35 +396,30 @@ export class PageAppLifecycle {
   /** Derive the layer for a staged registry (enabled, statically valid rows only). */
   private stageFromRegistry(registry: PageAppRegistryV1): PageAppStagedState {
     const roots: ValidatedManagedRoot[] = []
+    const expectedRoots: ExpectedManagedRoot[] = []
     for (const entry of registry.entries) {
       if (!entry.enabled) continue
-      const installed = resolveInstalledPackageDir(this.deps.profileDir, entry.packageName)
-      if (installed === undefined) continue
-      try {
-        const pkg = JSON.parse(readFileSync(join(installed, 'package.json'), 'utf8')) as { dsh?: { bundle?: { patch?: string } } }
-        const patch = pkg.dsh?.bundle?.patch
-        if (typeof patch !== 'string') continue
-        // Reuse the strict validator's composed root by re-deriving through it
-        // (the validation module owns the compose-over-empty-root logic).
-        const record = validateInstalledPageAppPackage(this.deps.profileDir, entry.packageName, {
-          profileDir: this.deps.profileDir,
-          registry,
-          baseRootIds: [],
-          profileDependencies: this.readProfileDependencies(),
-          profileBundles: [],
-        })
-        roots.push({
-          packageName: entry.packageName,
-          pageId: entry.page.id,
-          rootEntryId: record.rootEntryId,
-          enabled: true,
-          entries: [record.rootRow],
-        })
-      } catch {
-        // An unhealthy row contributes no root; the registry stays authoritative.
-      }
+      const row = composedManagedRow(this.deps.profileDir, entry, registry, this.readProfileDependencies())
+      if (row === undefined) continue
+      roots.push({
+        packageName: entry.packageName,
+        pageId: entry.page.id,
+        rootEntryId: row.rootEntryId,
+        enabled: true,
+        entries: [row.rootRow],
+      })
+      expectedRoots.push({
+        packageName: entry.packageName,
+        pageId: entry.page.id,
+        rootEntryId: row.rootEntryId,
+        hash: canonicalManagedRootHash(row.rootRow),
+      })
     }
-    return { registry, layer: roots.length > 0 ? renderPageAppRuntimeLayer(roots) : '[]\n' }
+    return {
+      registry,
+      layer: roots.length > 0 ? renderPageAppRuntimeLayer(roots) : '[]\n',
+      expectedRoots,
+    }
   }
 
   /** Write the staged runtime layer file, then advance the journal to staged. */
@@ -427,21 +431,10 @@ export class PageAppLifecycle {
 
   /** Apply the staged layer through the acknowledged profile runtime. */
   private async applyRuntime(staged: PageAppStagedState): Promise<void> {
-    const expectedRoots = staged.registry.entries
-      .filter(entry => entry.enabled)
-      .map(entry => ({
-        packageName: entry.packageName,
-        pageId: entry.page.id,
-        rootEntryId: entry.page.rootEntryId,
-        // The runtime hashes the effective row; the manager's staged rows are
-        // derived deterministically, so the expected hash check is meaningful
-        // only after the loader audit — pass the ids and let the runtime audit.
-        hash: '',
-      }))
     await this.deps.runtime.applyManagerLayer({
       registryRevision: staged.registry.revision,
       runtimeLayer: staged.layer,
-      expectedRoots,
+      expectedRoots: staged.expectedRoots,
     })
   }
 
@@ -469,6 +462,13 @@ export class PageAppLifecycle {
       const journal = await readPageAppJournal(this.deps.profileDir)
       if (journal !== null && journal.lockOwnerToken !== token) {
         throw new Error('page-app rollback: journal owner token mismatch')
+      }
+      // Restore the live Include tree through the acknowledged runtime FIRST
+      // (last-known-good): the prior layer is staged back, recomposed, and its
+      // audit awaited before any owned file changes. An audit failure rejects
+      // and keeps the journal as recovery-required.
+      if (journal !== null) {
+        await this.restoreLiveLayer(journal)
       }
       const files = journal?.files ?? {}
       for (const [relative, state] of Object.entries(files)) {
@@ -502,6 +502,42 @@ export class PageAppLifecycle {
     }
   }
 
+  /**
+   * Restore the prior manager-layer generation the journal recorded: stage the
+   * before layer, recompute its expected-root hashes from the before registry,
+   * and await the runtime's restore audit. A restore failure propagates so the
+   * journal stays and recovery-required is reported.
+   */
+  private async restoreLiveLayer(journal: PageAppJournalV1): Promise<void> {
+    const paths = resolvePageAppProfilePaths(this.deps.profileDir)
+    let registry: PageAppRegistryV1 | null = null
+    const registryState = journal.files['registry.json']
+    if (registryState?.present === true) {
+      try {
+        registry = parsePageAppRegistry(JSON.parse(await readFile(`${paths.registry}.backup`, 'utf8')))
+      } catch {
+        // An unreadable before registry restores as the empty composition.
+      }
+    }
+    let runtimeLayer = '[]\n'
+    const layerState = journal.files['runtime-layer.yml']
+    if (layerState?.present === true) {
+      try {
+        runtimeLayer = await readFile(`${paths.runtimeLayer}.backup`, 'utf8')
+      } catch {
+        // A missing before layer restores as the empty composition.
+      }
+    }
+    // The runtime verifies the staged file equals the request; stage the
+    // restored layer before recomposing.
+    writeFileSync(paths.runtimeLayer, runtimeLayer)
+    await this.deps.runtime.restoreManagerLayer({
+      registryRevision: registry?.revision ?? 0,
+      runtimeLayer,
+      expectedRoots: registry === null ? [] : derivePageAppExpectedRoots(this.deps.profileDir, registry),
+    })
+  }
+
   private async requireRegistry(): Promise<PageAppRegistryV1> {
     const registry = await readPageAppRegistry(this.deps.profileDir)
     if (registry === null) throw new Error('page-app: no registry has been published')
@@ -525,5 +561,74 @@ export class PageAppLifecycle {
     } catch {
       return {}
     }
+  }
+}
+
+/** The strict validator's composed root of one enabled registry row, when healthy. */
+function composedManagedRow(
+  profileDir: string,
+  entry: PageAppRegistryEntry,
+  registry: PageAppRegistryV1,
+  profileDependencies: Record<string, string>,
+): { rootEntryId: string; rootRow: ReturnType<typeof validateInstalledPageAppPackage>['rootRow'] } | undefined {
+  const installed = resolveInstalledPackageDir(profileDir, entry.packageName)
+  if (installed === undefined) return undefined
+  try {
+    const pkg = JSON.parse(readFileSync(join(installed, 'package.json'), 'utf8')) as { dsh?: { bundle?: { patch?: string } } }
+    if (typeof pkg.dsh?.bundle?.patch !== 'string') return undefined
+    // Reuse the strict validator's composed root (the validation module owns
+    // the compose-over-empty-root logic); the expected hash is its real one.
+    // The row being re-derived is already owned — exclude its own package so
+    // the admission uniqueness checks keep guarding the OTHER rows.
+    const record = validateInstalledPageAppPackage(profileDir, entry.packageName, {
+      profileDir,
+      registry: {
+        ...registry,
+        entries: registry.entries.filter(row => row.packageName !== entry.packageName),
+      },
+      baseRootIds: [],
+      profileDependencies,
+      profileBundles: [],
+    })
+    return { rootEntryId: record.rootEntryId, rootRow: record.rootRow }
+  } catch {
+    // An unhealthy row contributes no root; the registry stays authoritative.
+    return undefined
+  }
+}
+
+/**
+ * Derive the runtime-audit expectations for one registry (rollback/recovery
+ * restore paths recompute them from the journal's before-state). Hashes are
+ * `canonicalManagedRootHash` of the composed root row — never empty.
+ * @param profileDir - absolute profile directory (resolution anchor).
+ * @param registry - the registry to derive enabled roots from.
+ * @returns one expectation per enabled, statically valid row.
+ */
+export function derivePageAppExpectedRoots(profileDir: string, registry: PageAppRegistryV1): ExpectedManagedRoot[] {
+  const profileDependencies = readProfileDependenciesFrom(profileDir)
+  const expectedRoots: ExpectedManagedRoot[] = []
+  for (const entry of registry.entries) {
+    if (!entry.enabled) continue
+    const row = composedManagedRow(profileDir, entry, registry, profileDependencies)
+    if (row === undefined) continue
+    expectedRoots.push({
+      packageName: entry.packageName,
+      pageId: entry.page.id,
+      rootEntryId: row.rootEntryId,
+      hash: canonicalManagedRootHash(row.rootRow),
+    })
+  }
+  return expectedRoots
+}
+
+function readProfileDependenciesFrom(profileDir: string): Record<string, string> {
+  try {
+    const pkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8')) as {
+      dependencies?: Record<string, string>
+    }
+    return pkg.dependencies ?? {}
+  } catch {
+    return {}
   }
 }

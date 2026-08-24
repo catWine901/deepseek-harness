@@ -4,7 +4,7 @@
 
 Host 端 Workspace Apps 管理器：只读的归属投影、安装源解析与静态 Workspace Contract 校验，以及带日志的生命周期事务（安装、启用/停用、隐藏、排序、卸载）。`.workspace-manager/registry.json` 是唯一归属权威；launcher 持有的 `ProfileRuntime` 是唯一经过确认的实时重组写入方，因此管理 API 的就绪状态永远不会阻塞内置 DSH shell。
 
-`PageAppManager` 继承 Typert Remote 服务 `pageAppManager`。每次变更都在共享 profile 变更锁内执行，并在任何受管文件变更之前先写入 prepared journal 与私有 before-state 备份；失败的事务会回滚并保留 journal 为 `recovery-required`，由 operator 的 `recover()` Remote 解决。生成的 Host 与 Client Remote 产物由 `./typert` 与 `./remote` 导出。
+`PageAppManager` 继承 Typert Remote 服务 `pageAppManager`。每次变更都在共享 profile 变更锁内执行，并在任何受管文件变更之前先写入 prepared journal 与私有 before-state 备份；失败的事务会通过 `ProfileRuntime.restoreManagerLayer` 先复原先前的 live Include 树（携带真实 expected-root 哈希）再收敛文件，复原失败则保留 journal 为 `recovery-required`。operator 的 `recover()` Remote 在同一共享锁内解决它：registry 在 `committing` 阶段已变更则完成提交，否则先从 journal before-state 复原 live layer 再让 pnpm 收敛。journal 存在期间拒绝新事务——operator 必须先 recover。生成的 Host 与 Client Remote 产物由 `./typert` 与 `./remote` 导出。
 
 ## 取消与激活握手
 

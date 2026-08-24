@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import type { ProfileRuntime, ProfileRuntimeApplyRequest } from '@deepseek-ai/dsh-app-boot'
 import type { PageAppRegistryV1 } from '@deepseek-ai/dsh-page-app-profile'
 import { PageAppLifecycle, PageAppBuildPermissionError } from '../src/transaction.ts'
 import { createPnpmExecutor, PageAppCommandAbortedError, type PageAppPackageExecutor } from '../src/executor.ts'
@@ -107,6 +107,7 @@ function fakeRuntime(): { runtime: ProfileRuntime; applySpy: ReturnType<typeof v
   const runtime = {
     identity: { name: 'fixture-profile', directory: dir },
     applyManagerLayer: applySpy,
+    restoreManagerLayer: async () => ({ generation: 1, activeRoots: ['workspace.valid'], externallyOverridden: [] }),
   }
   return { runtime: runtime as unknown as ProfileRuntime, applySpy }
 }
@@ -454,5 +455,135 @@ describe('M1.1 cancellation, graph revision, and lifecycle abort', () => {
       'client-2' as never,
       new AbortController().signal,
     )).rejects.toThrow(/disposed/)
+  })
+})
+
+describe('M2 rollback live-tree restoration, journal guard, and expected-root hashes', () => {
+  const runtimeWithRestore = (restore: ProfileRuntime['restoreManagerLayer']): ProfileRuntime => ({
+    identity: { name: 'fixture-profile', directory: dir },
+    applyManagerLayer: async () => ({ generation: 1, activeRoots: ['workspace.valid'], externallyOverridden: [] }),
+    restoreManagerLayer: restore,
+  }) as unknown as ProfileRuntime
+
+  it('publish failure rolls back the live Include tree via restoreManagerLayer and awaits its audit', async () => {
+    writeWorkspacePackage()
+    const { executor } = fakeExecutor()
+    const restoreSpy = vi.fn(async (_request: ProfileRuntimeApplyRequest) => ({ generation: 1, activeRoots: [], externallyOverridden: [] }))
+    const lc = lifecycle(executor, runtimeWithRestore(restoreSpy))
+    const promise = lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      new AbortController().signal,
+    )
+    // Acknowledge as the client, then replace the registry path with a
+    // directory so the publish (registry write) fails after the layer applied.
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      const request = lc.activation.pendingRequest
+      if (request !== undefined) {
+        const ack = lc.activation.acknowledge(
+          request.transactionId, 'client-1' as never, request.packageName, request.pageId, request.graphRevision,
+        )
+        if (ack.accepted) {
+          rmSync(join(dir, '.workspace-manager', 'registry.json'), { force: true })
+          mkdirSync(join(dir, '.workspace-manager', 'registry.json'))
+          break
+        }
+      }
+      await new Promise(resolve => setTimeout(resolve, 1))
+    }
+    await expect(promise).rejects.toThrow(/recovery-required|rollback/)
+    // Rollback restored the prior live tree through the acknowledged runtime
+    // and awaited its audit; the fresh profile had no prior layer or registry.
+    expect(restoreSpy).toHaveBeenCalledTimes(1)
+    const request = restoreSpy.mock.calls[0]?.[0] as ProfileRuntimeApplyRequest
+    expect(request.registryRevision).toBe(0)
+    expect(request.runtimeLayer).toBe('[]\n')
+    expect(request.expectedRoots).toEqual([])
+    // The file restore hit the same registry write error, so the journal stays.
+    expect(() => readFileSync(join(dir, '.workspace-manager', 'transaction.json'), 'utf8')).not.toThrow()
+  })
+
+  it('pnpm remove failure on uninstall restores the layer that still contains the root', async () => {
+    writeWorkspacePackage()
+    // The profile manifest records the previously-installed package.
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: 'fixture-profile',
+      private: true,
+      dependencies: { [PKG]: '1.0.0' },
+    }))
+    const beforeLayer = [
+      '- insert:',
+      '    - id: workspace.valid',
+      "      name: '@fixture/valid-workspace/client'",
+      '',
+    ].join('\n')
+    writeRegistry([registryRow()])
+    writeFileSync(join(dir, '.workspace-manager', 'runtime-layer.yml'), beforeLayer)
+    const executor: PageAppPackageExecutor = {
+      run: async (args) => {
+        if (args[0] === 'remove') return { exitCode: 1, stdout: '', stderr: 'pnpm remove failed: boom' }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    const restoreSpy = vi.fn(async (_request: ProfileRuntimeApplyRequest) => ({ generation: 1, activeRoots: ['workspace.valid'], externallyOverridden: [] }))
+    const lc = lifecycle(executor, runtimeWithRestore(restoreSpy))
+    await expect(lc.uninstall('workspace.valid', new AbortController().signal)).rejects.toThrow(/pnpm remove failed/)
+    // The uninstall rollback restored the layer that still contains the root.
+    expect(restoreSpy).toHaveBeenCalledTimes(1)
+    const request = restoreSpy.mock.calls[0]?.[0] as ProfileRuntimeApplyRequest
+    expect(request.runtimeLayer).toBe(beforeLayer)
+    expect(request.expectedRoots).toHaveLength(1)
+    expect(request.expectedRoots[0]).toMatchObject({
+      packageName: PKG,
+      pageId: 'workspace.valid',
+      rootEntryId: 'workspace.valid',
+    })
+    expect(request.expectedRoots[0]?.hash).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  it('refuses to start a new transaction while a journal exists (recovery-required)', async () => {
+    writeWorkspacePackage()
+    const journalPath = join(dir, '.workspace-manager', 'transaction.json')
+    writeFileSync(journalPath, JSON.stringify({
+      schemaVersion: 1,
+      phase: 'prepared',
+      lockOwnerToken: 'token-other',
+      files: {
+        'registry.json': { present: false },
+        'runtime-layer.yml': { present: false },
+        '../package.json': { present: true, sha256: 'a'.repeat(64) },
+        '../pnpm-lock.yaml': { present: false },
+      },
+    }))
+    const lc = lifecycle(fakeExecutor().executor)
+    await expect(lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      new AbortController().signal,
+    )).rejects.toThrow(/a journal exists; run recover\(\) first \(recovery-required\)/)
+    // The crashed transaction's journal was not overwritten.
+    expect(JSON.parse(readFileSync(journalPath, 'utf8'))).toMatchObject({ lockOwnerToken: 'token-other' })
+  })
+
+  it('sends real expected root hashes in the apply request (never empty)', async () => {
+    writeWorkspacePackage()
+    const { executor } = fakeExecutor()
+    const applySpy = vi.fn(async (_request: ProfileRuntimeApplyRequest) => ({ generation: 1, activeRoots: ['workspace.valid'], externallyOverridden: [] }))
+    const runtime = {
+      identity: { name: 'fixture-profile', directory: dir },
+      applyManagerLayer: applySpy,
+    } as unknown as ProfileRuntime
+    const lc = lifecycle(executor, runtime)
+    const revision = await installWithAck(lc, 'client-1')
+    expect(revision).toBe(1)
+    const request = applySpy.mock.calls[0]?.[0] as ProfileRuntimeApplyRequest
+    expect(request.expectedRoots).toHaveLength(1)
+    expect(request.expectedRoots[0]).toMatchObject({
+      packageName: PKG,
+      pageId: 'workspace.valid',
+      rootEntryId: 'workspace.valid',
+    })
+    expect(request.expectedRoots[0]?.hash).toMatch(/^[0-9a-f]{64}$/)
+    expect(request.expectedRoots[0]?.hash).not.toBe('')
   })
 })

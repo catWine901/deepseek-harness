@@ -261,6 +261,7 @@ export class PageAppManager extends TypertRemoteService {
     return recoverPageAppTransaction(
       this.profileRuntime.identity.directory,
       createPnpmExecutor(),
+      this.profileRuntime,
     ).then(outcome => ({ action: outcome.action, ...outcome.message === undefined ? {} : { message: outcome.message } }))
   }
 
