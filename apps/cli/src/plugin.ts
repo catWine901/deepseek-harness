@@ -7,12 +7,21 @@
  * removed or bundle-less dependency leaves it). Reconciling by installed
  * state, not by dependency diff, means `update` activates a package that
  * gained its `dsh.bundle` declaration in a newer version.
+ *
+ * Every invocation holds the shared profile mutation lock (ownerKind
+ * `plugin-cli`) around the whole read → pnpm → reconcile sequence, so
+ * page-app manager transactions on the same profile serialize with it.
+ * Reconciliation classifies packages declaring `dsh.workspace` as
+ * manager-owned: they never join `dsh.profile.bundles` and a fresh install
+ * prints a Plugins → Workspace Apps diagnostic instead of promoting them.
  * @module @deepseek-ai/dsh/plugin
  */
 
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { withPageAppProfileLock } from '@deepseek-ai/dsh-page-app-profile'
 import {
   DEFAULT_PROFILE_BUNDLES,
   initProfile,
@@ -44,6 +53,29 @@ function exportsPatch(packageName: string, profileDir: string): boolean {
   return manifest.dsh?.bundle?.patch !== undefined
 }
 
+/** A manifest slice carrying the manager-owned `dsh.workspace` block. */
+type WorkspaceAwareManifest = ProfileManifest & { dsh?: { workspace?: unknown } }
+
+/**
+ * Whether an installed dependency declares the manager-owned `dsh.workspace`
+ * block. Classification is a presence check, not validation: an invalid or
+ * future-versioned block is still manager-owned and must never join
+ * `dsh.profile.bundles` (the manager's own admission rejects it loudly).
+ * @param packageName - the dependency's package name.
+ * @param profileDir - the profile directory (resolution anchor).
+ * @returns true when the installed manifest declares `dsh.workspace`.
+ */
+function declaresWorkspace(packageName: string, profileDir: string): boolean {
+  let dir: string
+  try {
+    dir = resolveBundleDir(NAME, packageName, INSTALL_ANCHOR, profileDir)
+  } catch {
+    return false // unresolvable — pnpm's own diagnostics own that failure
+  }
+  const manifest = readProfileManifest(NAME, dir) as WorkspaceAwareManifest
+  return manifest.dsh?.workspace !== undefined
+}
+
 /**
  * Reconcile `dsh.profile.bundles` against the installed state: pnpm has
  * already written the real installed names (so a git/path/tarball/alias spec
@@ -63,6 +95,17 @@ function reconcilePlugins(before: ProfileManifest, profileDir: string): void {
   const plugins = after.dsh?.profile?.bundles ?? []
   let changed = false
   for (const packageName of dependencies) {
+    if (declaresWorkspace(packageName, profileDir)) {
+      // A dsh.workspace package is manager-owned; it never joins the profile
+      // layer stack, and a freshly installed one points the user at the
+      // manager instead of the raw pnpm forwarder.
+      if (!beforeDeps.has(packageName)) {
+        process.stderr.write(
+          `${NAME}: ${packageName} declares dsh.workspace - manage it in Plugins → Workspace Apps, not as a profile layer\n`,
+        )
+      }
+      continue
+    }
     const isBundle = exportsPatch(packageName, profileDir)
     if (isBundle && !plugins.includes(packageName)) {
       plugins.push(packageName)
@@ -113,46 +156,51 @@ function anchorPathSpec(argument: string, cwd: string): string {
 
 /**
  * Run one `dsh plugin` invocation: init if needed, forward to pnpm, reconcile.
+ * The whole sequence holds the shared profile mutation lock (`ownerKind`
+ * `plugin-cli`), so page-app manager transactions on the same profile
+ * serialize with it.
  * @param profile - the profile name.
  * @param args - pnpm arguments with relative path specs anchored to the invoking directory.
- * @returns the pnpm exit code.
+ * @returns a promise of the pnpm exit code.
  */
-export function runPlugin(profile: string, args: readonly string[]): number {
+export async function runPlugin(profile: string, args: readonly string[]): Promise<number> {
   const dir = resolveProfileDir(profile)
-  if (!existsSync(join(dir, 'package.json'))) {
-    initProfile(dir, PROFILE_TEMPLATES[profile] ?? DEFAULT_PROFILE_BUNDLES)
-    process.stderr.write(`${NAME}: initialized profile ${profile} at ${dir}\n`)
-  }
-  const before = readProfileManifest(NAME, dir)
-  // Windows resolves pnpm through its .cmd shim, which spawn() refuses
-  // without a shell since the CVE-2024-27980 hardening.
-  const result = spawnSync('pnpm', args.map(argument => anchorPathSpec(argument, process.cwd())), {
-    cwd: dir,
-    stdio: 'inherit',
-    shell: process.platform === 'win32',
+  return withPageAppProfileLock(dir, { kind: 'plugin-cli', token: randomUUID() }, () => {
+    if (!existsSync(join(dir, 'package.json'))) {
+      initProfile(dir, PROFILE_TEMPLATES[profile] ?? DEFAULT_PROFILE_BUNDLES)
+      process.stderr.write(`${NAME}: initialized profile ${profile} at ${dir}\n`)
+    }
+    const before = readProfileManifest(NAME, dir)
+    // Windows resolves pnpm through its .cmd shim, which spawn() refuses
+    // without a shell since the CVE-2024-27980 hardening.
+    const result = spawnSync('pnpm', args.map(argument => anchorPathSpec(argument, process.cwd())), {
+      cwd: dir,
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+    })
+    if (result.error !== undefined) {
+      const code = (result.error as NodeJS.ErrnoException).code
+      if (code === 'ENOENT') {
+        process.stderr.write(`${NAME}: pnpm not found on PATH — install pnpm to manage profile plugins\n`)
+        return Promise.resolve(127)
+      }
+      throw result.error
+    }
+    const exitCode = result.status ?? 1
+    if (exitCode === 0) {
+      reconcilePlugins(before, dir)
+    } else {
+      // pnpm's own diagnostics name pnpm-workspace.yaml without saying WHICH
+      // one; the profile owns it, and the commonest failure here is pnpm ≥10
+      // blocking a git dependency's prepare (build) script until allowlisted.
+      process.stderr.write(`${NAME}: pnpm failed in profile directory ${dir}\n`)
+      if (args.some(argument => /^git\+|^github:|\.git(?:#|$)/.test(argument))) {
+        process.stderr.write(
+          `${NAME}: git-hosted plugins build on install via their prepare script, which pnpm blocks until allowed — `
+          + `add the exact key pnpm printed above under allowBuilds in ${join(dir, 'pnpm-workspace.yaml')}, then re-run\n`,
+        )
+      }
+    }
+    return Promise.resolve(exitCode)
   })
-  if (result.error !== undefined) {
-    const code = (result.error as NodeJS.ErrnoException).code
-    if (code === 'ENOENT') {
-      process.stderr.write(`${NAME}: pnpm not found on PATH — install pnpm to manage profile plugins\n`)
-      return 127
-    }
-    throw result.error
-  }
-  const exitCode = result.status ?? 1
-  if (exitCode === 0) {
-    reconcilePlugins(before, dir)
-  } else {
-    // pnpm's own diagnostics name pnpm-workspace.yaml without saying WHICH
-    // one; the profile owns it, and the commonest failure here is pnpm ≥10
-    // blocking a git dependency's prepare (build) script until allowlisted.
-    process.stderr.write(`${NAME}: pnpm failed in profile directory ${dir}\n`)
-    if (args.some(argument => /^git\+|^github:|\.git(?:#|$)/.test(argument))) {
-      process.stderr.write(
-        `${NAME}: git-hosted plugins build on install via their prepare script, which pnpm blocks until allowed — `
-        + `add the exact key pnpm printed above under allowBuilds in ${join(dir, 'pnpm-workspace.yaml')}, then re-run\n`,
-      )
-    }
-  }
-  return exitCode
 }

@@ -708,6 +708,51 @@ describe.skipIf(!existsSync(dshBin))('dsh BUILT bin (node lib/bin.js, no tsx)', 
     }
   }, 30_000)
 
+  it('does not promote a dsh.workspace package into bundles (built bin)', async () => {
+    // `dsh plugin add` of a package declaring dsh.workspace installs the
+    // dependency but never joins it to dsh.profile.bundles, and prints the
+    // Plugins → Workspace Apps diagnostic instead (the manager owns it).
+    const home = mkdtempSync(join(tmpdir(), 'dsh-plugin-workspace-'))
+    const checkout = mkdtempSync(join(tmpdir(), 'dsh-workspace-checkout-'))
+    try {
+      writeFileSync(join(checkout, 'package.json'), JSON.stringify({
+        name: 'workspace-fixture',
+        version: '1.0.0',
+        dsh: {
+          workspace: {
+            schemaVersion: 1,
+            id: 'ws-fixture',
+            name: 'WS Fixture',
+            description: 'fixture',
+            defaultOrder: 0,
+            rootEntryId: 'ws-fixture-root',
+          },
+          bundle: { patch: './cordis.patch.yml' },
+        },
+      }))
+      writeFileSync(join(checkout, 'cordis.patch.yml'), '[]\n')
+      const result = await execa(process.execPath, [dshBin, 'plugin', '--profile', 'ws', 'add', '.'], {
+        cwd: checkout,
+        input: '',
+        timeout: 90_000,
+        killSignal: 'SIGKILL',
+        reject: false,
+        env: { DSH_HOME: home },
+      })
+      expect(result.exitCode).toBe(0)
+      const manifest = JSON.parse(readFileSync(join(home, 'profiles', 'ws', 'package.json'), 'utf8')) as {
+        dependencies: Record<string, string>
+        dsh: { profile: { bundles: string[] } }
+      }
+      expect(Object.keys(manifest.dependencies)).toEqual(['workspace-fixture'])
+      expect(manifest.dsh.profile.bundles).not.toContain('workspace-fixture')
+      expect(result.stderr).toContain('workspace-fixture declares dsh.workspace')
+      expect(result.stderr).toContain('Plugins → Workspace Apps')
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      rmSync(checkout, { recursive: true, force: true })
+    }
+  }, 90_000)
   describe('config dump', () => {
     let home: string
     beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'dsh-dump-bin-')) })
