@@ -625,6 +625,62 @@ describe('ProfileRuntime runtime privacy', () => {
   })
 })
 
+describe('ProfileRuntime nested traceable proxies', () => {
+  it('resolves the registered state through an intentionally nested traceable proxy', async () => {
+    const { ctx, runtime, dir } = await bootRuntimeTree()
+    try {
+      // The manager gateway nests a second traceable layer: reading a
+      // traceable value through a traceable proxy re-wraps it (Cordis does not
+      // deduplicate), so registering the one-layer ctx.get value as a service
+      // and reading it back through ctx.get produces the same nested pair.
+      const oneLayer: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
+      const disposeNested = ctx.provide('profileRuntime.nested', oneLayer)
+      try {
+        const nested = ctx.get('profileRuntime.nested') as ProfileRuntime
+        expect((nested as unknown as Record<symbol, unknown>)[symbols.original]).not.toBe(runtime)
+        // The public getter resolves the original registered identity.
+        expect(nested.identity).toEqual({ name: 'demo', directory: dir })
+        // The launcher-only control resolves the same registered state.
+        expect(profileRuntimeControl(nested)).toBeDefined()
+      } finally {
+        disposeNested()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('stops the unwrap on a non-object or cyclic symbols.original chain', async () => {
+    const { ctx } = await bootRuntimeTree()
+    try {
+      const oneLayer: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
+      const withOriginal = (original: unknown): unknown => new Proxy(oneLayer as object, {
+        get: (target, prop, receiver) => {
+          if (prop === symbols.original) return original
+          return Reflect.get(target, prop, receiver) as unknown
+        },
+      })
+      // A primitive or null escape hatch is a dead end, not a redirect.
+      expect(() => (withOriginal(42) as ProfileRuntime).identity).toThrow(/state is unavailable/)
+      expect(() => (withOriginal(null) as ProfileRuntime).identity).toThrow(/state is unavailable/)
+      expect(profileRuntimeControl(withOriginal(42) as ProfileRuntime)).toBeUndefined()
+      // A self-referential escape hatch must stop instead of looping.
+      const cyclicHolder: { proxy?: unknown } = {}
+      cyclicHolder.proxy = new Proxy(oneLayer as object, {
+        get: (target, prop, receiver) => {
+          if (prop === symbols.original) return cyclicHolder.proxy
+          return Reflect.get(target, prop, receiver) as unknown
+        },
+      })
+      const cyclic: unknown = cyclicHolder.proxy
+      expect(() => (cyclic as ProfileRuntime).identity).toThrow(/state is unavailable/)
+      expect(profileRuntimeControl(cyclic as ProfileRuntime)).toBeUndefined()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
 describe('ProfileRuntime proxy poisoning and watcher surface', () => {
   it('does not trust a writable symbols.original on a raw instance', async () => {
     const dir = tmp()

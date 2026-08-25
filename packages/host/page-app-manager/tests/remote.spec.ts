@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
-import { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import { PROFILE_RUNTIME_SERVICE, ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
 import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { PageAppManager } from '../src/index.ts'
@@ -89,6 +89,36 @@ describe('pageAppManager Remote surface', () => {
     expect(snapshot.profile).toEqual({ name: 'fixture-profile', directory: dir })
     expect(snapshot.revision).toBe(0)
     expect(snapshot.entries).toEqual([])
+  })
+
+  it('resolves the real profile snapshot through the manager traceable proxy over the runtime traceable proxy', async () => {
+    // The production nested-proxy path: apply() stores ctx.get(PROFILE_RUNTIME_SERVICE)
+    // (one traceable layer) in the manager, and the gateway invokes the manager
+    // through ctx.get('pageAppManager'), whose traceable get re-wraps the stored
+    // runtime into a second layer. list() must still resolve the real identity.
+    const ctx = new Context()
+    try {
+      const runtime = new ProfileRuntime(ctx, {
+        identity: { name: 'fixture-profile', directory: dir },
+        compose: () => [],
+        initialManagerPatches: [],
+      })
+      const viaRuntime: unknown = ctx.get(PROFILE_RUNTIME_SERVICE)
+      expect(viaRuntime).not.toBe(runtime)
+      const manager = new PageAppManager(ctx, {
+        profileRuntime: viaRuntime as ProfileRuntime,
+        executor: fakeExecutor(),
+        config: { settlementTimeoutMs: 60_000 },
+      })
+      const viaGateway = ctx.get('pageAppManager') as PageAppManager
+      expect(viaGateway).not.toBe(manager)
+      const snapshot = viaGateway.list()
+      expect(snapshot.profile).toEqual({ name: 'fixture-profile', directory: dir })
+      expect(snapshot.revision).toBe(0)
+      expect(snapshot.entries).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 
   it('exposes the install Remote under installPackage and never the reserved install spelling', () => {
