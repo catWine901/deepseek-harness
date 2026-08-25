@@ -1,0 +1,7 @@
+# Bundle patch for the page-app fixture: composes exactly ONE top-level managed
+# root (id === dsh.workspace.rootEntryId) over an empty root. The single row is
+# both the managed root and the package's own dsh.client row, so the manager
+# validation counts exactly one root and one client row for the package.
+- insert:
+    - id: dsh-page-app-fixture-root
+      name: '@deepseek-ai/dsh-page-app-fixture'

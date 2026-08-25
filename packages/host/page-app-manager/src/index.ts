@@ -16,13 +16,15 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Loader } from '@deepseek-ai/cordis-plugin-loader'
-import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
 import { z } from 'zod'
+import { composePatchRows, findLoaderRow, fiberStateOf, isActiveFiberState, managedRootHash, type EntryOptions, type LoaderLike } from './adapter.ts'
 import {
-  canonicalManagedRootHash,
   loadOverlayPatches,
+  managedRootWrapperId,
+  managedRootWrapperRow,
+  managerWrapperResolvable,
   PROFILE_RUNTIME_SERVICE,
+  WORKBENCH_RUNTIME_SERVICE,
   type ProfileRuntime,
 } from '@deepseek-ai/dsh-app-boot'
 import {
@@ -39,6 +41,7 @@ import { parsePageAppInstallSource } from './source.ts'
 import { PageAppLifecycle } from './transaction.ts'
 import { createPnpmExecutor, type PageAppPackageExecutor } from './executor.ts'
 import { recoverPageAppTransaction } from './recovery.ts'
+import { createWorkbenchRuntime } from './workbench-runtime.ts'
 
 export * from './types.ts'
 export * from './source.ts'
@@ -47,6 +50,7 @@ export * from './executor.ts'
 export * from './activation.ts'
 export * from './transaction.ts'
 export * from './recovery.ts'
+export * from './workbench-runtime.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -60,6 +64,7 @@ interface RowRuntimeFacts {
   readonly installedVersion: string | undefined
   readonly manifestValid: boolean
   readonly bundleValid: boolean
+  readonly wrapperResolvable: boolean
   readonly expectedRootHash: string | undefined
   readonly loaderRow: { fiberState: number | undefined; hashMatches: boolean } | undefined
 }
@@ -79,11 +84,14 @@ function deriveHealth(
   if (!facts.manifestValid || !facts.bundleValid) {
     return { health: 'invalid-manifest', lastError: 'the installed package no longer satisfies the Workspace Plugin Contract' }
   }
-  if (facts.loaderRow === undefined || facts.loaderRow.fiberState === undefined) {
-    return { health: 'activation-failed', lastError: 'the managed root is not mounted with an active fiber in the runtime tree' }
+  if (!facts.wrapperResolvable) {
+    return { health: 'missing-manager', lastError: 'the page-app manager wrapper is not installed in this profile' }
+  }
+  if (facts.loaderRow === undefined || !isActiveFiberState(facts.loaderRow.fiberState)) {
+    return { health: 'activation-failed', lastError: 'the managed wrapper row is not mounted with an active fiber in the runtime tree' }
   }
   if (!facts.loaderRow.hashMatches) {
-    return { health: 'externally-overridden', lastError: 'a user patch configures, disables, or replaces the managed root' }
+    return { health: 'externally-overridden', lastError: 'a user patch configures, disables, or replaces the managed wrapper row' }
   }
   return { health: 'ready', runtimeState: String(facts.loaderRow.fiberState) }
 }
@@ -318,7 +326,7 @@ export class PageAppManager extends TypertRemoteService {
   }
 
   /** Project one registry row into its view with derived health. */
-  private viewOf(row: PageAppRegistryEntry, loader: Loader | undefined): PageAppView {
+  private viewOf(row: PageAppRegistryEntry, loader: LoaderLike | undefined): PageAppView {
     const profile = this.profileRuntime.identity
     const nodeModules = join(profile.directory, 'node_modules', row.packageName)
     const facts: RowRuntimeFacts = this.factsOf(row, nodeModules, loader)
@@ -340,7 +348,7 @@ export class PageAppManager extends TypertRemoteService {
   }
 
   /** Collect the current dependency/version/manifest/bundle/runtime facts of one row. */
-  private factsOf(row: PageAppRegistryEntry, packageDir: string, loader: Loader | undefined): RowRuntimeFacts {
+  private factsOf(row: PageAppRegistryEntry, packageDir: string, loader: LoaderLike | undefined): RowRuntimeFacts {
     let installedPkg: { version?: unknown; dsh?: { bundle?: { patch?: unknown } } } | undefined
     try {
       installedPkg = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as typeof installedPkg
@@ -353,13 +361,15 @@ export class PageAppManager extends TypertRemoteService {
         installedVersion,
         manifestValid: false,
         bundleValid: false,
+        wrapperResolvable: false,
         expectedRootHash: undefined,
         loaderRow: undefined,
       }
     }
     let manifestValid = true
+    let contractVersion = 1
     try {
-      parsePageAppManifest(row.packageName, installedPkg)
+      contractVersion = parsePageAppManifest(row.packageName, installedPkg).schemaVersion
     } catch {
       manifestValid = false
     }
@@ -369,10 +379,19 @@ export class PageAppManager extends TypertRemoteService {
     try {
       if (typeof patch !== 'string' || patch === '') throw new Error('no bundle patch')
       const patches = loadOverlayPatches('page-app', join(packageDir, patch))
-      const rows = applyEntryPatches([], structuredClone(patches), () => {})
+      const rows = composePatchRows(patches)
       const rootRow = rows.find(candidate => candidate.id === row.page.rootEntryId)
       if (rootRow === undefined) throw new Error('root row missing')
-      expectedRootHash = canonicalManagedRootHash(rootRow)
+      // The runtime layer mounts the Feature Runtime Wrapper parent row; the
+      // row's health follows the wrapper entry, not the bare feature row.
+      const wrapper = managedRootWrapperRow({
+        packageName: row.packageName,
+        pageId: row.page.id,
+        rootEntryId: row.page.rootEntryId,
+        contractVersion,
+        entries: [rootRow],
+      }) as unknown as EntryOptions
+      expectedRootHash = managedRootHash(wrapper)
     } catch {
       bundleValid = false
     }
@@ -380,15 +399,22 @@ export class PageAppManager extends TypertRemoteService {
     if (loader === undefined || expectedRootHash === undefined) {
       loaderRow = undefined
     } else {
-      const found = [...loader.entries()].find(candidate => candidate.options.id === row.page.rootEntryId)
+      const found = findLoaderRow(loader, managedRootWrapperId(row.page.id))
       loaderRow = found === undefined
         ? undefined
         : {
-          fiberState: found.fiber?.state,
-          hashMatches: canonicalManagedRootHash(found.options) === expectedRootHash,
+          fiberState: fiberStateOf(found),
+          hashMatches: managedRootHash(found.options) === expectedRootHash,
         }
     }
-    return { installedVersion, manifestValid, bundleValid, expectedRootHash, loaderRow }
+    return {
+      installedVersion,
+      manifestValid,
+      bundleValid,
+      wrapperResolvable: managerWrapperResolvable(this.profileRuntime.identity.directory),
+      expectedRootHash,
+      loaderRow,
+    }
   }
 }
 
@@ -425,17 +451,26 @@ export const Config = z.object({
 /**
  * Mount the Host page-app manager service as a Cordis plugin: reads the
  * launcher-owned profile runtime (the immutable identity and the only
- * acknowledged live-recomposition writer) and constructs the manager over it.
- * The manager must never infer the profile from cwd or browser arguments
- * (spec §8.1). Constructing the TypertRemoteService registers it on the
- * caller's fiber, so it unregisters automatically when the fiber unloads; the
- * effect disposes the lifecycle so an in-flight transaction aborts with the
- * manager fiber instead of orphaning under a half-dead manager.
+ * acknowledged live-recomposition writer), provides the Workbench Runtime
+ * under the contract service name (the Feature Runtime Wrapper fibers inject
+ * it, so provider loss parks them PENDING and return reloads them), and
+ * constructs the manager over the runtime. The manager must never infer the
+ * profile from cwd or browser arguments (spec §8.1). Constructing the
+ * TypertRemoteService registers it on the caller's fiber, so it unregisters
+ * automatically when the fiber unloads; the effect disposes the lifecycle so
+ * an in-flight transaction aborts with the manager fiber instead of orphaning
+ * under a half-dead manager. The `ctx.provide` call is itself fiber-scoped:
+ * its disposer deletes the service and re-evaluates every dependent wrapper.
  * @param ctx - Host context with the profile runtime and Loader mounted.
  * @param config - resolved plugin config (Cordis applies the schema default).
  */
 export function apply(ctx: Context, config: PageAppManagerConfig): void {
   const runtime = ctx.get(PROFILE_RUNTIME_SERVICE) as ProfileRuntime
+  // The Workbench Runtime lives and dies with the manager fiber: `ctx.provide`
+  // registers a fiber effect whose disposer removes the service and notifies
+  // every fiber injecting it, so an uninstalled or reloaded manager leaves the
+  // wrapper fibers PENDING until a provider returns.
+  ctx.provide(WORKBENCH_RUNTIME_SERVICE, createWorkbenchRuntime(ctx))
   // Constructing the manager provides ctx.pageAppManager on this fiber; the
   // Service base auto-unregisters it when the fiber unloads.
   const manager = new PageAppManager(ctx, {

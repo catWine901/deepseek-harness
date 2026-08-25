@@ -88,6 +88,13 @@ export interface PageAppLockPayloadV1 {
 export interface PageAppRuntimeEntry {
   readonly id: string
   readonly name?: string
+  /**
+   * Required services the entry's fiber waits for, declared verbatim in the
+   * layer (the wrapper row carries `workbenchRuntime`). Opaque to the
+   * renderer, which only serializes it; structurally compatible with the
+   * Loader's `Inject` surface.
+   */
+  readonly inject?: unknown
   readonly config?: Readonly<Record<string, unknown>>
   /** Nested Loader group structure the root carries; validated recursively. */
   readonly insert?: readonly PageAppRuntimeEntry[]

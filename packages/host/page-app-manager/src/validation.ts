@@ -9,9 +9,8 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join, relative, resolve, sep } from 'node:path'
-import { load } from 'js-yaml'
-import { applyEntryPatches, entryListSchema } from '@deepseek-ai/cordis-plugin-include'
-import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
+import { composePatchRows, parseEntryList, type EntryOptions } from './adapter.ts'
+import { SUPPORTED_CONTRACT_VERSIONS, assertSupportedContractVersion } from './contract.ts'
 import {
   parsePageAppManifest,
   renderPageAppRuntimeLayer,
@@ -72,6 +71,10 @@ interface InstalledPackage {
   version?: unknown
   dsh?: { bundle?: { patch?: unknown }; workspace?: unknown; client?: unknown }
   exports?: unknown
+  dependencies?: unknown
+  devDependencies?: unknown
+  peerDependencies?: unknown
+  optionalDependencies?: unknown
 }
 
 /** Whether one path stays inside `root` (symlink-free containment check). */
@@ -82,6 +85,41 @@ function isInside(root: string, candidate: string): boolean {
 
 function isAbsolutePath(value: string): boolean {
   return value.startsWith(sep) || /^[a-zA-Z]:[\\/]/.test(value)
+}
+
+/** Direct Cordis dependencies a Strict Mode Feature must never declare (G-8). */
+const FORBIDDEN_DIRECT_DEPENDENCIES = ['cordis', '@deepseek-ai/cordis'] as const
+
+/** Every package.json dependency section the boundary checks (matches the source-boundary gate). */
+const DEPENDENCY_SECTIONS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'] as const
+
+/**
+ * Reject a package whose installed package.json declares a direct Cordis
+ * dependency in ANY dependency section — `dependencies`, `devDependencies`,
+ * `peerDependencies`, or `optionalDependencies` — matching the source-boundary
+ * gate and the fixture's Cordis-free semantics. The installed manifest only
+ * exists after pnpm staging, so the boundary runs there — before any registry
+ * or ownership mutation — and needs no rollback (design D2).
+ * @param packageName - the package being validated (diagnostic only).
+ * @param pkg - the parsed installed package.json.
+ * @throws {Error} naming the forbidden dependency and its section when declared.
+ */
+function rejectForbiddenDependencies(packageName: string, pkg: InstalledPackage): void {
+  for (const section of DEPENDENCY_SECTIONS) {
+    const dependencies = pkg[section]
+    if (dependencies === undefined) continue
+    if (typeof dependencies !== 'object' || dependencies === null || Array.isArray(dependencies)) {
+      throw new Error(`page-app validation: "${packageName}" package.json ${section} must be a record`)
+    }
+    for (const forbidden of FORBIDDEN_DIRECT_DEPENDENCIES) {
+      if (Object.hasOwn(dependencies, forbidden)) {
+        throw new Error(
+          `page-app validation: "${packageName}" declares a direct ${forbidden} dependency (${section}) `
+          + '(Strict Mode features must not depend on Cordis; the Adapter absorbs Cordis changes)',
+        )
+      }
+    }
+  }
 }
 
 /**
@@ -140,8 +178,22 @@ export function validateInstalledPageAppPackage(
   if (!existsSync(patchPath)) {
     throw new Error(`page-app validation: "${packageName}" dsh.bundle.patch does not exist at ${patchPath}`)
   }
+  // Contract version gate (design D2): the supportedContractVersions constant
+  // is the manager's single source of truth for version admission. The gate
+  // runs before the manifest parse, so an unsupported numeric schema version
+  // is rejected by the constant; a missing or non-numeric schemaVersion keeps
+  // the manifest shape error from parsePageAppManifest.
+  const schemaVersion = (pkg.dsh?.workspace as { schemaVersion?: unknown } | undefined)?.schemaVersion
+  if (typeof schemaVersion === 'number') {
+    assertSupportedContractVersion(schemaVersion, SUPPORTED_CONTRACT_VERSIONS)
+  }
   // The workspace manifest (schemaVersion, every required field non-empty).
   const manifest = parsePageAppManifest(packageName, pkg)
+  // Strict Mode dependency boundary (design D2 / G-8): a Feature must not
+  // declare Cordis itself — the Adapter absorbs Cordis changes for it. The
+  // check reads the installed package.json, so it runs after pnpm staging and
+  // before any registry/ownership mutation; nothing owned changes here.
+  rejectForbiddenDependencies(packageName, pkg)
   // Uniqueness axes (spec §11): page id, package name, root id.
   for (const row of context.registry?.entries ?? []) {
     if (row.packageName === packageName) {
@@ -161,7 +213,7 @@ export function validateInstalledPageAppPackage(
   // mounts a layer; ANY warning (an ignored/missing patch target) rejects.
   let raw: unknown
   try {
-    raw = load(readFileSync(patchPath, 'utf8'), { schema: entryListSchema })
+    raw = parseEntryList(readFileSync(patchPath, 'utf8'))
   } catch (error) {
     throw new Error(`page-app validation: "${packageName}" bundle patch failed to parse: ${String(error)}`)
   }
@@ -171,7 +223,7 @@ export function validateInstalledPageAppPackage(
   const warnings: string[] = []
   let composed: EntryOptions[]
   try {
-    composed = applyEntryPatches([], structuredClone(raw as PatchOptionsLike[]), (message: string) => { warnings.push(message) })
+    composed = composePatchRows(raw, (message: string) => { warnings.push(message) })
   } catch (error) {
     throw new Error(`page-app validation: "${packageName}" bundle patch failed to compose: ${String(error)}`)
   }
@@ -235,9 +287,6 @@ export function validateInstalledPageAppPackage(
     clientRowCount: clientRows.length,
   })
 }
-
-/** Structural type of one include patch entry (the include validates at mount). */
-type PatchOptionsLike = Record<string, unknown>
 
 /**
  * Resolve `exports["./client"]` to a relative path, accepting the string and

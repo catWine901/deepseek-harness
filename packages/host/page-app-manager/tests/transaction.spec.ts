@@ -198,6 +198,35 @@ describe('install transaction', () => {
     expect(readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8')).toContain('packages:')
   })
 
+  it('runs the dependency admission after pnpm staging but before any ownership mutation', async () => {
+    // The installed package declares a direct Cordis dependency: pnpm staging
+    // succeeds (the dependency lands in node_modules), then the dependency
+    // boundary rejects it before any registry or ownership change.
+    writeWorkspacePackage()
+    const pkgDir = join(dir, 'node_modules', ...PKG.split('/'))
+    const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> }
+    pkg.dependencies = { cordis: '^4.0.1' }
+    writeFileSync(join(pkgDir, 'package.json'), JSON.stringify(pkg))
+    const { executor, calls } = fakeExecutor()
+    const { runtime, applySpy } = fakeRuntime()
+    const lc = lifecycle(executor, runtime)
+    await expect(lc.install(
+      { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
+      'client-1' as never,
+      new AbortController().signal,
+    )).rejects.toThrow(/declares a direct cordis dependency/)
+    // pnpm add ran (staging happened) and the rollback converged node_modules.
+    expect(calls.map(call => call.args[0])).toContain('add')
+    expect(calls.map(call => call.args[0])).toContain('install')
+    // The rejection preceded every ownership mutation: no registry write, no
+    // runtime apply. The journal is retained (design D8 removes it only after
+    // commit), so the failed install projects recovery-required until the
+    // operator runs recover().
+    expect(readRegistryFile()).toBeNull()
+    expect(applySpy).not.toHaveBeenCalled()
+    expect(() => readFileSync(join(dir, '.workspace-manager', 'transaction.json'), 'utf8')).not.toThrow()
+  })
+
   it('preserves pnpm allowBuilds diagnostics and never edits pnpm-workspace.yaml', async () => {
     writeWorkspacePackage()
     const before = readFileSync(workspaceYaml, 'utf8')
@@ -536,7 +565,7 @@ describe('M2 rollback live-tree restoration, journal guard, and expected-root ha
     expect(request.expectedRoots[0]).toMatchObject({
       packageName: PKG,
       pageId: 'workspace.valid',
-      rootEntryId: 'workspace.valid',
+      rootEntryId: 'page-app.wrapper.workspace.valid',
     })
     expect(request.expectedRoots[0]?.hash).toMatch(/^[0-9a-f]{64}$/)
   })
@@ -581,7 +610,7 @@ describe('M2 rollback live-tree restoration, journal guard, and expected-root ha
     expect(request.expectedRoots[0]).toMatchObject({
       packageName: PKG,
       pageId: 'workspace.valid',
-      rootEntryId: 'workspace.valid',
+      rootEntryId: 'page-app.wrapper.workspace.valid',
     })
     expect(request.expectedRoots[0]?.hash).toMatch(/^[0-9a-f]{64}$/)
     expect(request.expectedRoots[0]?.hash).not.toBe('')

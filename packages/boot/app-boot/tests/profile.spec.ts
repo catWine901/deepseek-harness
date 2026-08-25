@@ -357,6 +357,16 @@ describe('manager runtime layer startup', () => {
     ].join('\n'))
   }
 
+  /** Stage the installed host manager package that owns the Feature Runtime Wrapper module. */
+  function stageHostManagerPackage(profileDir: string): void {
+    const dir = join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-page-app-manager')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: '@deepseek-ai/dsh-page-app-manager',
+      version: '0.1.1-rc.2',
+    }))
+  }
+
   /** A valid registry v1 document with the given entries. */
   function registry(entries: Array<Record<string, unknown>>): string {
     return JSON.stringify({ schemaVersion: 1, revision: 1, entries }, null, 2)
@@ -390,19 +400,21 @@ describe('manager runtime layer startup', () => {
   it('regenerates a missing derived layer from a valid registry', async () => {
     const profile = tmp()
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
 
     const startup = await prepareManagerRuntimeLayer('t', profile)
     expect(startup.recoveryError).toBeUndefined()
     expect(startup.omitted).toEqual([])
     expect(readLayer(profile)).toEqual([
-      { insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] },
+      { insert: [{ id: 'page-app.wrapper.fixture-page', name: '@deepseek-ai/dsh-page-app-manager/wrapper', inject: ['workbenchRuntime'], config: { packageName: '@acme/page', pageId: 'fixture-page', rootEntryId: 'fixture-root', contractVersion: 1 }, insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] }] },
     ])
   })
 
   it('regenerates a corrupt derived layer from a valid registry', async () => {
     const profile = tmp()
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
     mkdirSync(join(profile, MANAGER_DIR), { recursive: true })
     writeFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), 'invalid: [unclosed\n')
@@ -410,7 +422,7 @@ describe('manager runtime layer startup', () => {
     const startup = await prepareManagerRuntimeLayer('t', profile)
     expect(startup.omitted).toEqual([])
     expect(readLayer(profile)).toEqual([
-      { insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] },
+      { insert: [{ id: 'page-app.wrapper.fixture-page', name: '@deepseek-ai/dsh-page-app-manager/wrapper', inject: ['workbenchRuntime'], config: { packageName: '@acme/page', pageId: 'fixture-page', rootEntryId: 'fixture-root', contractVersion: 1 }, insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] }] },
     ])
   })
 
@@ -467,6 +479,7 @@ describe('manager runtime layer startup', () => {
     }, null, 2))
     writeFileSync(join(brokenDir, 'cordis.patch.yml'), "- insert:\n    - id: other-row\n      name: '@acme/other'\n")
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     writeRegistry(profile, registry([
       registryEntry('@acme/broken', '1.0.0', { page: { id: 'broken-page', name: 'Broken', description: 'broken', defaultOrder: 0, rootEntryId: 'missing-root' } }),
       registryEntry('@acme/page', '1.0.0'),
@@ -475,7 +488,7 @@ describe('manager runtime layer startup', () => {
     const startup = await prepareManagerRuntimeLayer('t', profile)
     expect(startup.omitted).toEqual([{ rootEntryId: 'missing-root', reason: 'invalid-manifest' }])
     expect(readLayer(profile)).toEqual([
-      { insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] },
+      { insert: [{ id: 'page-app.wrapper.fixture-page', name: '@deepseek-ai/dsh-page-app-manager/wrapper', inject: ['workbenchRuntime'], config: { packageName: '@acme/page', pageId: 'fixture-page', rootEntryId: 'fixture-root', contractVersion: 1 }, insert: [{ id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } }] }] },
     ])
   })
 
@@ -506,6 +519,7 @@ describe('manager runtime layer startup', () => {
   it('omits disabled registry rows from the derived layer', async () => {
     const profile = tmp()
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     stageManagerPackage(profile, '@acme/hidden', '1.0.0', 'hidden-root')
     writeRegistry(profile, registry([
       registryEntry('@acme/page', '1.0.0'),
@@ -518,7 +532,7 @@ describe('manager runtime layer startup', () => {
     const startup = await prepareManagerRuntimeLayer('t', profile)
     expect(startup.omitted).toEqual([])
     const rows = readLayer(profile).flatMap(patch => patch.insert)
-    expect(rows.map(row => row.id)).toEqual(['fixture-root'])
+    expect(rows.map(row => row.id)).toEqual(['page-app.wrapper.fixture-page'])
   })
 
   it('leaves a profile with no registry untouched', async () => {
@@ -530,6 +544,7 @@ describe('manager runtime layer startup', () => {
   it('derives the same safe roots independently of write timing', async () => {
     const profile = tmp()
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
 
     const before = await deriveSafeRuntimeLayer('t', profile)
@@ -557,6 +572,7 @@ describe('manager runtime layer startup', () => {
   it('aborts regeneration when the registry changes between derivation and commit', async () => {
     const profile = tmp()
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
 
     // Pause at the pre-commit registry re-verification read; a stale startup
@@ -585,6 +601,7 @@ describe('manager runtime layer startup', () => {
   it('leaves the existing layer intact when the atomic publish fails', async () => {
     const profile = tmp()
     stageManagerPackage(profile, '@acme/page', '1.0.0')
+    stageHostManagerPackage(profile)
     writeRegistry(profile, registry([registryEntry('@acme/page', '1.0.0')]))
     const existing = 'previously committed layer bytes that must survive\n'
     writeFileSync(join(profile, MANAGER_DIR, 'runtime-layer.yml'), existing)

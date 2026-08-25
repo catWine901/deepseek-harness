@@ -22,6 +22,10 @@
       "types": "./lib/types/types.d.ts",
       "default": "./lib/types/types.js"
     },
+    "./wrapper": {
+      "types": "./lib/types/wrapper.d.ts",
+      "default": "./lib/types/wrapper.js"
+    },
     "./typert": {
       "types": "./lib/typert.host.d.ts",
       "default": "./lib/typert.host.js"
@@ -59,11 +63,6 @@
     "@deepseek-ai/cordis-plugin-include": "workspace:^",
     "@deepseek-ai/cordis-plugin-loader": "workspace:^",
     "@deepseek-ai/dsh-invariants": "workspace:^"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/cordis-plugin-include": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "workspace:^",

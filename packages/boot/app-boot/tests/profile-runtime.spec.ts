@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { load } from 'js-yaml'
 import { Context, FiberState, symbols } from '@deepseek-ai/cordis'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
@@ -18,7 +19,9 @@ import {
   canonicalManagedRootHash,
   composeEntries,
   composeProfilePatches,
+  deriveSafeRuntimeLayer,
   loadOptionalPatches,
+  prepareManagerRuntimeLayer,
   PROFILE_PATCH_FILENAME,
   PROFILE_RUNTIME_SERVICE,
   ProfileRuntime,
@@ -1170,5 +1173,192 @@ describe('ProfileRuntime watcher setup and the settled gate', () => {
     expect(disposerCalls).toEqual([0])
     await expect(runtime.applyManagerLayer({ registryRevision: 0, runtimeLayer: '[]\n', expectedRoots: [] }))
       .rejects.toThrow(/before the initial tree has settled/i)
+  })
+})
+
+describe('M7 managed-root wrapper derivation', () => {
+  const MANAGER_DIR = '.workspace-manager'
+
+  /** Stage one installed feature package with a workspace manifest and bundle patch. */
+  function stageFeaturePackage(
+    profileDir: string,
+    name = '@acme/page',
+    version = '1.0.0',
+    rootEntryId = 'fixture-root',
+    pageId = 'fixture-page',
+  ): void {
+    const dir = join(profileDir, 'node_modules', ...name.split('/'))
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name,
+      version,
+      dsh: {
+        workspace: {
+          schemaVersion: 1, id: pageId, name: 'Fixture Page', description: 'fixture page app', defaultOrder: 0, rootEntryId,
+        },
+        bundle: { patch: './cordis.patch.yml' },
+      },
+    }, null, 2))
+    writeFileSync(join(dir, 'cordis.patch.yml'), [
+      '- insert:',
+      `    - id: ${rootEntryId}`,
+      "      name: '@acme/fixture-client'",
+      '      config:',
+      '        marker: fixture',
+      '',
+    ].join('\n'))
+  }
+
+  /** Stage the installed manager package that owns the wrapper module. */
+  function stageManagerPackage(profileDir: string): void {
+    const dir = join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-page-app-manager')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: '@deepseek-ai/dsh-page-app-manager',
+      version: '0.1.1-rc.2',
+    }))
+  }
+
+  /** A valid registry v1 document with one enabled row for the fixture page. */
+  function writeRegistry(profileDir: string): void {
+    mkdirSync(join(profileDir, MANAGER_DIR), { recursive: true })
+    writeFileSync(join(profileDir, MANAGER_DIR, 'registry.json'), JSON.stringify({
+      schemaVersion: 1,
+      revision: 1,
+      entries: [{
+        packageName: '@acme/page',
+        source: { kind: 'registry', display: 'https://registry.example/fixture' },
+        resolvedVersion: '1.0.0',
+        page: { id: 'fixture-page', name: 'Fixture Page', description: 'fixture page app', defaultOrder: 0, rootEntryId: 'fixture-root' },
+        order: 0,
+        enabled: true,
+        hidden: false,
+        installedAt: '2026-08-22T00:00:00.000Z',
+        updatedAt: '2026-08-22T00:00:00.000Z',
+      }],
+    }, null, 2))
+  }
+
+  /** The exact wrapper parent row the derivation must produce for the fixture page. */
+  function expectedWrapperRow(): unknown {
+    return {
+      id: 'page-app.wrapper.fixture-page',
+      name: '@deepseek-ai/dsh-page-app-manager/wrapper',
+      inject: ['workbenchRuntime'],
+      config: {
+        packageName: '@acme/page',
+        pageId: 'fixture-page',
+        rootEntryId: 'fixture-root',
+        contractVersion: 1,
+      },
+      insert: [
+        { id: 'fixture-root', name: '@acme/fixture-client', config: { marker: 'fixture' } },
+      ],
+    }
+  }
+
+  it('derives wrapper root rows that inject workbenchRuntime and mount feature rows as children', async () => {
+    const profile = tmp()
+    stageFeaturePackage(profile)
+    stageManagerPackage(profile)
+    writeRegistry(profile)
+
+    const derived = await deriveSafeRuntimeLayer('t', profile)
+    expect(derived.recoveryError).toBeUndefined()
+    expect(derived.omitted).toEqual([])
+    // The renderer normalizes key order (`sortKeys`), so the serialized row
+    // lists config before id/inject/insert/name.
+    expect(derived.layer).toBe([
+      '- insert:',
+      '    - config:',
+      '        contractVersion: 1',
+      "        packageName: '@acme/page'",
+      '        pageId: fixture-page',
+      '        rootEntryId: fixture-root',
+      '      id: page-app.wrapper.fixture-page',
+      '      inject:',
+      '        - workbenchRuntime',
+      '      insert:',
+      '        - config:',
+      '            marker: fixture',
+      '          id: fixture-root',
+      "          name: '@acme/fixture-client'",
+      "      name: '@deepseek-ai/dsh-page-app-manager/wrapper'",
+      '',
+    ].join('\n'))
+    const parsed = load(derived.layer) as Array<{ insert: unknown[] }>
+    expect(parsed).toHaveLength(1)
+    expect(parsed[0]?.insert).toEqual([expectedWrapperRow()])
+  })
+
+  it('omits a root whose wrapper module cannot resolve from the profile (missing-manager health)', async () => {
+    const profile = tmp()
+    // The feature is installed and statically valid, but the manager package
+    // that owns the wrapper module is not installed in the profile.
+    stageFeaturePackage(profile)
+    writeRegistry(profile)
+
+    const derived = await deriveSafeRuntimeLayer('t', profile)
+    expect(derived.recoveryError).toBeUndefined()
+    expect(derived.omitted).toEqual([{ rootEntryId: 'fixture-root', reason: 'missing-manager' }])
+    expect(derived.layer).toBe('[]\n')
+  })
+
+  it('boots with zero managed roots after a manager uninstall with a surviving registry (boot-after-uninstall)', async () => {
+    const dir = tmp()
+    writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
+    writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
+    stageFeaturePackage(dir)
+    // The registry survives the manager uninstall; the manager package is gone.
+    writeRegistry(dir)
+
+    const startup = await prepareManagerRuntimeLayer(NAME, dir)
+    expect(startup.recoveryError).toBeUndefined()
+    expect(startup.omitted).toEqual([{ rootEntryId: 'fixture-root', reason: 'missing-manager' }])
+
+    let runtime: ProfileRuntime | undefined
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
+      runtime = new ProfileRuntime(hostCtx, {
+        identity: { name: 'demo', directory: dir },
+        compose: managerPatches => composeProfilePatches({
+          bundlePatches: [],
+          managerPatches,
+          profilePatches: [],
+          homePatches: [],
+          overlays: [],
+        }),
+        initialManagerPatches: readManagerLayerPatches(NAME, dir),
+      })
+    })
+    try {
+      if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
+      const rows = [...ctx.loader.entries()]
+      // No managed root (wrapper or feature row) mounted; boot survived the
+      // manager uninstall with the registry still owned.
+      expect(rows.some(entry => entry.options.id === 'page-app.wrapper.fixture-page')).toBe(false)
+      expect(rows.some(entry => entry.options.id === 'fixture-root')).toBe(false)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('layer serializes the wrapper form deterministically', async () => {
+    const first = tmp()
+    stageFeaturePackage(first)
+    stageManagerPackage(first)
+    writeRegistry(first)
+    const second = tmp()
+    stageFeaturePackage(second)
+    stageManagerPackage(second)
+    writeRegistry(second)
+
+    const derivedFirst = await deriveSafeRuntimeLayer('t', first)
+    const derivedSecond = await deriveSafeRuntimeLayer('t', second)
+    expect(derivedFirst.layer).toBe(derivedSecond.layer)
+    expect(derivedFirst.layer).toContain('page-app.wrapper.fixture-page')
+    // Deriving twice from the same profile is byte-identical.
+    const again = await deriveSafeRuntimeLayer('t', first)
+    expect(again.layer).toBe(derivedFirst.layer)
+    expect(again.omitted).toEqual(derivedFirst.omitted)
   })
 })

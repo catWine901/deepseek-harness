@@ -34,6 +34,7 @@ import {
   withPageAppProfileLock,
   type PageAppRegistryEntry,
   type PageAppRegistryV1,
+  type PageAppRuntimeEntry,
   type ValidatedManagedRoot,
 } from '@deepseek-ai/dsh-page-app-profile'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
@@ -42,6 +43,74 @@ import { loadOptionalPatches, loadOverlayPatches } from './index.ts'
 
 /** The service name the launcher provides `ProfileRuntime` under. */
 export const PROFILE_RUNTIME_SERVICE = 'profileRuntime'
+
+/** The manager package that owns the Feature Runtime Wrapper module. */
+export const PAGE_APP_MANAGER_PACKAGE_NAME = '@deepseek-ai/dsh-page-app-manager'
+
+/** The service the manager provides under, and every wrapper fiber injects. */
+export const WORKBENCH_RUNTIME_SERVICE = 'workbenchRuntime'
+
+/** Deterministic prefix of one Feature Runtime Wrapper row id (`page-app.wrapper.<pageId>`). */
+export const PAGE_APP_WRAPPER_ID_PREFIX = 'page-app.wrapper.'
+
+/**
+ * The deterministic wrapper row id of one managed page. The runtime layer and
+ * the manager's facts/health lookup both derive the same id, so a staged
+ * wrapper row and its loaded Loader entry are found by the same key.
+ * @param pageId - the managed page id.
+ * @returns `page-app.wrapper.<pageId>`.
+ */
+export function managedRootWrapperId(pageId: string): string {
+  return `${PAGE_APP_WRAPPER_ID_PREFIX}${pageId}`
+}
+
+/**
+ * Whether the manager package that owns the Feature Runtime Wrapper module is
+ * installed in the profile. Profile-local pnpm installs (hoisted linker) place
+ * the manager directly under the profile's own `node_modules` — the same
+ * anchor the Loader resolves the wrapper module against — so an uninstalled
+ * manager is observable from the profile alone and never falls through to an
+ * ambient parent store.
+ * @param profileDir - absolute profile directory.
+ * @returns true when the manager package.json exists in the profile's own
+ * node_modules.
+ */
+export function managerWrapperResolvable(profileDir: string): boolean {
+  return existsSync(join(profileDir, 'node_modules', PAGE_APP_MANAGER_PACKAGE_NAME, 'package.json'))
+}
+
+/**
+ * Derive the Feature Runtime Wrapper parent row of one statically valid root:
+ * a named loader entry for the manager's wrapper module that injects the
+ * `workbenchRuntime` service, carries the feature's package/page/root identity
+ * in its config, and mounts the feature's composed rows as its `insert`
+ * children. Every enabled root of the runtime layer takes this wrapper form,
+ * so the manager's loader row lookup and hash expectation follow the same
+ * shape.
+ * @param input - the feature's package/page identity, contract version, and
+ * composed feature rows.
+ * @returns the wrapper parent row (a {@link PageAppRuntimeEntry}).
+ */
+export function managedRootWrapperRow(input: {
+  readonly packageName: string
+  readonly pageId: string
+  readonly rootEntryId: string
+  readonly contractVersion: number
+  readonly entries: readonly PageAppRuntimeEntry[]
+}): PageAppRuntimeEntry {
+  return {
+    id: managedRootWrapperId(input.pageId),
+    name: `${PAGE_APP_MANAGER_PACKAGE_NAME}/wrapper`,
+    inject: [WORKBENCH_RUNTIME_SERVICE],
+    config: {
+      packageName: input.packageName,
+      pageId: input.pageId,
+      rootEntryId: input.rootEntryId,
+      contractVersion: input.contractVersion,
+    },
+    insert: [...input.entries],
+  }
+}
 
 /** Immutable identity of the active profile the runtime manages. */
 export interface ActiveProfileIdentity {
@@ -97,7 +166,11 @@ export interface ProfileRuntimeApplyResult {
 }
 
 /** Why a registry root was omitted from the safe derived layer at startup. */
-export type ManagedRootOmissionReason = 'missing-dependency' | 'version-drift' | 'invalid-manifest'
+export type ManagedRootOmissionReason =
+  | 'missing-dependency'
+  | 'version-drift'
+  | 'invalid-manifest'
+  | 'missing-manager'
 
 /** One root the safe derived layer omitted, with the reason. */
 export interface OmittedManagedRoot {
@@ -354,11 +427,16 @@ function resolveInstalledPackageDir(profileDir: string, packageName: string): st
  * package, or the reason the root is unsafe. The installed package must
  * exist, carry the committed version, declare a valid `dsh.workspace` v1
  * manifest and a resolvable `dsh.bundle.patch`, and the composed bundle
- * layer must contain the manifest's root row.
+ * layer must contain the manifest's root row. The Feature Runtime Wrapper
+ * module must resolve from the profile: the manager package that owns it has
+ * to be installed, otherwise the root is omitted as `missing-manager` so a
+ * boot after a manager uninstall survives with zero managed roots while the
+ * registry stays owned. Every derived root is emitted in the wrapper parent
+ * form (the feature rows become the wrapper's `insert` children).
  * @param binName - the diagnostic prefix on parse errors.
  * @param profileDir - absolute profile directory.
  * @param entry - the enabled registry row.
- * @returns the validated root, or the omission reason.
+ * @returns the validated wrapper root, or the omission reason.
  */
 function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryEntry): DerivedRoot {
   const packageDir = resolveInstalledPackageDir(profileDir, entry.packageName)
@@ -370,10 +448,17 @@ function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryE
     return { reason: 'invalid-manifest' }
   }
   if (installed.version !== entry.resolvedVersion) return { reason: 'version-drift' }
+  let manifest: ReturnType<typeof parsePageAppManifest>
   try {
-    parsePageAppManifest(entry.packageName, installed)
+    manifest = parsePageAppManifest(entry.packageName, installed)
   } catch {
     return { reason: 'invalid-manifest' }
+  }
+  // The Feature Runtime Wrapper lives in the manager package; an uninstalled
+  // manager (boot-after-uninstall) must omit every root instead of failing
+  // boot on an unresolvable wrapper module.
+  if (!managerWrapperResolvable(profileDir)) {
+    return { reason: 'missing-manager' }
   }
   const bundle = (installed.dsh as { bundle?: { patch?: unknown } } | undefined)?.bundle
   if (typeof bundle?.patch !== 'string' || bundle.patch === '') return { reason: 'invalid-manifest' }
@@ -389,13 +474,20 @@ function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryE
   const rows = applyEntryPatches([], structuredClone(patches), () => {})
   const rootRow = rows.find(row => row.id === entry.page.rootEntryId)
   if (rootRow === undefined) return { reason: 'invalid-manifest' }
+  const wrapper = managedRootWrapperRow({
+    packageName: entry.packageName,
+    pageId: entry.page.id,
+    rootEntryId: entry.page.rootEntryId,
+    contractVersion: manifest.schemaVersion,
+    entries: [rootRow],
+  })
   return {
     root: {
       packageName: entry.packageName,
       pageId: entry.page.id,
-      rootEntryId: entry.page.rootEntryId,
+      rootEntryId: wrapper.id,
       enabled: entry.enabled,
-      entries: [rootRow],
+      entries: [wrapper],
     },
   }
 }
