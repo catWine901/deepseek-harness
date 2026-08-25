@@ -72,8 +72,11 @@ function stubRemote(): PageAppManagerRemoteMethods & PageAppRemoteEvents {
 
 /** Build the real remote face when the generated namespace is mounted. */
 function buildRemote(ctx: ClientContext): PageAppManagerRemoteMethods & PageAppRemoteEvents | null {
+  // The carrier is retained only for the event subscription; the namespace
+  // resolves through the dotted service name (a property dereference on the
+  // traceable carrier throws without inject).
   const remote = ctx.get('remote')
-  const namespace = remote?.pageAppManager
+  const namespace = ctx.get('remote.pageAppManager') as PageAppManagerRemoteMethods | undefined
   if (namespace === undefined || remote === undefined) return null
   return {
     ...namespace,

@@ -10,6 +10,7 @@ import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
 import { apply, PageAppShell, type PageAppShellInjected, inject } from '@deepseek-ai/dsh-client-ui-page-app-manager/client'
+import type { PageAppManagerRemoteMethods, PageAppRemoteEvents } from '../src/client/contracts.ts'
 import { FakeRemote, fakeEntry } from './fake-page-app.client.ts'
 
 beforeEach(() => {
@@ -36,19 +37,29 @@ async function benchWithRemote(): Promise<{ ctx: Context; slots: SlotRegistry; r
   const locale = new LocaleRuntime(ctx)
   ctx.provide('locale', locale)
   const remote = new FakeRemote()
-  class RemoteService extends Service {
-    public readonly pageAppManager: FakeRemote
-    constructor(serviceCtx: Context, pageAppManager: FakeRemote) {
-      super(serviceCtx, 'remote')
-      this.pageAppManager = pageAppManager
+  // The generated api-remotes plugin owns both the carrier and the nested
+  // namespace on one provider fiber: dereferencing the traceable carrier then
+  // trips Cordis' missing-inject trap, while a dotted
+  // ctx.get('remote.pageAppManager') resolves it from the store.
+  const remoteFiber = ctx.plugin((providerCtx: Context) => {
+    class RemoteService extends Service {
+      private readonly serviceCtx: Context
+      constructor(serviceCtx: Context) {
+        super(serviceCtx, 'remote')
+        this.serviceCtx = serviceCtx
+      }
+      // The generated carrier owns the event subscription seam and forwards
+      // through the dotted service name (a property dereference on the
+      // traceable carrier throws without inject).
+      public $on(event: string, listener: (value: never) => void): () => void {
+        const namespace = this.serviceCtx.get('remote.pageAppManager') as PageAppManagerRemoteMethods & PageAppRemoteEvents
+        return namespace.$on(event as never, listener as never)
+      }
     }
-    // The generated carrier owns the event subscription seam; the manager
-    // namespace's methods live on the pageAppManager surface.
-    public $on(event: string, listener: (value: never) => void): () => void {
-      return this.pageAppManager.$on(event as never, listener as never)
-    }
-  }
-  new RemoteService(ctx, remote)
+    new RemoteService(providerCtx)
+    providerCtx.reflect.provide('remote.pageAppManager', remote)
+  })
+  await remoteFiber.await()
   return { ctx, slots: ctx.get('slots') as SlotRegistry, remote }
 }
 
@@ -110,6 +121,22 @@ describe('ui-page-app-manager client apply', () => {
     expect(snapshot.registry?.entries.length).toBe(0)
     expect(snapshot.eligible.size).toBe(0)
     expect(snapshot.activePageId).toBeNull()
+    await fiber.dispose()
+  })
+
+  it('mounts with the real remote namespace provided through Cordis', async () => {
+    const { ctx, slots, remote } = await benchWithRemote()
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    // The nested namespace resolved through Cordis' dotted service name (a
+    // carrier property dereference throws without inject): the controller's
+    // event subscriptions land on the real namespace, so a pending activation
+    // surfaces in the snapshot — the degraded stub never emits.
+    const injected = (slots.entries('root')[0]!.inject as unknown as () => PageAppShellInjected)()
+    remote.emitActivation(activationEvent())
+    const view = injected.hooks.pageApp.getSnapshot().activation
+    expect(view).not.toBeNull()
+    expect(view?.transactionId).toBe('tx-1')
     await fiber.dispose()
   })
 
