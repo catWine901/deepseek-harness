@@ -20,9 +20,9 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import type { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import { managedRootWrapperRow, type ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
 import { type ExpectedManagedRoot } from '@deepseek-ai/dsh-app-boot'
-import { managedRootHash } from './adapter.ts'
+import { managedRootHash, type EntryOptions } from './adapter.ts'
 import {
   advancePageAppJournalPhase,
   parsePageAppRegistry,
@@ -402,18 +402,29 @@ export class PageAppLifecycle {
       if (!entry.enabled) continue
       const row = composedManagedRow(this.deps.profileDir, entry, registry, this.readProfileDependencies())
       if (row === undefined) continue
-      roots.push({
+      // Every staged root takes the Feature Runtime Wrapper parent form, using
+      // the app-boot renderer as the single implementation the runtime layer
+      // derivation shares (the layer, the transaction, and the health lookup
+      // can never drift).
+      const wrapper = managedRootWrapperRow({
         packageName: entry.packageName,
         pageId: entry.page.id,
         rootEntryId: row.rootEntryId,
-        enabled: true,
+        contractVersion: row.contractVersion,
         entries: [row.rootRow],
+      }) as unknown as EntryOptions
+      roots.push({
+        packageName: entry.packageName,
+        pageId: entry.page.id,
+        rootEntryId: wrapper.id,
+        enabled: true,
+        entries: [wrapper],
       })
       expectedRoots.push({
         packageName: entry.packageName,
         pageId: entry.page.id,
-        rootEntryId: row.rootEntryId,
-        hash: managedRootHash(row.rootRow),
+        rootEntryId: wrapper.id,
+        hash: managedRootHash(wrapper),
       })
     }
     return {
@@ -571,7 +582,7 @@ function composedManagedRow(
   entry: PageAppRegistryEntry,
   registry: PageAppRegistryV1,
   profileDependencies: Record<string, string>,
-): { rootEntryId: string; rootRow: ReturnType<typeof validateInstalledPageAppPackage>['rootRow'] } | undefined {
+): { rootEntryId: string; rootRow: ReturnType<typeof validateInstalledPageAppPackage>['rootRow']; contractVersion: number } | undefined {
   const installed = resolveInstalledPackageDir(profileDir, entry.packageName)
   if (installed === undefined) return undefined
   try {
@@ -591,7 +602,11 @@ function composedManagedRow(
       profileDependencies,
       profileBundles: [],
     })
-    return { rootEntryId: record.rootEntryId, rootRow: record.rootRow }
+    return {
+      rootEntryId: record.rootEntryId,
+      rootRow: record.rootRow,
+      contractVersion: record.manifest.schemaVersion,
+    }
   } catch {
     // An unhealthy row contributes no root; the registry stays authoritative.
     return undefined
@@ -602,7 +617,8 @@ function composedManagedRow(
  * Derive the runtime-audit expectations for one registry (rollback/recovery
  * restore paths recompute them from the journal's before-state). Hashes are
  * `managedRootHash` (the adapter's `canonicalManagedRootHash` delegate) of the
- * composed root row — never empty.
+ * Feature Runtime Wrapper parent row — never empty — so the audit and the
+ * health lookup share the wrapper form.
  * @param profileDir - absolute profile directory (resolution anchor).
  * @param registry - the registry to derive enabled roots from.
  * @returns one expectation per enabled, statically valid row.
@@ -614,11 +630,18 @@ export function derivePageAppExpectedRoots(profileDir: string, registry: PageApp
     if (!entry.enabled) continue
     const row = composedManagedRow(profileDir, entry, registry, profileDependencies)
     if (row === undefined) continue
-    expectedRoots.push({
+    const wrapper = managedRootWrapperRow({
       packageName: entry.packageName,
       pageId: entry.page.id,
       rootEntryId: row.rootEntryId,
-      hash: managedRootHash(row.rootRow),
+      contractVersion: row.contractVersion,
+      entries: [row.rootRow],
+    }) as unknown as EntryOptions
+    expectedRoots.push({
+      packageName: entry.packageName,
+      pageId: entry.page.id,
+      rootEntryId: wrapper.id,
+      hash: managedRootHash(wrapper),
     })
   }
   return expectedRoots

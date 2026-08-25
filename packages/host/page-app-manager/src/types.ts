@@ -52,6 +52,7 @@ export type PageAppHealth =
   | 'missing-dependency'
   | 'version-drift'
   | 'invalid-manifest'
+  | 'missing-manager'
   | 'activation-failed'
   | 'externally-overridden'
   | 'recovery-required'

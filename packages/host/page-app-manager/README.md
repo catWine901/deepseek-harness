@@ -8,11 +8,21 @@ Host-side Workspace Apps manager: the read-only ownership projection, install-so
 
 ## Cordis Adapter
 
-Manager product code touches Cordis only through `src/adapter.ts`, the sole runtime-import location for `@deepseek-ai/cordis`, `@deepseek-ai/cordis-plugin-loader`, and `@deepseek-ai/cordis-plugin-include`; a type-only `Context` import (the plugin signature) is the only exception. The adapter exposes the Cordis state the manager reads and delegates to the vendored surfaces it wraps: `managedRootHash` (expected-root hashes, delegating to `canonicalManagedRootHash`), `composePatchRows` (bundle patch composition over an empty root, delegating to Include's `applyEntryPatches`), `parseEntryList` (the include's `!!js` entry-list YAML dialect), `findLoaderRow` (Loader row lookup through `loader.entries()`), and `fiberStateOf` (a row's numeric `FiberState`).
+Manager product code touches Cordis only through `src/adapter.ts`, the sole runtime-import location for `@deepseek-ai/cordis`, `@deepseek-ai/cordis-plugin-loader`, and `@deepseek-ai/cordis-plugin-include`; a type-only `Context` import (the plugin signature) is the only exception. The adapter exposes the Cordis state the manager reads and delegates to the vendored surfaces it wraps: `managedRootHash` (expected-root hashes, delegating to `canonicalManagedRootHash`), `composePatchRows` (bundle patch composition over an empty root, delegating to Include's `applyEntryPatches`), `parseEntryList` (the include's `!!js` entry-list YAML dialect), `findLoaderRow` (Loader row lookup through `loader.entries()`), `fiberStateOf` (a row's numeric `FiberState`), `isActiveFiberState` (the `ready` health's ACTIVE requirement), `wrapperChildrenOf` and `mountWrapperChildren` (the Feature Runtime Wrapper's child-row mounting through `Loader.create`/`remove`).
 
 Compatibility promise: every delegation is behavior-preserving — the adapter spec pins each one against the vendored Cordis surface it wraps, and the import gate (also pinned in `tests/adapter.spec.ts`) keeps every other product file Cordis-free at runtime, so a Cordis API change is absorbed in `adapter.ts` only.
 
 The three Cordis peers are required, not optional: the adapter runtime-imports `cordis-plugin-include` at module load, so an absent peer would fail the manager module itself. No optional-runtime contract exists to preserve — `verify-optional-dependency-imports` enforces that a declared-optional package is never loaded at module scope.
+
+## Workbench Runtime and the Feature Runtime Wrapper
+
+The manager provides the `workbenchRuntime` service with the manager fiber's lifetime: `ctx.provide` deletes the service and re-evaluates every dependent fiber when the fiber unloads, so a manager loss parks every wrapper fiber PENDING and a returning provider reloads them. The runtime exposes only the contract-v1 domain surface to Features — lifecycle disposal, workspace-surface registration, events, storage get/set, and a host-call seam — never the raw context. A manager uninstall therefore suspends every Feature through the real Loader lifecycle (no second lifecycle system), and re-enable or re-install restores it.
+
+Every enabled, statically valid managed root mounts under the Feature Runtime Wrapper (`page-app-manager.wrapper`, loaded as `@deepseek-ai/dsh-page-app-manager/wrapper`): the wrapper row id is the deterministic `page-app.wrapper.<pageId>`, it injects `workbenchRuntime`, mounts the feature's composed rows as Loader entries (each keeping its own entry and fiber), and registers the feature's surface seat with its owning package. The runtime layer derivation, transaction staging, and the manager's health lookup all share the app-boot wrapper renderer, so the staged document, the loaded tree, and the health facts can never drift.
+
+Strict Mode consequence: a Feature still runs as a Cordis loader entry — the wrapper is the seam that composes it, while the Feature's own source stays Cordis-free (its dependency boundary is enforced at install). The contract's client render wiring lands with the fixture migration; until then the wrapper records the surface seat and provenance.
+
+A root whose wrapper module cannot resolve — the manager package is not installed in the profile, so boot after a manager uninstall with a surviving registry — is omitted as `missing-manager`: boot succeeds with zero managed roots and the registry stays owned.
 
 ## Cancellation and the activation handshake
 

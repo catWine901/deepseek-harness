@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
+import { FiberState, type Context } from '@deepseek-ai/cordis'
 import {
   boot,
   canonicalManagedRootHash,
@@ -25,6 +25,9 @@ import {
   type ExpectedManagedRoot,
   type ProfileRuntimeApplyRequest,
 } from '@deepseek-ai/dsh-app-boot'
+import { fiberStateOf, findLoaderRow } from '../src/adapter.ts'
+import { createWorkbenchRuntime, WORKBENCH_RUNTIME_SERVICE } from '../src/workbench-runtime.ts'
+import { apply as wrapperApply, inject as wrapperInject, name as wrapperName } from '../src/wrapper.ts'
 
 const NAME = 'dsh-loader-composition-test'
 
@@ -181,6 +184,185 @@ describe('manager layer composition (the M2 rollback seam)', () => {
       expect(restored.generation).toBe(2)
       expect(restored.activeRoots).toEqual(['page'])
       expect(entryOptions(ctx, 'page')).toEqual({ id: 'page', name: './manager.mjs', config: { value: 1 } })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('M7 workbench runtime and the feature runtime wrapper (real Loader)', () => {
+  const WRAPPER_BUILTIN = 'page-app-manager.wrapper'
+  // The feature child's disposal is deliberately slow (a 25 ms disposer): the
+  // provider-loss contract is that the wrapper's unload AWAITS the child
+  // removal, so a fire-and-forget disposer would still have the child mounted
+  // when the loss settles. A finite delay makes that race deterministically
+  // observable through the real Loader lifecycle without any mock.
+  const CHILD_PLUGIN = [
+    "export const name = 'feature-child'",
+    'export function apply(ctx) {',
+    "  ctx.effect(() => () => new Promise(resolve => setTimeout(resolve, 25)), 'feature-child: slow disposal')",
+    '}',
+    '',
+  ].join('\n')
+
+  interface WrapperTree {
+    ctx: Context
+    runtime: ProfileRuntime
+    workbench: ReturnType<typeof createWorkbenchRuntime>
+    layerPath: string
+    disposeWorkbench: () => unknown
+  }
+
+  /**
+   * Boot a real Loader tree whose include mounts the REAL manager wrapper
+   * plugin through the Loader's builtin surface (the module's name resolves to
+   * the builtin without a temp-profile package install) and a real
+   * `createWorkbenchRuntime` provided under the contract service name.
+   */
+  async function bootWrapperTree(provideWorkbench: boolean): Promise<WrapperTree> {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-wrapper-composition-'))
+    dirs.push(dir)
+    writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
+    writeFileSync(join(dir, 'child.mjs'), CHILD_PLUGIN)
+    writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
+    mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
+    let runtime: ProfileRuntime | undefined
+    let workbench: ReturnType<typeof createWorkbenchRuntime> | undefined
+    let disposeWorkbench: (() => unknown) | undefined
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
+      hostCtx.loader.builtins[WRAPPER_BUILTIN] = { name: wrapperName, inject: wrapperInject, apply: wrapperApply }
+      if (provideWorkbench) {
+        workbench = createWorkbenchRuntime(hostCtx)
+        disposeWorkbench = hostCtx.provide(WORKBENCH_RUNTIME_SERVICE, workbench)
+      }
+      runtime = new ProfileRuntime(hostCtx, {
+        identity: { name: 'demo', directory: dir },
+        compose: managerPatches => composeProfilePatches({
+          bundlePatches: [],
+          managerPatches,
+          profilePatches: loadOptionalPatches(NAME, join(dir, PROFILE_PATCH_FILENAME)) ?? [],
+          homePatches: [],
+          overlays: [],
+        }),
+        initialManagerPatches: readManagerLayerPatches(NAME, dir),
+      })
+    })
+    if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
+    if (workbench === undefined) throw new Error('boot did not construct the workbench runtime')
+    return {
+      ctx,
+      runtime,
+      workbench,
+      layerPath: join(dir, '.workspace-manager', 'runtime-layer.yml'),
+      disposeWorkbench: disposeWorkbench ?? (async () => {}),
+    }
+  }
+
+  /** One managed root in the wrapper parent-row form (children nested in `insert`). */
+  function wrapperLayer(
+    rootId: string,
+    value: number,
+    packageName = '@fixture/feature',
+    pageId = `p${value}`,
+  ): { layer: string; expected: ExpectedManagedRoot } {
+    const wrapperRow = {
+      id: `page-app.wrapper.${pageId}`,
+      name: `cordis:${WRAPPER_BUILTIN}`,
+      inject: ['workbenchRuntime'],
+      config: { packageName, pageId, rootEntryId: rootId, contractVersion: 1 },
+      insert: [{ id: rootId, name: './child.mjs', config: { v: value } }],
+    }
+    const layer = [
+      '- insert:',
+      `    - id: page-app.wrapper.${pageId}`,
+      `      name: 'cordis:${WRAPPER_BUILTIN}'`,
+      '      inject:',
+      '        - workbenchRuntime',
+      '      config:',
+      `        packageName: '${packageName}'`,
+      `        pageId: ${pageId}`,
+      `        rootEntryId: ${rootId}`,
+      '        contractVersion: 1',
+      '      insert:',
+      `        - id: ${rootId}`,
+      '          name: ./child.mjs',
+      '          config:',
+      `            v: ${value}`,
+      '',
+    ].join('\n')
+    return {
+      layer,
+      expected: {
+        packageName,
+        pageId,
+        rootEntryId: `page-app.wrapper.${pageId}`,
+        hash: canonicalManagedRootHash(wrapperRow),
+      },
+    }
+  }
+
+  it('workbenchRuntime provider loss leaves wrapper fibers PENDING and return reloads them', async () => {
+    const { ctx, runtime, layerPath, disposeWorkbench } = await bootWrapperTree(true)
+    try {
+      const { layer, expected } = wrapperLayer('feature-root', 1)
+      writeFileSync(layerPath, layer)
+      await runtime.applyManagerLayer(applyRequest(layer, [expected]))
+      const wrapperId = 'page-app.wrapper.p1'
+      // Boolean projection: the loader row is a Cordis traceable proxy, which
+      // vitest's diff formatter cannot pretty-print on a failing assertion.
+      const childMounted = (): boolean => findLoaderRow(ctx.loader, 'feature-root') !== undefined
+      expect(fiberStateOf(findLoaderRow(ctx.loader, wrapperId))).toBe(FiberState.ACTIVE)
+      expect(childMounted()).toBe(true)
+
+      // Provider loss through the real provide disposer: the dependent wrapper
+      // fiber re-evaluates and parks PENDING (real Loader lifecycle, never a
+      // mocked state transition). The wrapper's unload must remove its mounted
+      // feature rows before the disposer settles: Cordis awaits disposer
+      // promises during fiber unload, so a fast provider return can never race
+      // a still-in-flight removal and orphan re-created child entries. The
+      // child's slow disposal makes that ordering deterministically observable.
+      await disposeWorkbench()
+      expect(childMounted()).toBe(false)
+      await ctx.loader.await()
+      expect(fiberStateOf(findLoaderRow(ctx.loader, wrapperId))).toBe(FiberState.PENDING)
+      expect(childMounted()).toBe(false)
+
+      // Provider return: the same wrapper fiber reloads to ACTIVE and mounts
+      // its feature children again.
+      ctx.provide(WORKBENCH_RUNTIME_SERVICE, createWorkbenchRuntime(ctx))
+      await ctx.loader.await()
+      expect(fiberStateOf(findLoaderRow(ctx.loader, wrapperId))).toBe(FiberState.ACTIVE)
+      expect(childMounted()).toBe(true)
+      expect(fiberStateOf(findLoaderRow(ctx.loader, 'feature-root'))).toBe(FiberState.ACTIVE)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('wrapper fiber with satisfied inject mounts its feature children', async () => {
+    const { ctx, runtime, layerPath } = await bootWrapperTree(true)
+    try {
+      const { layer, expected } = wrapperLayer('feature-root', 1)
+      writeFileSync(layerPath, layer)
+      await runtime.applyManagerLayer(applyRequest(layer, [expected]))
+      // The feature child is a real loader entry with its own active fiber.
+      const child = findLoaderRow(ctx.loader, 'feature-root')
+      expect(child).toBeDefined()
+      expect(fiberStateOf(child)).toBe(FiberState.ACTIVE)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('a feature surface registered through the contract carries ownerPackage equal to the feature package', async () => {
+    const { ctx, runtime, workbench, layerPath } = await bootWrapperTree(true)
+    try {
+      const { layer, expected } = wrapperLayer('feature-root', 1)
+      writeFileSync(layerPath, layer)
+      await runtime.applyManagerLayer(applyRequest(layer, [expected]))
+      const surfaces = workbench.surfaces.list()
+      expect(surfaces).toHaveLength(1)
+      expect(surfaces[0]).toEqual({ pageId: 'p1', packageName: '@fixture/feature' })
     } finally {
       await ctx.fiber.dispose()
     }

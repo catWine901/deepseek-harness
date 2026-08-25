@@ -14,6 +14,7 @@
 import { canonicalManagedRootHash } from '@deepseek-ai/dsh-app-boot'
 import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
+import type { Context } from '@deepseek-ai/cordis'
 import { load } from 'js-yaml'
 
 export type { EntryOptions }
@@ -27,6 +28,12 @@ export interface LoaderRow {
 /** The Loader surface the manager reads (the real Loader service satisfies it). */
 export interface LoaderLike {
   entries(): Iterable<LoaderRow>
+}
+
+/** The Loader surface the Feature Runtime Wrapper mounts children through. */
+export interface LoaderCreateLike {
+  create(options: EntryOptions): Promise<string>
+  remove(id: string): Promise<void>
 }
 
 /**
@@ -96,4 +103,63 @@ export function findLoaderRow(loader: LoaderLike, rootEntryId: string): LoaderRo
  */
 export function fiberStateOf(loaderRow: LoaderRow | undefined): number | undefined {
   return loaderRow?.fiber?.state
+}
+
+/** The numeric ACTIVE fiber state; Cordis's const enum has no runtime object (mirrored like app-boot). */
+const FIBER_STATE_ACTIVE = 2
+
+/**
+ * Whether one projected fiber state is ACTIVE. Workbench concern: the `ready`
+ * health requires the mounted wrapper row to be active, not merely present;
+ * Cordis mechanism: `FiberState.ACTIVE` — the const enum has no runtime
+ * object, so the numeric value is mirrored here exactly as app-boot mirrors it.
+ * @param state - the projected numeric fiber state.
+ * @returns true only for the ACTIVE state.
+ */
+export function isActiveFiberState(state: number | undefined): boolean {
+  return state === FIBER_STATE_ACTIVE
+}
+
+/**
+ * Read the already-composed feature rows of one wrapper entry. Workbench
+ * concern: the Feature Runtime Wrapper mounting its `insert` children — the
+ * rows the runtime layer nested under the wrapper parent row; Cordis
+ * mechanism: the loader `Entry` carrying the layer's full options (including
+ * `insert`) on `ctx.fiber.entry`, so the wrapper mounts exactly what the
+ * manager staged.
+ * @param ctx - the wrapper plugin's context (its fiber owns the loader entry).
+ * @returns the mounted child rows, or undefined when the entry carries none.
+ */
+export function wrapperChildrenOf(ctx: Context): EntryOptions[] | undefined {
+  const entry = (ctx.fiber as unknown as { entry?: { options?: { insert?: EntryOptions[] } } }).entry
+  const children = entry?.options?.insert
+  return Array.isArray(children) && children.length > 0 ? children : undefined
+}
+
+/**
+ * Mount one wrapper entry's feature rows as Loader entries. Workbench concern:
+ * the Feature Runtime Wrapper parent mounting its already-composed children so
+ * each keeps its own Loader entry and fiber; Cordis mechanism: `Loader.create`
+ * — the loader service the wrapper's context inherits — with each child row
+ * created as an independent entry. The returned disposer removes every mounted
+ * child in reverse mount order.
+ * @param ctx - the wrapper plugin's context (inherits the Loader service).
+ * @param children - the feature rows to mount.
+ * @returns a disposer that removes the mounted children.
+ * @throws {Error} when the Loader service is unavailable.
+ */
+export async function mountWrapperChildren(ctx: Context, children: readonly EntryOptions[]): Promise<() => Promise<void>> {
+  const loader = ctx.get('loader') as LoaderCreateLike | undefined
+  if (loader === undefined) {
+    throw new Error('page-app wrapper: the Loader service is unavailable to mount feature rows')
+  }
+  const mounted: string[] = []
+  for (const child of children) {
+    mounted.push(await loader.create({ ...child }))
+  }
+  return async () => {
+    for (const id of mounted.splice(0).reverse()) {
+      await loader.remove(id)
+    }
+  }
 }

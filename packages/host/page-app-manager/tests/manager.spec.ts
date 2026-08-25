@@ -25,6 +25,8 @@ interface LoaderRow {
   name: string
   fiberState?: number
   config?: Record<string, unknown>
+  inject?: readonly string[]
+  insert?: readonly unknown[]
 }
 
 function writeManagerDir(registry: unknown): void {
@@ -32,15 +34,47 @@ function writeManagerDir(registry: unknown): void {
   writeFileSync(join(dir, '.workspace-manager', 'registry.json'), JSON.stringify(registry))
 }
 
-/** One fake loader entry: the manager reads options.id/name and fiber.state. */
+/** Stage the installed manager package that owns the wrapper module. */
+function writeManagerPackage(): void {
+  const pkgDir = join(dir, 'node_modules', '@deepseek-ai', 'dsh-page-app-manager')
+  mkdirSync(pkgDir, { recursive: true })
+  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: '@deepseek-ai/dsh-page-app-manager', version: '0.1.1-rc.2' }))
+}
+
+/** One fake loader entry: the manager reads options.id/name/inject/insert/config and fiber.state. */
 function loaderEntry(row: LoaderRow): { options: Record<string, unknown>; fiber: { state?: number } | undefined } {
   return {
     options: {
       id: row.id,
       name: row.name,
+      ...row.inject === undefined ? {} : { inject: row.inject },
+      ...row.insert === undefined ? {} : { insert: row.insert },
       ...row.config === undefined ? {} : { config: row.config },
     },
     fiber: row.fiberState === undefined ? undefined : { state: row.fiberState },
+  }
+}
+
+/** The exact Feature Runtime Wrapper row the manager derives for the fixture row. */
+function wrapperRowOf(overrides: Record<string, unknown> = {}): {
+  id: string
+  name: string
+  inject: readonly string[]
+  config: Record<string, unknown>
+  insert: readonly unknown[]
+} {
+  return {
+    id: 'page-app.wrapper.workspace.managed',
+    name: '@deepseek-ai/dsh-page-app-manager/wrapper',
+    inject: ['workbenchRuntime'],
+    config: {
+      packageName: PKG,
+      pageId: 'workspace.managed',
+      rootEntryId: ROOT_ID,
+      contractVersion: 1,
+    },
+    insert: [{ id: ROOT_ID, name: `${PKG}/client` }],
+    ...overrides,
   }
 }
 
@@ -134,11 +168,12 @@ describe('manager snapshot', () => {
     expect(snapshot.entries[0]?.packageName).toBe(PKG)
   })
 
-  it('derives ready when the installed package and runtime root match the committed row', () => {
+  it('derives ready when the installed package and the active hash-matching wrapper row match the committed row', () => {
     writeInstalledPackage()
+    writeManagerPackage()
     const { manager } = buildManager({
       registry: writeRegistryRow(),
-      loaderRows: [{ id: ROOT_ID, name: `${PKG}/client`, fiberState: 2 }],
+      loaderRows: [{ ...wrapperRowOf(), fiberState: 2 }],
     })
     expect(manager.snapshot().entries[0]?.health).toBe('ready')
   })
@@ -165,8 +200,9 @@ describe('manager snapshot', () => {
     expect(manager.snapshot().entries[0]?.health).toBe('invalid-manifest')
   })
 
-  it('derives activation-failed when the runtime root is absent or fiberless', () => {
+  it('derives activation-failed when the wrapper row is absent or fiberless', () => {
     writeInstalledPackage()
+    writeManagerPackage()
     const { manager } = buildManager({
       registry: writeRegistryRow(),
       loaderRows: [{ id: 'some-other-id', name: `${PKG}/client`, fiberState: 2 }],
@@ -174,11 +210,12 @@ describe('manager snapshot', () => {
     expect(manager.snapshot().entries[0]?.health).toBe('activation-failed')
   })
 
-  it('derives externally-overridden when a user patch changes the managed root', () => {
+  it('derives externally-overridden when a user patch changes the wrapper row', () => {
     writeInstalledPackage()
+    writeManagerPackage()
     const { manager } = buildManager({
       registry: writeRegistryRow(),
-      loaderRows: [{ id: ROOT_ID, name: `${PKG}/client`, fiberState: 2, config: { enabled: false } }],
+      loaderRows: [{ ...wrapperRowOf(), config: { enabled: false }, fiberState: 2 }],
     })
     expect(manager.snapshot().entries[0]?.health).toBe('externally-overridden')
   })
@@ -197,5 +234,43 @@ describe('manager snapshot', () => {
       journal: { schemaVersion: 1, phase: 'staged', lockOwnerToken: 'token-1', files: {} },
     })
     expect(manager.snapshot().operation).toEqual({ phase: 'staged' })
+  })
+
+  it('derives missing-manager when the wrapper module is unresolvable', () => {
+    // The feature is installed and statically valid, but the manager package
+    // that owns the wrapper module is not installed in the profile.
+    writeInstalledPackage()
+    const { manager } = buildManager({ registry: writeRegistryRow(), loaderRows: [] })
+    expect(manager.snapshot().entries[0]?.health).toBe('missing-manager')
+  })
+
+  it('health projects ready only when the wrapper row is active and hash-matching', () => {
+    writeInstalledPackage()
+    writeManagerPackage()
+    const wrapper = wrapperRowOf()
+    const active = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ ...wrapper, fiberState: 2 }],
+    })
+    expect(active.manager.snapshot().entries[0]?.health).toBe('ready')
+
+    // A wrapper row whose effective options differ from the derived row (a
+    // user patch rewrote its config) is externally overridden, not ready.
+    const overridden = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{
+        ...wrapper,
+        config: { ...wrapper.config, packageName: '@fixture/other' },
+        fiberState: 2,
+      }],
+    })
+    expect(overridden.manager.snapshot().entries[0]?.health).toBe('externally-overridden')
+
+    // A wrapper row that is mounted but still pending is not ready.
+    const pending = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ ...wrapper, fiberState: 0 }],
+    })
+    expect(pending.manager.snapshot().entries[0]?.health).toBe('activation-failed')
   })
 })

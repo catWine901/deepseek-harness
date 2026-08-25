@@ -565,7 +565,7 @@ describe('M2 rollback live-tree restoration, journal guard, and expected-root ha
     expect(request.expectedRoots[0]).toMatchObject({
       packageName: PKG,
       pageId: 'workspace.valid',
-      rootEntryId: 'workspace.valid',
+      rootEntryId: 'page-app.wrapper.workspace.valid',
     })
     expect(request.expectedRoots[0]?.hash).toMatch(/^[0-9a-f]{64}$/)
   })
@@ -610,7 +610,7 @@ describe('M2 rollback live-tree restoration, journal guard, and expected-root ha
     expect(request.expectedRoots[0]).toMatchObject({
       packageName: PKG,
       pageId: 'workspace.valid',
-      rootEntryId: 'workspace.valid',
+      rootEntryId: 'page-app.wrapper.workspace.valid',
     })
     expect(request.expectedRoots[0]?.hash).toMatch(/^[0-9a-f]{64}$/)
     expect(request.expectedRoots[0]?.hash).not.toBe('')
