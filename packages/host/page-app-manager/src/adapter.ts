@@ -16,6 +16,7 @@ import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import type { Context } from '@deepseek-ai/cordis'
 import { load } from 'js-yaml'
+import type { PageAppRuntimeStateLabel } from './types.ts'
 
 export type { EntryOptions }
 
@@ -105,8 +106,13 @@ export function fiberStateOf(loaderRow: LoaderRow | undefined): number | undefin
   return loaderRow?.fiber?.state
 }
 
-/** The numeric ACTIVE fiber state; Cordis's const enum has no runtime object (mirrored like app-boot). */
+/** The `FiberState` member values; Cordis's const enum has no runtime object (mirrored like app-boot). */
+const FIBER_STATE_PENDING = 0
+const FIBER_STATE_LOADING = 1
 const FIBER_STATE_ACTIVE = 2
+const FIBER_STATE_FAILED = 3
+const FIBER_STATE_DISPOSED = 4
+const FIBER_STATE_UNLOADING = 5
 
 /**
  * Whether one projected fiber state is ACTIVE. Workbench concern: the `ready`
@@ -118,6 +124,27 @@ const FIBER_STATE_ACTIVE = 2
  */
 export function isActiveFiberState(state: number | undefined): boolean {
   return state === FIBER_STATE_ACTIVE
+}
+
+/**
+ * Project one projected fiber state to its semantic label. Workbench concern:
+ * the `runtimeState` health surface; Cordis mechanism: the `FiberState` enum —
+ * a const enum with no runtime object, so the member values are mirrored here
+ * member-by-member, never reverse-looked-up; `DISPOSED` (a terminal state)
+ * collapses into `failed` until the next generation remounts the root.
+ * @param state - the projected numeric fiber state.
+ * @returns the semantic label, or undefined for an unknown or absent state.
+ */
+export function fiberStateLabelOf(state: number | undefined): PageAppRuntimeStateLabel | undefined {
+  switch (state) {
+    case FIBER_STATE_PENDING: return 'pending'
+    case FIBER_STATE_LOADING: return 'loading'
+    case FIBER_STATE_ACTIVE: return 'active'
+    case FIBER_STATE_FAILED: return 'failed'
+    case FIBER_STATE_DISPOSED: return 'failed'
+    case FIBER_STATE_UNLOADING: return 'unloading'
+    default: return undefined
+  }
 }
 
 /**

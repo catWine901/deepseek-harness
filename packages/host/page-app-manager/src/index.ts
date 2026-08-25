@@ -17,7 +17,7 @@ import { join } from 'node:path'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
-import { composePatchRows, findLoaderRow, fiberStateOf, isActiveFiberState, managedRootHash, type EntryOptions, type LoaderLike } from './adapter.ts'
+import { composePatchRows, fiberStateLabelOf, findLoaderRow, fiberStateOf, isActiveFiberState, managedRootHash, type EntryOptions, type LoaderLike } from './adapter.ts'
 import {
   loadOverlayPatches,
   managedRootWrapperId,
@@ -35,7 +35,7 @@ import {
   type PageAppRegistryEntry,
   type PageAppRegistryV1,
 } from '@deepseek-ai/dsh-page-app-profile'
-import type { PageAppClientInstanceId, PageAppManagerConfig, PageAppTransactionId } from './types.ts'
+import type { PageAppClientInstanceId, PageAppJournalPhase, PageAppManagerConfig, PageAppOperationState, PageAppOperationView, PageAppRuntimeStateLabel, PageAppTransactionId } from './types.ts'
 import type { PageAppManagerSnapshot, PageAppView, PageAppInstallSource } from './types.ts'
 import { parsePageAppInstallSource } from './source.ts'
 import { PageAppLifecycle } from './transaction.ts'
@@ -73,7 +73,7 @@ interface RowRuntimeFacts {
 function deriveHealth(
   entry: PageAppRegistryEntry,
   facts: RowRuntimeFacts,
-): { health: PageAppView['health']; runtimeState?: string; lastError?: string } {
+): { health: PageAppView['health']; runtimeState?: PageAppRuntimeStateLabel; lastError?: string } {
   if (!entry.enabled) return { health: 'disabled' }
   if (facts.installedVersion === undefined) {
     return { health: 'missing-dependency', lastError: 'the package dependency is not installed in this profile' }
@@ -87,13 +87,21 @@ function deriveHealth(
   if (!facts.wrapperResolvable) {
     return { health: 'missing-manager', lastError: 'the page-app manager wrapper is not installed in this profile' }
   }
-  if (facts.loaderRow === undefined || !isActiveFiberState(facts.loaderRow.fiberState)) {
+  if (facts.loaderRow === undefined) {
     return { health: 'activation-failed', lastError: 'the managed wrapper row is not mounted with an active fiber in the runtime tree' }
   }
-  if (!facts.loaderRow.hashMatches) {
-    return { health: 'externally-overridden', lastError: 'a user patch configures, disables, or replaces the managed wrapper row' }
+  // Every row that maps to a loader fiber exposes its current semantic label;
+  // health still gates on ACTIVE plus the exact managed-root hash. A fiberless
+  // row omits the label (exactOptionalPropertyTypes keeps the property absent).
+  const runtimeState = fiberStateLabelOf(facts.loaderRow.fiberState)
+  const label = runtimeState === undefined ? {} : { runtimeState }
+  if (!isActiveFiberState(facts.loaderRow.fiberState)) {
+    return { health: 'activation-failed', lastError: 'the managed wrapper row is not mounted with an active fiber in the runtime tree', ...label }
   }
-  return { health: 'ready', runtimeState: String(facts.loaderRow.fiberState) }
+  if (!facts.loaderRow.hashMatches) {
+    return { health: 'externally-overridden', lastError: 'a user patch configures, disables, or replaces the managed wrapper row', ...label }
+  }
+  return { health: 'ready', ...label }
 }
 
 /** Sync read of the ownership authority; a missing file is a normal empty state. */
@@ -281,7 +289,8 @@ export class PageAppManager extends TypertRemoteService {
   public snapshot(): PageAppManagerSnapshot {
     const profile = this.profileRuntime.identity
     const { registry, recoveryError } = readRegistrySync(profile.directory)
-    const operation = readJournalOperation(profile.directory)
+    const recoveryVisible = recoveryError !== undefined
+    const operation = readJournalOperation(profile.directory, recoveryVisible)
     const loader = this.ctx.get('loader')
     const entries = registry === null
       ? []
@@ -291,7 +300,7 @@ export class PageAppManager extends TypertRemoteService {
       revision: registry?.revision ?? 0,
       entries: Object.freeze(entries),
       operation,
-      recovery: recoveryError === undefined ? null : Object.freeze({ message: recoveryError }),
+      recovery: recoveryVisible ? Object.freeze({ message: recoveryError }) : null,
     })
   }
 
@@ -418,23 +427,44 @@ export class PageAppManager extends TypertRemoteService {
   }
 }
 
-/** Read the durable journal phase as the in-flight operation view. */
-function readJournalOperation(profileDir: string): { phase: 'prepared' | 'staged' | 'committing' } | null {
-  const paths = resolvePageAppProfilePaths(profileDir)
-  let content: string
+/** Operation state projected per journal phase (the mapping table; every phase maps, so an invalid combination is a projection bug). */
+const OPERATION_STATE_BY_PHASE: Record<PageAppJournalPhase, Extract<PageAppOperationState, 'installing' | 'active'>> = {
+  prepared: 'installing',
+  staged: 'installing',
+  committing: 'active',
+}
+
+/**
+ * The durable journal phase, when one exists (a missing or unreadable journal —
+ * the mutation path fails closed on the parser — is no phase).
+ */
+function readJournalPhase(profileDir: string): PageAppJournalPhase | undefined {
   try {
-    content = readFileSync(paths.journal, 'utf8')
+    return parsePageAppJournal(JSON.parse(readFileSync(resolvePageAppProfilePaths(profileDir).journal, 'utf8'))).phase
   } catch {
-    // No journal (or an unreadable one — the mutation path fails closed on the
-    // parser) means no operation in flight.
-    return null
+    return undefined
   }
-  try {
-    const journal = parsePageAppJournal(JSON.parse(content))
-    return { phase: journal.phase }
-  } catch {
-    return null
+}
+
+/**
+ * Project the in-flight operation view from the durable journal and registry
+ * recovery facts (mapping table): no journal and no recovery → null;
+ * prepared/staged → installing; committing → active; a visible recovery →
+ * recovery-required (carrying the journal phase when one explains it). No
+ * persisted fields are added; `removing`/`install-failed`/`remove-failed`
+ * stay members of the closed `PageAppOperationState` union that current facts
+ * never produce.
+ * @param profileDir - absolute profile directory (journal resolution anchor).
+ * @param recoveryVisible - whether the registry read surfaced a recovery error.
+ * @returns the operation view, or null when nothing is in flight.
+ */
+function readJournalOperation(profileDir: string, recoveryVisible: boolean): PageAppOperationView | null {
+  const phase = readJournalPhase(profileDir)
+  if (recoveryVisible) {
+    return phase === undefined ? { state: 'recovery-required' } : { state: 'recovery-required', phase }
   }
+  if (phase === undefined) return null
+  return { state: OPERATION_STATE_BY_PHASE[phase], phase }
 }
 
 /** Stable Cordis plugin name. */
