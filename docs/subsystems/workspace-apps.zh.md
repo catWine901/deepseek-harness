@@ -33,6 +33,9 @@ Generated from source by `scripts/gen-cordis-catalog.ts` (verified fresh by `pnp
 Build the Host page-app manager service. Extends `TypertRemoteService` so the generated `pageAppManager` namespace exposes the mutation API; the read projection and staged validation are plain methods on the same service.
 
 ```ts cordis-catalog
+/** Abort the in-flight transaction; wired to the manager fiber's effect. */
+public dispose(): void
+
 /**
  * The full read-only projection of the managed set. The registry is the
  * ownership authority; health is derived from current dependency, version,
@@ -43,20 +46,25 @@ Build the Host page-app manager service. Extends `TypertRemoteService` so the ge
 @Remote('list') public list(): PageAppManagerSnapshot
 
 /**
- * Install one managed package (the Remote entry of the Settings add-flow).
+ * Install one managed package (exposed as the `installPackage` Remote of the
+ * Settings add-flow; the gateway namespace service reserves the `install`
+ * member on its prototype, so the wire method cannot reuse that spelling
+ * while the internal lifecycle method keeps the `install` name).
  * @param source - the validated install source.
  * @param clientInstanceId - the opaque initiating client instance.
+ * @param signal - cancellation; aborts pnpm and the activation wait.
  * @returns the committed registry revision.
  */
-@Remote('install') public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<number>
+@Remote('installPackage') public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId, signal: AbortSignal): Promise<number>
 
 /**
  * Enable or disable one managed page.
  * @param pageId - the managed page id.
  * @param enabled - the new enabled state.
+ * @param signal - cancellation; honored by the shared lock.
  * @returns the committed registry revision.
  */
-@Remote('setEnabled') public setEnabled(pageId: string, enabled: boolean): Promise<number>
+@Remote('setEnabled') public setEnabled(pageId: string, enabled: boolean, signal: AbortSignal): Promise<number>
 
 /**
  * Hide or show one managed page (presentation only).
@@ -76,9 +84,10 @@ Build the Host page-app manager service. Extends `TypertRemoteService` so the ge
 /**
  * Uninstall one managed page from the current profile.
  * @param pageId - the managed page id.
+ * @param signal - cancellation; aborts pnpm and the activation wait.
  * @returns the committed registry revision.
  */
-@Remote('uninstall') public uninstall(pageId: string): Promise<number>
+@Remote('uninstall') public uninstall(pageId: string, signal: AbortSignal): Promise<number>
 
 /**
  * Acknowledge a pending targeted client activation. Only the first valid
@@ -118,6 +127,14 @@ public validateInstall(source: string | PageAppInstallSource): { source: PageApp
 ```
 
 Source: [`packages/host/page-app-manager/src/index.ts`](../../packages/host/page-app-manager/src/index.ts)
+
+<a id="ctxworkbenchruntime--workbenchruntime"></a>
+
+### `ctx.workbenchRuntime` — `WorkbenchRuntime`
+
+The Feature-facing domain API the manager provides.
+
+Source: [`packages/host/page-app-manager/src/workbench-runtime.ts`](../../packages/host/page-app-manager/src/workbench-runtime.ts)
 
 <a id="page-app-manager-events"></a>
 

@@ -1083,21 +1083,26 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
     description: 'Build the Host page-app manager service. Extends `TypertRemoteService` so the generated `pageAppManager` namespace exposes the mutation API; the read projection and staged validation are plain methods on the same service.',
     methods: [
       {
+        signature: 'public dispose(): void',
+        description: 'Abort the in-flight transaction; wired to the manager fiber\'s effect.',
+        parameters: [],
+      },
+      {
         signature: '@Remote(\'list\') public list(): PageAppManagerSnapshot',
         description: 'The full read-only projection of the managed set. The registry is the ownership authority; health is derived from current dependency, version, and runtime facts. Plugin Inventory and unrelated Loader rows never create entries.',
         parameters: [],
         returns: 'the immutable snapshot.',
       },
       {
-        signature: '@Remote(\'install\') public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId): Promise<number>',
-        description: 'Install one managed package (the Remote entry of the Settings add-flow).',
-        parameters: [{ name: 'source', description: 'the validated install source.' }, { name: 'clientInstanceId', description: 'the opaque initiating client instance.' }],
+        signature: '@Remote(\'installPackage\') public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId, signal: AbortSignal): Promise<number>',
+        description: 'Install one managed package (exposed as the `installPackage` Remote of the Settings add-flow; the gateway namespace service reserves the `install` member on its prototype, so the wire method cannot reuse that spelling while the internal lifecycle method keeps the `install` name).',
+        parameters: [{ name: 'source', description: 'the validated install source.' }, { name: 'clientInstanceId', description: 'the opaque initiating client instance.' }, { name: 'signal', description: 'cancellation; aborts pnpm and the activation wait.' }],
         returns: 'the committed registry revision.',
       },
       {
-        signature: '@Remote(\'setEnabled\') public setEnabled(pageId: string, enabled: boolean): Promise<number>',
+        signature: '@Remote(\'setEnabled\') public setEnabled(pageId: string, enabled: boolean, signal: AbortSignal): Promise<number>',
         description: 'Enable or disable one managed page.',
-        parameters: [{ name: 'pageId', description: 'the managed page id.' }, { name: 'enabled', description: 'the new enabled state.' }],
+        parameters: [{ name: 'pageId', description: 'the managed page id.' }, { name: 'enabled', description: 'the new enabled state.' }, { name: 'signal', description: 'cancellation; honored by the shared lock.' }],
         returns: 'the committed registry revision.',
       },
       {
@@ -1113,9 +1118,9 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the committed registry revision.',
       },
       {
-        signature: '@Remote(\'uninstall\') public uninstall(pageId: string): Promise<number>',
+        signature: '@Remote(\'uninstall\') public uninstall(pageId: string, signal: AbortSignal): Promise<number>',
         description: 'Uninstall one managed page from the current profile.',
-        parameters: [{ name: 'pageId', description: 'the managed page id.' }],
+        parameters: [{ name: 'pageId', description: 'the managed page id.' }, { name: 'signal', description: 'cancellation; aborts pnpm and the activation wait.' }],
         returns: 'the committed registry revision.',
       },
       {
@@ -2364,6 +2369,38 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         description: 'Render one index.html body: the structured injection table first, then the raw `tapIndex` transforms over the result.',
         parameters: [{ name: 'html', description: 'the raw index.html body.' }],
         returns: 'the transformed body.',
+      },
+    ],
+  },
+  {
+    key: 'workbenchRuntime',
+    summary: 'The Feature-facing domain API the manager provides.',
+    description: 'The Feature-facing domain API the manager provides.',
+    methods: [
+      {
+        signature: 'readonly lifecycle: { /** * Register one disposal callback that runs when the runtime fiber unloads. * @param callback - the callback to run at disposal. * @returns a disposer that removes the callback. */ onDispose(callback: () => void): () => void }',
+        description: 'Lifecycle disposal: every side effect a Feature registers releases with the runtime.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly surfaces: { /** * Register one workspace surface seat. The returned disposer removes the * registration; the runtime records the owning package provenance. * @param registration - page id, owning package, and the surface render. * @returns a disposer that removes the registration. */ registerWorkspaceSurface(registration: WorkbenchSurfaceRegistration): () => void /** Every live surface registration, in registration order. */ list(): readonly WorkbenchSurfaceRegistration[] }',
+        description: 'Workspace-surface registration: the contract\'s single surface entry.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly events: WorkbenchEventSubscription',
+        description: 'Runtime events: the Feature subscribes through the contract, never Cordis.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly storage: { /** Read one stored value (undefined when absent). */ get(key: string): unknown /** Store one value under a key. */ set(key: string, value: unknown): void }',
+        description: 'Keyed storage the runtime owns per fiber.',
+        parameters: [],
+      },
+      {
+        signature: 'readonly host: { /** * Call one Host capability. Contract v1 keeps the seam but wires no * capability yet: the fixture migration (M9) registers the surface * lifecycle behind this face, so an unknown method fails loud instead of * silently no-oping. * @param method - the capability name. * @param args - the capability arguments. * @returns the capability result. * @throws {Error} naming the unwired method. */ call(method: string, ...args: unknown[]): Promise<unknown> }',
+        description: 'Host call seam: the Feature invokes Host capabilities by name.',
+        parameters: [],
       },
     ],
   },
@@ -3895,11 +3932,11 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'PageAppClientInstanceId',
-    declaration: 'export type PageAppClientInstanceId = string & {\n    readonly __pageAppClientInstance: true;\n};',
+    declaration: 'export type PageAppClientInstanceId = Branded<\'PageAppClientInstanceId\'>;',
   },
   {
     name: 'PageAppHealth',
-    declaration: 'export type PageAppHealth = \'ready\' | \'disabled\' | \'missing-dependency\' | \'version-drift\' | \'invalid-manifest\' | \'activation-failed\' | \'externally-overridden\' | \'recovery-required\';',
+    declaration: 'export type PageAppHealth = \'ready\' | \'disabled\' | \'missing-dependency\' | \'version-drift\' | \'invalid-manifest\' | \'missing-manager\' | \'activation-failed\' | \'externally-overridden\' | \'recovery-required\';',
   },
   {
     name: 'PageAppInstallSource',
@@ -3910,8 +3947,12 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface PageAppManagerSnapshot {\n    readonly profile: PageAppProfileIdentity;\n    readonly revision: number;\n    readonly entries: readonly PageAppView[];\n    readonly operation: PageAppOperationView | null;\n    readonly recovery: PageAppRecoveryView | null;\n}',
   },
   {
+    name: 'PageAppOperationState',
+    declaration: 'export type PageAppOperationState = \'installing\' | \'active\' | \'removing\' | \'install-failed\' | \'remove-failed\' | \'recovery-required\';',
+  },
+  {
     name: 'PageAppOperationView',
-    declaration: 'export interface PageAppOperationView {\n    readonly phase: PageAppJournalPhase;\n}',
+    declaration: 'export interface PageAppOperationView {\n    readonly state: PageAppOperationState;\n    readonly phase?: PageAppJournalPhase;\n}',
   },
   {
     name: 'PageAppProfileIdentity',
@@ -3922,12 +3963,16 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface PageAppRecoveryView {\n    readonly message: string;\n}',
   },
   {
+    name: 'PageAppRuntimeStateLabel',
+    declaration: 'export type PageAppRuntimeStateLabel = \'pending\' | \'loading\' | \'active\' | \'failed\' | \'unloading\';',
+  },
+  {
     name: 'PageAppTransactionId',
-    declaration: 'export type PageAppTransactionId = string & {\n    readonly __pageAppTransaction: true;\n};',
+    declaration: 'export type PageAppTransactionId = Branded<\'PageAppTransactionId\'>;',
   },
   {
     name: 'PageAppView',
-    declaration: 'export interface PageAppView {\n    readonly packageName: string;\n    readonly source: PageAppRegistrySource;\n    readonly resolvedVersion: string;\n    readonly page: PageAppPageFields;\n    readonly order: number;\n    readonly enabled: boolean;\n    readonly hidden: boolean;\n    readonly installedAt: string;\n    readonly updatedAt: string;\n    readonly health: PageAppHealth;\n    readonly runtimeState?: string;\n    readonly lastError?: string;\n}',
+    declaration: 'export interface PageAppView {\n    readonly packageName: string;\n    readonly source: PageAppRegistrySource;\n    readonly resolvedVersion: string;\n    readonly page: PageAppPageFields;\n    readonly order: number;\n    readonly enabled: boolean;\n    readonly hidden: boolean;\n    readonly installedAt: string;\n    readonly updatedAt: string;\n    readonly health: PageAppHealth;\n    readonly runtimeState?: PageAppRuntimeStateLabel;\n    readonly lastError?: string;\n}',
   },
   {
     name: 'PermissionSelect',
@@ -5128,6 +5173,14 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'WebUpgradeRoute',
     declaration: 'export interface WebUpgradeRoute {\n    path: string;\n    handler: (req: IncomingMessage, socket: Duplex, head: Buffer) => void | Promise<void>;\n}',
+  },
+  {
+    name: 'WorkbenchEventSubscription',
+    declaration: 'export interface WorkbenchEventSubscription {\n    on(name: string, listener: (payload: unknown) => void): () => void;\n    emit(name: string, payload?: unknown): void;\n}',
+  },
+  {
+    name: 'WorkbenchSurfaceRegistration',
+    declaration: 'export interface WorkbenchSurfaceRegistration {\n    readonly pageId: string;\n    readonly packageName: string;\n    readonly render?: unknown;\n}',
   },
   {
     name: 'WorkflowAgentEndInfo',
