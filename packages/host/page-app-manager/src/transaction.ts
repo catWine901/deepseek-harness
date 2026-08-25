@@ -21,7 +21,8 @@ import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
-import { canonicalManagedRootHash, type ExpectedManagedRoot } from '@deepseek-ai/dsh-app-boot'
+import { type ExpectedManagedRoot } from '@deepseek-ai/dsh-app-boot'
+import { managedRootHash } from './adapter.ts'
 import {
   advancePageAppJournalPhase,
   parsePageAppRegistry,
@@ -412,7 +413,7 @@ export class PageAppLifecycle {
         packageName: entry.packageName,
         pageId: entry.page.id,
         rootEntryId: row.rootEntryId,
-        hash: canonicalManagedRootHash(row.rootRow),
+        hash: managedRootHash(row.rootRow),
       })
     }
     return {
@@ -600,7 +601,8 @@ function composedManagedRow(
 /**
  * Derive the runtime-audit expectations for one registry (rollback/recovery
  * restore paths recompute them from the journal's before-state). Hashes are
- * `canonicalManagedRootHash` of the composed root row — never empty.
+ * `managedRootHash` (the adapter's `canonicalManagedRootHash` delegate) of the
+ * composed root row — never empty.
  * @param profileDir - absolute profile directory (resolution anchor).
  * @param registry - the registry to derive enabled roots from.
  * @returns one expectation per enabled, statically valid row.
@@ -616,7 +618,7 @@ export function derivePageAppExpectedRoots(profileDir: string, registry: PageApp
       packageName: entry.packageName,
       pageId: entry.page.id,
       rootEntryId: row.rootEntryId,
-      hash: canonicalManagedRootHash(row.rootRow),
+      hash: managedRootHash(row.rootRow),
     })
   }
   return expectedRoots

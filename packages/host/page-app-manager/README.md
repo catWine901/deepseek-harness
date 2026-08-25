@@ -6,6 +6,14 @@ Host-side Workspace Apps manager: the read-only ownership projection, install-so
 
 `PageAppManager` extends the Typert Remote service `pageAppManager`. Every mutation runs inside the shared profile mutation lock and writes a prepared journal plus private before-state backups before any owned file changes; a failed transaction rolls back by restoring the prior live Include tree through `ProfileRuntime.restoreManagerLayer` (with real expected-root hashes) before converging files, and a failed restore retains the journal as `recovery-required`. The operator `recover()` Remote resolves it under the same shared lock: a commit is finished when the registry changed at `committing`, otherwise the live layer is restored from the journal before-state and pnpm converges. A new transaction is refused while a journal exists — the operator must recover first. The generated Host and Client Remote artifacts are exposed by `./typert` and `./remote`.
 
+## Cordis Adapter
+
+Manager product code touches Cordis only through `src/adapter.ts`, the sole runtime-import location for `@deepseek-ai/cordis`, `@deepseek-ai/cordis-plugin-loader`, and `@deepseek-ai/cordis-plugin-include`; a type-only `Context` import (the plugin signature) is the only exception. The adapter exposes the Cordis state the manager reads and delegates to the vendored surfaces it wraps: `managedRootHash` (expected-root hashes, delegating to `canonicalManagedRootHash`), `composePatchRows` (bundle patch composition over an empty root, delegating to Include's `applyEntryPatches`), `parseEntryList` (the include's `!!js` entry-list YAML dialect), `findLoaderRow` (Loader row lookup through `loader.entries()`), and `fiberStateOf` (a row's numeric `FiberState`).
+
+Compatibility promise: every delegation is behavior-preserving — the adapter spec pins each one against the vendored Cordis surface it wraps, and the import gate (also pinned in `tests/adapter.spec.ts`) keeps every other product file Cordis-free at runtime, so a Cordis API change is absorbed in `adapter.ts` only.
+
+The three Cordis peers are required, not optional: the adapter runtime-imports `cordis-plugin-include` at module load, so an absent peer would fail the manager module itself. No optional-runtime contract exists to preserve — `verify-optional-dependency-imports` enforces that a declared-optional package is never loaded at module scope.
+
 ## Cancellation and the activation handshake
 
 The mutating Remote methods `install`, `setEnabled`, and `uninstall` carry a final `signal: AbortSignal`. The signal flows into the transaction and aborts profile-local pnpm and the targeted client activation wait; the transaction signal is additionally merged with the manager fiber's lifecycle controller, so a manager reload aborts an in-flight transaction instead of orphaning it. `setHidden`, `reorder`, `ackClientActivation`, `recover`, and `list` are unchanged.

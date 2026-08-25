@@ -16,11 +16,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Loader } from '@deepseek-ai/cordis-plugin-loader'
-import { applyEntryPatches } from '@deepseek-ai/cordis-plugin-include'
 import { z } from 'zod'
+import { composePatchRows, findLoaderRow, fiberStateOf, managedRootHash, type LoaderLike } from './adapter.ts'
 import {
-  canonicalManagedRootHash,
   loadOverlayPatches,
   PROFILE_RUNTIME_SERVICE,
   type ProfileRuntime,
@@ -318,7 +316,7 @@ export class PageAppManager extends TypertRemoteService {
   }
 
   /** Project one registry row into its view with derived health. */
-  private viewOf(row: PageAppRegistryEntry, loader: Loader | undefined): PageAppView {
+  private viewOf(row: PageAppRegistryEntry, loader: LoaderLike | undefined): PageAppView {
     const profile = this.profileRuntime.identity
     const nodeModules = join(profile.directory, 'node_modules', row.packageName)
     const facts: RowRuntimeFacts = this.factsOf(row, nodeModules, loader)
@@ -340,7 +338,7 @@ export class PageAppManager extends TypertRemoteService {
   }
 
   /** Collect the current dependency/version/manifest/bundle/runtime facts of one row. */
-  private factsOf(row: PageAppRegistryEntry, packageDir: string, loader: Loader | undefined): RowRuntimeFacts {
+  private factsOf(row: PageAppRegistryEntry, packageDir: string, loader: LoaderLike | undefined): RowRuntimeFacts {
     let installedPkg: { version?: unknown; dsh?: { bundle?: { patch?: unknown } } } | undefined
     try {
       installedPkg = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8')) as typeof installedPkg
@@ -369,10 +367,10 @@ export class PageAppManager extends TypertRemoteService {
     try {
       if (typeof patch !== 'string' || patch === '') throw new Error('no bundle patch')
       const patches = loadOverlayPatches('page-app', join(packageDir, patch))
-      const rows = applyEntryPatches([], structuredClone(patches), () => {})
+      const rows = composePatchRows(patches)
       const rootRow = rows.find(candidate => candidate.id === row.page.rootEntryId)
       if (rootRow === undefined) throw new Error('root row missing')
-      expectedRootHash = canonicalManagedRootHash(rootRow)
+      expectedRootHash = managedRootHash(rootRow)
     } catch {
       bundleValid = false
     }
@@ -380,12 +378,12 @@ export class PageAppManager extends TypertRemoteService {
     if (loader === undefined || expectedRootHash === undefined) {
       loaderRow = undefined
     } else {
-      const found = [...loader.entries()].find(candidate => candidate.options.id === row.page.rootEntryId)
+      const found = findLoaderRow(loader, row.page.rootEntryId)
       loaderRow = found === undefined
         ? undefined
         : {
-          fiberState: found.fiber?.state,
-          hashMatches: canonicalManagedRootHash(found.options) === expectedRootHash,
+          fiberState: fiberStateOf(found),
+          hashMatches: managedRootHash(found.options) === expectedRootHash,
         }
     }
     return { installedVersion, manifestValid, bundleValid, expectedRootHash, loaderRow }

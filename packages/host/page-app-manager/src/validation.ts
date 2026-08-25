@@ -9,9 +9,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join, relative, resolve, sep } from 'node:path'
-import { load } from 'js-yaml'
-import { applyEntryPatches, entryListSchema } from '@deepseek-ai/cordis-plugin-include'
-import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
+import { composePatchRows, parseEntryList, type EntryOptions } from './adapter.ts'
 import { SUPPORTED_CONTRACT_VERSIONS, assertSupportedContractVersion } from './contract.ts'
 import {
   parsePageAppManifest,
@@ -215,7 +213,7 @@ export function validateInstalledPageAppPackage(
   // mounts a layer; ANY warning (an ignored/missing patch target) rejects.
   let raw: unknown
   try {
-    raw = load(readFileSync(patchPath, 'utf8'), { schema: entryListSchema })
+    raw = parseEntryList(readFileSync(patchPath, 'utf8'))
   } catch (error) {
     throw new Error(`page-app validation: "${packageName}" bundle patch failed to parse: ${String(error)}`)
   }
@@ -225,7 +223,7 @@ export function validateInstalledPageAppPackage(
   const warnings: string[] = []
   let composed: EntryOptions[]
   try {
-    composed = applyEntryPatches([], structuredClone(raw as PatchOptionsLike[]), (message: string) => { warnings.push(message) })
+    composed = composePatchRows(raw, (message: string) => { warnings.push(message) })
   } catch (error) {
     throw new Error(`page-app validation: "${packageName}" bundle patch failed to compose: ${String(error)}`)
   }
@@ -289,9 +287,6 @@ export function validateInstalledPageAppPackage(
     clientRowCount: clientRows.length,
   })
 }
-
-/** Structural type of one include patch entry (the include validates at mount). */
-type PatchOptionsLike = Record<string, unknown>
 
 /**
  * Resolve `exports["./client"]` to a relative path, accepting the string and
