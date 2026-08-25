@@ -28,7 +28,7 @@ wrapper 模块无法解析的 root——manager 包未安装在 profile 中，�
 
 ## 取消与激活握手
 
-变更类 Remote 方法 `install`、`setEnabled` 与 `uninstall` 携带末尾参数 `signal: AbortSignal`。该信号流入事务，中止 profile 本地 pnpm 与定向客户端激活等待；事务信号还会与 manager fiber 的生命周期控制器合并，因此 manager 重载会中止进行中的事务而不是让其成为孤儿。`setHidden`、`reorder`、`ackClientActivation`、`recover` 与 `list` 保持不变。
+变更类 Remote 方法 `installPackage`、`setEnabled` 与 `uninstall` 携带末尾参数 `signal: AbortSignal`（安装的 wire 名称不能复用 `install`——gateway 的 namespace service 在其原型上保留了该成员）。该信号流入事务，中止 profile 本地 pnpm 与定向客户端激活等待；事务信号还会与 manager fiber 的生命周期控制器合并，因此 manager 重载会中止进行中的事务而不是让其成为孤儿。`setHidden`、`reorder`、`ackClientActivation`、`recover` 与 `list` 保持不变。
 
 安装的激活请求携带 Host 客户端图修订（`clientModules.graph().rev`）——绝不是 runtime-layer 文档——且确认必须回显完全相同的修订，因此过期或无关的图变更无法完成握手。Host 结算等待由经校验的插件配置 `settlementTimeoutMs`（默认 `60000` 毫秒）限定，因此消失的客户端无法在存活进程中无限期持有 profile 锁。
 
@@ -38,7 +38,7 @@ wrapper 模块无法解析的 root——manager 包未安装在 profile 中，�
 
 #### 模型看到什么
 
-没有任何直接内容——管理器不注册提示词或工具 schema；它服务于 operator 的设置添加流程与 `pageAppManager` Remote 表面（`install`、`setEnabled`、`uninstall`）。
+没有任何直接内容——管理器不注册提示词或工具 schema；它服务于 operator 的设置添加流程与 `pageAppManager` Remote 表面（`installPackage`、`setEnabled`、`uninstall`）。
 
 #### Token 影响
 
