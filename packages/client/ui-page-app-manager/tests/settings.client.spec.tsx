@@ -18,6 +18,7 @@ import { usePinnedBrowserLanguages } from '@deepseek-ai/dsh-client-test-runtime'
 import { apply, inject, NS } from '../src/client/index.ts'
 import { PageAppSettingsTab, type PageAppSettingsTabInjected, type PageAppSettingsTabProps } from '../src/client/PageAppSettingsTab.tsx'
 import type { PageAppClientSnapshot } from '../src/client/controller.ts'
+import type { PageAppOperationView } from '@deepseek-ai/dsh-page-app-manager/types'
 import { zh } from '../src/client/locales.ts'
 import { MutableObservable } from '../src/client/stores.ts'
 import { parsePageAppInstallSourceClient } from '../src/client/source.ts'
@@ -118,9 +119,15 @@ function snapshotWithRow(): PageAppClientSnapshot {
   }
 }
 
+/** One snapshot carrying the given projected operation view. */
+function snapshotWithOperation(operation: PageAppOperationView): PageAppClientSnapshot {
+  const snapshot = snapshotWithRow()
+  return { ...snapshot, registry: { ...snapshot.registry!, operation } }
+}
+
 /** Render the tab against stub injections and the zh dictionary (zh-CN pinned). */
-function renderTab(over: Partial<PageAppSettingsTabInjected> = {}) {
-  const store = new MutableObservable(snapshotWithRow())
+function renderTab(over: Partial<PageAppSettingsTabInjected> = {}, snapshot: PageAppClientSnapshot = snapshotWithRow()) {
+  const store = new MutableObservable(snapshot)
   const install = vi.fn<PageAppSettingsTabInjected['install']>(() => Promise.resolve())
   const setEnabled = vi.fn<PageAppSettingsTabInjected['setEnabled']>(() => Promise.resolve())
   const setHidden = vi.fn<PageAppSettingsTabInjected['setHidden']>(() => Promise.resolve())
@@ -208,5 +215,21 @@ describe('client-side install-source classification', () => {
     expect(() => parsePageAppInstallSourceClient('relative/path/pkg')).toThrow(/ambiguous relative filesystem/)
     expect(() => parsePageAppInstallSourceClient('https://user:pass@example.com/foo.git')).toThrow(/credentials/)
     expect(() => parsePageAppInstallSourceClient('')).toThrow(/empty/)
+  })
+})
+
+describe('projected operation state rendering (M8-client)', () => {
+  it('renders the projected operation state label from the snapshot', () => {
+    // A journaled install projects `installing`; the durable journal phase is
+    // never the user-facing state.
+    const installing = renderTab({}, snapshotWithOperation({ state: 'installing', phase: 'prepared' }))
+    expect(installing.container.textContent).toContain('正在变更：安装中')
+    expect(installing.container.textContent).not.toContain('prepared')
+
+    // A recovery-visible/no-journal operation carries no phase: the state
+    // label renders and `undefined` never leaks into the copy.
+    const recovering = renderTab({}, snapshotWithOperation({ state: 'recovery-required' }))
+    expect(recovering.container.textContent).toContain('需要恢复')
+    expect(recovering.container.textContent).not.toContain('undefined')
   })
 })

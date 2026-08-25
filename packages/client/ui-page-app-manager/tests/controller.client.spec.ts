@@ -28,6 +28,7 @@ async function harness(remote: FakeRemote, slots: FakeSlots, clientInstanceId = 
       void graphRevision
       return gate.promise
     },
+    cancelGraphWait: () => {},
   }
   const controller = new PageAppController(deps)
   const dispose = controller.start()

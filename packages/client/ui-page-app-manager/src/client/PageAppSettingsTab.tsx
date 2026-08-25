@@ -15,6 +15,7 @@ import type {
   InjectFace, PropsLocale, PropsRuntime,
 } from '@deepseek-ai/dsh-client-ui-slots'
 import type { PageAppClientSnapshot } from './controller.ts'
+import type { PageAppOperationState } from '@deepseek-ai/dsh-page-app-manager/types'
 import type { PageAppObservable } from './stores.ts'
 import type { PageAppSettingsKey } from './locales.ts'
 import { parsePageAppInstallSourceClient } from './source.ts'
@@ -52,6 +53,21 @@ export type PageAppSettingsTabProps =
 function isAbort(failure: unknown): boolean {
   return typeof failure === 'object' && failure !== null && 'name' in failure
     && (failure as { name?: unknown }).name === 'AbortError'
+}
+
+/**
+ * Operation-state display keys: one per closed PageAppOperationState member
+ * (the Host projects prepared/staged → installing, committing → active, and a
+ * visible recovery → recovery-required). The durable journal phase is never
+ * the user-facing state; a recovery-visible operation carries no phase at all.
+ */
+const OPERATION_STATE_KEYS: Record<PageAppOperationState, PageAppSettingsKey> = {
+  installing: 'operationInstalling',
+  active: 'operationActive',
+  removing: 'operationRemoving',
+  'install-failed': 'operationInstallFailed',
+  'remove-failed': 'operationRemoveFailed',
+  'recovery-required': 'recoveryRequired',
 }
 
 /** Health display keys (one per manager health value that Settings shows). */
@@ -148,7 +164,7 @@ export function PageAppSettingsTab(
         ) : null}
       {snapshot.registry?.operation !== null && snapshot.registry?.operation !== undefined ? (
         <p className={css.operation}>
-          {t('operationProgress')}{snapshot.registry.operation.phase}
+          {t('operationProgress')}{t(OPERATION_STATE_KEYS[snapshot.registry.operation.state])}
         </p>
       ) : null}
       {error !== null ? <p className={css.error} role="alert">{error}</p> : null}

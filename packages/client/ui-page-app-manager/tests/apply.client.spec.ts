@@ -3,13 +3,14 @@
 // declaring both child seats (builtin DSH + keyed surface), and the shell
 // still registers when the generated remote namespace is absent (the built-in
 // DSH seat must never depend on remote readiness — spec §3).
-import { Context } from '@deepseek-ai/cordis'
-import { beforeEach, describe, expect, it } from 'vitest'
+import { Context, Service } from '@deepseek-ai/cordis'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { PageAppActivationRequestedEvent } from '@deepseek-ai/dsh-page-app-manager/types'
 import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import { SlotRegistry } from '@deepseek-ai/dsh-client-runtime/client'
 import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
 import { apply, PageAppShell, type PageAppShellInjected, inject } from '@deepseek-ai/dsh-client-ui-page-app-manager/client'
-import { fakeEntry } from './fake-page-app.client.ts'
+import { FakeRemote, fakeEntry } from './fake-page-app.client.ts'
 
 beforeEach(() => {
   document.head.querySelectorAll('meta[name="theme-color"]').forEach((node) => { node.remove() })
@@ -25,6 +26,44 @@ async function bench() {
   // namespace is deliberately absent in this bench to prove the built-in seat
   // does not block on it.
   return { ctx, slots: ctx.get('slots') as SlotRegistry }
+}
+
+/** Bench with a programmable remote namespace so activation events can be emitted. */
+async function benchWithRemote(): Promise<{ ctx: Context; slots: SlotRegistry; remote: FakeRemote }> {
+  const ctx = new Context()
+  const slotsFiber = ctx.plugin(SlotRegistry)
+  await slotsFiber.await()
+  const locale = new LocaleRuntime(ctx)
+  ctx.provide('locale', locale)
+  const remote = new FakeRemote()
+  class RemoteService extends Service {
+    public readonly pageAppManager: FakeRemote
+    constructor(serviceCtx: Context, pageAppManager: FakeRemote) {
+      super(serviceCtx, 'remote')
+      this.pageAppManager = pageAppManager
+    }
+    // The generated carrier owns the event subscription seam; the manager
+    // namespace's methods live on the pageAppManager surface.
+    public $on(event: string, listener: (value: never) => void): () => void {
+      return this.pageAppManager.$on(event as never, listener as never)
+    }
+  }
+  new RemoteService(ctx, remote)
+  return { ctx, slots: ctx.get('slots') as SlotRegistry, remote }
+}
+
+/** A pending activation event fixture. A non-initiating client instance only
+ *  starts the graph-convergence tracking wait (never the acknowledgement), so
+ *  the residual-interval assertion covers exactly one wait per event. */
+function activationEvent(over: Partial<PageAppActivationRequestedEvent> = {}): PageAppActivationRequestedEvent {
+  return {
+    transactionId: 'tx-1',
+    clientInstanceId: 'client-other',
+    packageName: '@scope/app',
+    pageId: 'page-a',
+    graphRevision: 'layer-9',
+    ...over,
+  }
 }
 
 describe('ui-page-app-manager client apply', () => {
@@ -106,5 +145,36 @@ describe('ui-page-app-manager client apply', () => {
     // so no remote calls surfaced beyond the initial list failure).
     await fiber.dispose()
     expect(slots.entries('root')).toHaveLength(0)
+  })
+
+  it('clears the graph-wait interval on controller disposal', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] })
+    try {
+      const { ctx, remote } = await benchWithRemote()
+      // The client graph manifest is provided and differs from the pending
+      // activation's revision, so the convergence wait starts an interval.
+      ctx.provide('modules', { manifest: { rev: 'layer-0' } })
+      const mount = async () => {
+        const fiber = ctx.plugin({ inject: [...inject], apply })
+        await fiber.await()
+        return fiber
+      }
+      // First mount (StrictMode setup): the pending activation starts the wait.
+      let fiber = await mount()
+      remote.emitActivation(activationEvent())
+      expect(vi.getTimerCount()).toBeGreaterThan(0)
+      // Normal stop: the interval dies with the controller, never the 30s cap.
+      await fiber.dispose()
+      expect(vi.getTimerCount()).toBe(0)
+      // StrictMode double-run (setup → cleanup → setup → cleanup): the remount
+      // starts a fresh wait and its cleanup leaves zero residual intervals.
+      fiber = await mount()
+      remote.emitActivation(activationEvent())
+      expect(vi.getTimerCount()).toBeGreaterThan(0)
+      await fiber.dispose()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

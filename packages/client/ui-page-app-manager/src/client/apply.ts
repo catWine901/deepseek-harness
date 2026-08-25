@@ -99,33 +99,53 @@ function buildSlotsSeam(ctx: ClientContext): PageAppSlotsSeam {
   }
 }
 
-/** Wait for the client graph to converge to a new revision (HMR reconcile). */
-function buildGraphWait(ctx: ClientContext): (graphRevision: string) => Promise<void> {
+/**
+ * Wait for the client graph to converge to a new revision (HMR reconcile) and
+ * cancel every pending wait idempotently. The 30-second cap is a convergence
+ * timeout, not a cleanup path: the controller disposes the intervals with its
+ * own stop, so a stopped controller never leaks timers (React 18 StrictMode
+ * cleanup symmetry).
+ */
+function buildGraphWait(ctx: ClientContext): {
+  wait: (graphRevision: string) => Promise<void>
+  cancel: () => void
+} {
   const modules = ctx.get('modules') as { manifest: { rev: string } } | undefined
-  return (graphRevision: string) => new Promise<void>((resolve) => {
-    if (modules === undefined || modules.manifest.rev === graphRevision) {
-      resolve()
-      return
-    }
-    const baseline = modules.manifest.rev
-    const started = Date.now()
-    const timer = setInterval(() => {
-      if (modules.manifest.rev !== baseline || modules.manifest.rev === graphRevision || Date.now() - started > 30_000) {
-        clearInterval(timer)
+  const timers = new Set<ReturnType<typeof setInterval>>()
+  return {
+    wait: (graphRevision: string) => new Promise<void>((resolve) => {
+      if (modules === undefined || modules.manifest.rev === graphRevision) {
         resolve()
+        return
       }
-    }, 100)
-  })
+      const baseline = modules.manifest.rev
+      const started = Date.now()
+      const timer = setInterval(() => {
+        if (modules.manifest.rev !== baseline || modules.manifest.rev === graphRevision || Date.now() - started > 30_000) {
+          clearInterval(timer)
+          timers.delete(timer)
+          resolve()
+        }
+      }, 100)
+      timers.add(timer)
+    }),
+    cancel: () => {
+      for (const timer of timers) clearInterval(timer)
+      timers.clear()
+    },
+  }
 }
 
 /** Build the controller, degrading gracefully when the remote is not mounted. */
 function createController(ctx: ClientContext): PageAppController {
   const remote = buildRemote(ctx)
+  const graphWait = buildGraphWait(ctx)
   const deps: PageAppControllerDeps = {
     remote: remote ?? stubRemote(),
     slots: buildSlotsSeam(ctx),
     clientInstanceId: crypto.randomUUID() as PageAppClientInstanceId,
-    awaitGraphRevision: buildGraphWait(ctx),
+    awaitGraphRevision: graphWait.wait,
+    cancelGraphWait: graphWait.cancel,
   }
   return new PageAppController(deps)
 }

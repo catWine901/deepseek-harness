@@ -56,6 +56,12 @@ export interface PageAppControllerDeps {
    * (wired to the HMR graph reconcile by the shell). Resolves when converged.
    */
   readonly awaitGraphRevision: (graphRevision: string) => Promise<void>
+  /**
+   * Cancel every pending graph-wait interval immediately. The controller
+   * calls this from its stop path; the 30-second convergence cap is not a
+   * cleanup mechanism, and repeated cancellation is a no-op.
+   */
+  readonly cancelGraphWait: () => void
 }
 
 /** Unwrap a Remote result or throw its message. */
@@ -153,6 +159,9 @@ export class PageAppController {
     return () => {
       this.disposed = true
       for (const dispose of this.disposers.splice(0).reverse()) dispose()
+      // The graph-wait interval dies with the controller: stop is the only
+      // lifecycle path that clears it (idempotent under repeated cleanup).
+      this.deps.cancelGraphWait()
     }
   }
 
