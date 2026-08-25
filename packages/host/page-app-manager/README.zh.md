@@ -4,11 +4,13 @@
 
 Host 端 Workspace Apps 管理器：只读的归属投影、安装源解析与静态 Workspace Contract 校验，以及带日志的生命周期事务（安装、启用/停用、隐藏、排序、卸载）。`.workspace-manager/registry.json` 是唯一归属权威；launcher 持有的 `ProfileRuntime` 是唯一经过确认的实时重组写入方，因此管理 API 的就绪状态永远不会阻塞内置 DSH shell。
 
+`snapshot.operation` 由持久 journal 相位加 registry 恢复事实投影进行中的变更：prepared/staged → `installing`，committing → `active`，可见的恢复 → `recovery-required`（闭合的 `PageAppOperationState` 联合类型；不新增持久字段）。每行的 `runtimeState` 是其 Cordis fiber 状态的语义标签（`pending`/`loading`/`active`/`failed`/`unloading`，终态 `DISPOSED` 折叠为 `failed`），绝不是数值 fiber 值。
+
 `PageAppManager` 继承 Typert Remote 服务 `pageAppManager`。每次变更都在共享 profile 变更锁内执行，并在任何受管文件变更之前先写入 prepared journal 与私有 before-state 备份；失败的事务会通过 `ProfileRuntime.restoreManagerLayer` 先复原先前的 live Include 树（携带真实 expected-root 哈希）再收敛文件，复原失败则保留 journal 为 `recovery-required`。operator 的 `recover()` Remote 在同一共享锁内解决它：registry 在 `committing` 阶段已变更则完成提交，否则先从 journal before-state 复原 live layer 再让 pnpm 收敛。journal 存在期间拒绝新事务——operator 必须先 recover。生成的 Host 与 Client Remote 产物由 `./typert` 与 `./remote` 导出。
 
 ## Cordis Adapter
 
-Manager 产品代码仅通过 `src/adapter.ts` 接触 Cordis——它是 `@deepseek-ai/cordis`、`@deepseek-ai/cordis-plugin-loader` 与 `@deepseek-ai/cordis-plugin-include` 在 Manager 产品代码中的唯一运行时导入位置；仅允许 type-only 的 `Context` 导入（插件签名）作为例外。adapter 暴露 Manager 读取的 Cordis 状态，并委托给它所包裹的 vendored 表面：`managedRootHash`（expected-root 哈希，委托 `canonicalManagedRootHash`）、`composePatchRows`（空根上的 bundle patch 组合，委托 Include 的 `applyEntryPatches`）、`parseEntryList`（include 的 `!!js` entry-list YAML 方言）、`findLoaderRow`（通过 `loader.entries()` 查找 Loader 行）、`fiberStateOf`（行的数值 `FiberState`）、`isActiveFiberState`（`ready` 健康态对 ACTIVE 的要求）、`wrapperChildrenOf` 与 `mountWrapperChildren`（Feature Runtime Wrapper 通过 `Loader.create`/`remove` 挂载子行）。
+Manager 产品代码仅通过 `src/adapter.ts` 接触 Cordis——它是 `@deepseek-ai/cordis`、`@deepseek-ai/cordis-plugin-loader` 与 `@deepseek-ai/cordis-plugin-include` 在 Manager 产品代码中的唯一运行时导入位置；仅允许 type-only 的 `Context` 导入（插件签名）作为例外。adapter 暴露 Manager 读取的 Cordis 状态，并委托给它所包裹的 vendored 表面：`managedRootHash`（expected-root 哈希，委托 `canonicalManagedRootHash`）、`composePatchRows`（空根上的 bundle patch 组合，委托 Include 的 `applyEntryPatches`）、`parseEntryList`（include 的 `!!js` entry-list YAML 方言）、`findLoaderRow`（通过 `loader.entries()` 查找 Loader 行）、`fiberStateOf`（行的数值 `FiberState`）、`fiberStateLabelOf`（语义标签映射：pending/loading/active/failed/unloading，`DISPOSED` → failed）、`isActiveFiberState`（`ready` 健康态对 ACTIVE 的要求）、`wrapperChildrenOf` 与 `mountWrapperChildren`（Feature Runtime Wrapper 通过 `Loader.create`/`remove` 挂载子行）。
 
 兼容性承诺：所有委托都是行为保持的——adapter 测试把每个委托钉在它所包裹的 vendored Cordis 表面之上，导入门禁（同样在 `tests/adapter.spec.ts` 中钉住）让其余每个产品文件在运行时保持 Cordis-free，因此 Cordis API 变更只会在 `adapter.ts` 内被吸收。
 

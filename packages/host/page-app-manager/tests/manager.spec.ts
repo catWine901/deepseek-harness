@@ -233,7 +233,65 @@ describe('manager snapshot', () => {
       registry: writeRegistryRow(),
       journal: { schemaVersion: 1, phase: 'staged', lockOwnerToken: 'token-1', files: {} },
     })
-    expect(manager.snapshot().operation).toEqual({ phase: 'staged' })
+    expect(manager.snapshot().operation).toEqual({ state: 'installing', phase: 'staged' })
+  })
+
+  it('projects installing for a prepared journal and active for committing', () => {
+    writeInstalledPackage()
+    const installing = buildManager({
+      registry: writeRegistryRow(),
+      journal: { schemaVersion: 1, phase: 'prepared', lockOwnerToken: 'token-1', files: {} },
+    })
+    expect(installing.manager.snapshot().operation).toEqual({ state: 'installing', phase: 'prepared' })
+
+    const active = buildManager({
+      registry: writeRegistryRow(),
+      journal: { schemaVersion: 1, phase: 'committing', lockOwnerToken: 'token-1', files: {} },
+    })
+    expect(active.manager.snapshot().operation).toEqual({ state: 'active', phase: 'committing' })
+  })
+
+  it('projects recovery-required when recovery is visible', () => {
+    const { manager } = buildManager({ registry: { schemaVersion: 99 } })
+    const snapshot = manager.snapshot()
+    expect(snapshot.recovery).not.toBeNull()
+    expect(snapshot.operation).toEqual({ state: 'recovery-required' })
+  })
+
+  it('maps runtime fiber states to semantic labels (pending/loading/active/failed/unloading)', () => {
+    const labels: ReadonlyArray<readonly [number, string]> = [
+      [0, 'pending'],   // PENDING
+      [1, 'loading'],   // LOADING
+      [2, 'active'],    // ACTIVE
+      [3, 'failed'],    // FAILED
+      [5, 'unloading'], // UNLOADING
+    ]
+    for (const [fiberState, label] of labels) {
+      writeInstalledPackage()
+      writeManagerPackage()
+      const { manager } = buildManager({
+        registry: writeRegistryRow(),
+        loaderRows: [{ ...wrapperRowOf(), fiberState }],
+      })
+      expect(manager.snapshot().entries[0]?.runtimeState).toBe(label)
+    }
+  })
+
+  it('maps a disposed managed root to failed until the next generation', () => {
+    writeInstalledPackage()
+    writeManagerPackage()
+    const disposed = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ ...wrapperRowOf(), fiberState: 4 }],
+    })
+    expect(disposed.manager.snapshot().entries[0]?.runtimeState).toBe('failed')
+    // The next generation remounts the root with a fresh fiber; the label
+    // follows the new fiber instead of the terminal disposed state.
+    const next = buildManager({
+      registry: writeRegistryRow(),
+      loaderRows: [{ ...wrapperRowOf(), fiberState: 2 }],
+    })
+    expect(next.manager.snapshot().entries[0]?.runtimeState).toBe('active')
   })
 
   it('derives missing-manager when the wrapper module is unresolvable', () => {

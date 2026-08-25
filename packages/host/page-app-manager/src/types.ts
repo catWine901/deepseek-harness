@@ -42,6 +42,31 @@ export interface PageAppProfileIdentity {
 export type PageAppJournalPhase = 'prepared' | 'staged' | 'committing'
 
 /**
+ * Projected operational state of one profile's managed set — the closed union
+ * every operation view state belongs to. The Host projection derives it from
+ * the durable journal phase and registry recovery facts only (no persisted
+ * operation-kind field): prepared/staged → `installing`, committing → `active`,
+ * a visible recovery → `recovery-required`. `removing`/`install-failed`/
+ * `remove-failed` stay members of the union but current facts never produce
+ * them, so a view outside the union is a projection bug.
+ */
+export type PageAppOperationState =
+  | 'installing'
+  | 'active'
+  | 'removing'
+  | 'install-failed'
+  | 'remove-failed'
+  | 'recovery-required'
+
+/** Semantic label of one managed root's Cordis fiber state (closed union; the terminal `DISPOSED` collapses into `failed`). */
+export type PageAppRuntimeStateLabel =
+  | 'pending'
+  | 'loading'
+  | 'active'
+  | 'failed'
+  | 'unloading'
+
+/**
  * Derived operational health of one managed row. Manager lifecycle state and
  * Cordis runtime state are separate dimensions (spec §18); this view combines
  * them for display while the underlying data model keeps them distinct.
@@ -70,15 +95,17 @@ export interface PageAppView {
   readonly updatedAt: string
   readonly health: PageAppHealth
   /** Loader fiber state label of the managed root, when the row maps to one. */
-  readonly runtimeState?: string
+  readonly runtimeState?: PageAppRuntimeStateLabel
   /** One-line failure summary when the row is unhealthy. */
   readonly lastError?: string
 }
 
-/** In-flight mutation visibility projected from the durable journal. */
+/** In-flight mutation visibility projected from the durable journal and registry recovery facts. */
 export interface PageAppOperationView {
-  /** Durable journal phase (`prepared`/`staged`/`committing`). */
-  readonly phase: PageAppJournalPhase
+  /** Projected operational state (closed `PageAppOperationState` union). */
+  readonly state: PageAppOperationState
+  /** Durable journal phase, present when a journal explains the state. */
+  readonly phase?: PageAppJournalPhase
 }
 
 /** Startup or rollback recovery visibility. */
