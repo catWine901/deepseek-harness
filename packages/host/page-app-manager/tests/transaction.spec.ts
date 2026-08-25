@@ -14,6 +14,8 @@ import type { ProfileRuntime, ProfileRuntimeApplyRequest } from '@deepseek-ai/ds
 import type { PageAppRegistryV1 } from '@deepseek-ai/dsh-page-app-profile'
 import { PageAppLifecycle, PageAppBuildPermissionError } from '../src/transaction.ts'
 import { createPnpmExecutor, PageAppCommandAbortedError, type PageAppPackageExecutor } from '../src/executor.ts'
+import { parsePageAppInstallSource } from '../src/source.ts'
+import type { PageAppInstallSource } from '../src/types.ts'
 
 const PKG = '@fixture/valid-workspace'
 
@@ -123,13 +125,15 @@ function lifecycle(executor: PageAppPackageExecutor, runtime: ProfileRuntime = f
   })
 }
 
+const REGISTRY_SOURCE: PageAppInstallSource = { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } }
+
 /** Drive one install to completion by acknowledging through the targeted activation gate. */
-async function installWithAck(lc: PageAppLifecycle, clientInstanceId: string): Promise<number> {
-  const promise = lc.install(
-    { kind: 'registry', spec: PKG, display: { kind: 'registry', display: PKG } },
-    clientInstanceId as never,
-    new AbortController().signal,
-  )
+async function installWithAck(
+  lc: PageAppLifecycle,
+  clientInstanceId: string,
+  source: PageAppInstallSource = REGISTRY_SOURCE,
+): Promise<number> {
+  const promise = lc.install(source, clientInstanceId as never, new AbortController().signal)
   // The transaction opens the gate after staging; acknowledge as the client.
   for (let attempt = 0; attempt < 200; attempt += 1) {
     const request = lc.activation.pendingRequest
@@ -178,6 +182,80 @@ describe('install transaction', () => {
     expect(readRegistryFile()?.entries[0]?.enabled).toBe(true)
     // Journal cleared after commit.
     expect(() => readFileSync(join(dir, '.workspace-manager', 'transaction.json'), 'utf8')).toThrow()
+  })
+
+  it('resolves a local link: install by the post-add direct dependency key (the package name), not the raw spec', async () => {
+    writeWorkspacePackage()
+    const linkSpec = `link:${join(dir, 'source', 'page-app-fixture')}`
+    const source = parsePageAppInstallSource(linkSpec, 'link')
+    const executor: PageAppPackageExecutor = {
+      run: async (args) => {
+        if (args[0] === 'add' && args[1] !== undefined) {
+          // pnpm keys node_modules and the profile manifest by the package's
+          // OWN name; the link spec becomes the dependency VALUE.
+          const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
+          manifest.dependencies[PKG] = linkSpec
+          writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    const lc = lifecycle(executor)
+    const revision = await installWithAck(lc, 'client-1', source)
+    expect(revision).toBe(1)
+    const entry = readRegistryFile()?.entries[0]
+    expect(entry?.packageName).toBe(PKG)
+    expect(entry?.source).toEqual(source.display)
+    expect(entry?.resolvedVersion).toBe('1.0.0')
+  })
+
+  it('rejects a non-registry install whose pnpm add produced no direct dependency change', async () => {
+    writeWorkspacePackage()
+    const linkSpec = `link:${join(dir, 'source', 'page-app-fixture')}`
+    const source = parsePageAppInstallSource(linkSpec, 'link')
+    // A successful add that leaves the profile manifest untouched yields zero
+    // candidates; the install must fail loud instead of guessing a key.
+    const executor: PageAppPackageExecutor = {
+      run: async () => ({ exitCode: 0, stdout: '', stderr: '' }),
+    }
+    const lc = lifecycle(executor)
+    await expect(lc.install(source, 'client-1' as never, new AbortController().signal))
+      .rejects.toThrow(/produced no direct profile dependency change .*exactly one added or changed dependency key/)
+  })
+
+  it('rejects a non-registry install whose pnpm add changed multiple direct dependencies', async () => {
+    writeWorkspacePackage()
+    const linkSpec = `link:${join(dir, 'source', 'page-app-fixture')}`
+    const source = parsePageAppInstallSource(linkSpec, 'link')
+    const executor: PageAppPackageExecutor = {
+      run: async (args) => {
+        if (args[0] === 'add' && args[1] !== undefined) {
+          const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { dependencies: Record<string, string> }
+          manifest.dependencies['@fixture/other-workspace'] = 'link:C:\\other'
+          manifest.dependencies[PKG] = linkSpec
+          writeFileSync(join(dir, 'package.json'), JSON.stringify(manifest))
+        }
+        return { exitCode: 0, stdout: '', stderr: '' }
+      },
+    }
+    const lc = lifecycle(executor)
+    // Deterministic ambiguity error: both candidate keys are named, sorted.
+    await expect(lc.install(source, 'client-1' as never, new AbortController().signal))
+      .rejects.toThrow(/changed 2 direct profile dependencies \(@fixture\/other-workspace, @fixture\/valid-workspace\)/)
+  })
+
+  it('claims an already-present registry dependency when pnpm add leaves the manifest unchanged (no-delta reinstall)', async () => {
+    writeWorkspacePackage()
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({
+      name: 'fixture-profile',
+      private: true,
+      dependencies: { [PKG]: '1.0.0' },
+    }))
+    const { executor } = fakeExecutor() // add rewrites the same spec — no delta
+    const lc = lifecycle(executor)
+    const revision = await installWithAck(lc, 'client-1')
+    expect(revision).toBe(1)
+    expect(readRegistryFile()?.entries[0]?.packageName).toBe(PKG)
   })
 
   it('rolls back a static-validation failure: registry/layer restored, convergence run, journal cleared', async () => {

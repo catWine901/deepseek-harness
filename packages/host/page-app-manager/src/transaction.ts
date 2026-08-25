@@ -144,6 +144,9 @@ export class PageAppLifecycle {
     signal: AbortSignal,
   ): Promise<number> {
     return this.withTransaction(async (transactionId, txSignal) => {
+      // The post-add direct dependency key is resolved from the before/after
+      // profile manifest delta; capture the before state before pnpm mutates it.
+      const dependenciesBefore = this.readProfileDependencies()
       // pnpm add with the exact validated spec.
       const add = await this.deps.executor.run(['add', source.spec], { cwd: this.deps.profileDir, signal: txSignal })
       if (add.exitCode !== 0) {
@@ -156,7 +159,7 @@ export class PageAppLifecycle {
         throw new Error(`page-app install: pnpm add failed: ${add.stderr.trim()}`)
       }
       // Resolve the actual installed package name/version, then validate.
-      const staged = this.stageAfterInstall(source)
+      const staged = this.stageAfterInstall(source, dependenciesBefore)
       // Write the staged layer and advance to staged.
       await this.writeStagedLayer(staged)
       // Apply the layer through the acknowledged profile runtime.
@@ -351,14 +354,14 @@ export class PageAppLifecycle {
   }
 
   /** Stage the next registry + derived layer after a successful pnpm add. */
-  private stageAfterInstall(source: PageAppInstallSource): PageAppStagedState {
+  private stageAfterInstall(source: PageAppInstallSource, dependenciesBefore: Readonly<Record<string, string>>): PageAppStagedState {
     const registry = this.requireRegistrySync()
-    // Resolve the installed package (pnpm add wrote node_modules) and validate.
-    // The dependency key is the package name (aliases rejected by validation).
-    const installed = resolveInstalledPackageDir(this.deps.profileDir, source.spec.replace(/^npm:/, ''))
-    const packageName = installed === undefined
-      ? source.spec.replace(/^npm:/, '')
-      : (JSON.parse(readFileSync(join(installed, 'package.json'), 'utf8')) as { name?: string }).name ?? source.spec
+    // Resolve the direct profile dependency key pnpm add actually wrote — from
+    // the observable before/after manifest delta, never from the raw spec: for
+    // a local link:/file:/tarball/Git source pnpm keys the dependency by
+    // the package's own name (the spec is only the dependency value), while
+    // the raw spec is not even a node_modules key. Validate against the real key.
+    const packageName = this.resolveInstalledPackageKey(source, dependenciesBefore, this.readProfileDependencies())
     const record = validateInstalledPageAppPackage(this.deps.profileDir, packageName, {
       profileDir: this.deps.profileDir,
       registry,
@@ -392,6 +395,50 @@ export class PageAppLifecycle {
         entries: [...registry.entries, entry],
       }
     return this.stageFromRegistry(next)
+  }
+
+  /**
+   * Resolve the direct profile dependency key one successful `pnpm add` wrote.
+   * The key comes from observable post-add profile state (the before/after
+   * manifest delta), never pathname parsing or raw-spec heuristics: for a
+   * local link:/file:/tarball/Git source pnpm keys the dependency by the
+   * package's OWN name and the spec is only the dependency value, so the raw
+   * spec can never name node_modules. A registry source keeps its bare package
+   * name as the valid direct key when present — including a no-delta
+   * reinstall where pnpm leaves the manifest dependency untouched. Non-registry
+   * sources must produce exactly one added or changed key; zero or multiple
+   * candidates are rejected with a deterministic, actionable error — never
+   * guessed.
+   * @param source - the validated install source.
+   * @param before - the profile's direct dependencies captured before `pnpm add`.
+   * @param after - the profile's direct dependencies read after success.
+   * @returns the direct dependency key of the installed package.
+   * @throws {Error} when a non-registry source produced zero or multiple
+   * added/changed keys.
+   */
+  private resolveInstalledPackageKey(
+    source: PageAppInstallSource,
+    before: Readonly<Record<string, string>>,
+    after: Readonly<Record<string, string>>,
+  ): string {
+    if (source.kind === 'registry') {
+      const bare = source.spec.replace(/^npm:/, '')
+      if (after[bare] !== undefined) return bare
+    }
+    const candidates = Object.keys(after)
+      .filter(key => before[key] === undefined || before[key] !== after[key])
+      .sort()
+    const [candidate] = candidates
+    if (candidates.length !== 1 || candidate === undefined) {
+      const detail = candidates.length === 0
+        ? 'produced no direct profile dependency change'
+        : `changed ${candidates.length} direct profile dependencies (${candidates.join(', ')})`
+      throw new Error(
+        `page-app install: pnpm add ${detail} for source "${source.display.display}"; `
+        + 'exactly one added or changed dependency key is required to resolve the installed package',
+      )
+    }
+    return candidate
   }
 
   /** Derive the layer for a staged registry (enabled, statically valid rows only). */
