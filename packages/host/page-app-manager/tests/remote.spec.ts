@@ -1,14 +1,15 @@
 /**
  * The generated Remote surface of the Host manager: the `pageAppManager`
- * namespace methods (list/install/ackClientActivation/recover) behave through
- * the TypertRemoteService face, and the privileged endpoint names match the
- * wire exactly.
+ * namespace methods (list/installPackage/ackClientActivation/recover) behave
+ * through the TypertRemoteService face, and the privileged endpoint names
+ * match the wire exactly.
  */
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import { remoteMethods } from '@deepseek-ai/dsh-typert-protocol'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { PageAppManager } from '../src/index.ts'
 import { PageAppCommandAbortedError, type PageAppPackageExecutor } from '../src/executor.ts'
@@ -88,6 +89,16 @@ describe('pageAppManager Remote surface', () => {
     expect(snapshot.profile).toEqual({ name: 'fixture-profile', directory: dir })
     expect(snapshot.revision).toBe(0)
     expect(snapshot.entries).toEqual([])
+  })
+
+  it('exposes the install Remote under installPackage and never the reserved install spelling', () => {
+    // The gateway's namespace service reserves `install` on its prototype; the
+    // exported wire surface must carry `installPackage` instead so a fresh
+    // generated client can mount the namespace.
+    const { manager } = buildManager()
+    const exported = remoteMethods(manager).map(marker => marker.exportName ?? marker.method)
+    expect(exported).toContain('installPackage')
+    expect(exported).not.toContain('install')
   })
 
   it('installs through the Remote face and settles only on the targeted client acknowledgement', async () => {

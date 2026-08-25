@@ -189,13 +189,16 @@ export class PageAppManager extends TypertRemoteService {
   }
 
   /**
-   * Install one managed package (the Remote entry of the Settings add-flow).
+   * Install one managed package (exposed as the `installPackage` Remote of the
+   * Settings add-flow; the gateway namespace service reserves the `install`
+   * member on its prototype, so the wire method cannot reuse that spelling
+   * while the internal lifecycle method keeps the `install` name).
    * @param source - the validated install source.
    * @param clientInstanceId - the opaque initiating client instance.
    * @param signal - cancellation; aborts pnpm and the activation wait.
    * @returns the committed registry revision.
    */
-  @Remote('install')
+  @Remote('installPackage')
   public install(source: PageAppInstallSource, clientInstanceId: PageAppClientInstanceId, signal: AbortSignal): Promise<number> {
     return this.lifecycle.install(source, clientInstanceId, signal)
   }
