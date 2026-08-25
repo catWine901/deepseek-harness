@@ -28,7 +28,7 @@ A root whose wrapper module cannot resolve — the manager package is not instal
 
 ## Cancellation and the activation handshake
 
-The mutating Remote methods `install`, `setEnabled`, and `uninstall` carry a final `signal: AbortSignal`. The signal flows into the transaction and aborts profile-local pnpm and the targeted client activation wait; the transaction signal is additionally merged with the manager fiber's lifecycle controller, so a manager reload aborts an in-flight transaction instead of orphaning it. `setHidden`, `reorder`, `ackClientActivation`, `recover`, and `list` are unchanged.
+The mutating Remote methods `installPackage`, `setEnabled`, and `uninstall` carry a final `signal: AbortSignal` (the install wire name cannot reuse `install` — the gateway namespace service reserves that member on its prototype). The signal flows into the transaction and aborts profile-local pnpm and the targeted client activation wait; the transaction signal is additionally merged with the manager fiber's lifecycle controller, so a manager reload aborts an in-flight transaction instead of orphaning it. `setHidden`, `reorder`, `ackClientActivation`, `recover`, and `list` are unchanged.
 
 The install activation request carries the Host client-graph revision (`clientModules.graph().rev`) — never the runtime-layer document — and the acknowledgement must echo that exact revision, so a stale or unrelated graph change cannot settle the gate. The Host settlement wait is bounded by the validated plugin config `settlementTimeoutMs` (default `60000` milliseconds), so a vanished client can never hold the profile lock indefinitely in a live process.
 
@@ -38,7 +38,7 @@ The install activation request carries the Host client-graph revision (`clientMo
 
 #### What the model sees
 
-Nothing directly — the manager registers no prompt or tool schema; it serves the operator Settings add-flow and the `pageAppManager` Remote surface (`install`, `setEnabled`, `uninstall`).
+Nothing directly — the manager registers no prompt or tool schema; it serves the operator Settings add-flow and the `pageAppManager` Remote surface (`installPackage`, `setEnabled`, `uninstall`).
 
 #### Token effect
 
