@@ -82,6 +82,7 @@ export const SERVICE_PAGE: Record<string, string> = {
   lsp: 'lsp.md',
   messageFeedback: 'feedback.md',
   pageAppManager: 'workspace-apps.md',
+  workbenchRuntime: 'workspace-apps.md',
   permissionPresets: 'permission-presets.md',
   planMode: 'plan.md',
   terminals: 'terminal.md',

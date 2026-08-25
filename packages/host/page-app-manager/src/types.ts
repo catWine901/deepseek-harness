@@ -7,6 +7,7 @@
  * side's page-app-profile types are structurally compatible.
  * @module @deepseek-ai/dsh-page-app-manager/types
  */
+import type { Branded } from '@deepseek-ai/dsh-brand'
 
 /** How a managed package's source spec was stated at install time (wire copy). */
 export type PageAppSourceKind = 'registry' | 'file' | 'link' | 'tarball' | 'git'
@@ -153,10 +154,10 @@ export interface PageAppActivationRequestedEvent {
 }
 
 /** Branded transaction id (journal-visible identity of one mutation). */
-export type PageAppTransactionId = string & { readonly __pageAppTransaction: true }
+export type PageAppTransactionId = Branded<'PageAppTransactionId'>
 
 /** Branded opaque client-instance id (stable `crypto.randomUUID()` of the controller). */
-export type PageAppClientInstanceId = string & { readonly __pageAppClientInstance: true }
+export type PageAppClientInstanceId = Branded<'PageAppClientInstanceId'>
 
 /** One pending activation the manager announces before staging. */
 export interface ClientActivationRequest {
