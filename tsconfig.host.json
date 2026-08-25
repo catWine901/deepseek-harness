@@ -33,6 +33,8 @@
     "apps/web/tests/onboarding-deepseek-config.e2e.ts",
     "apps/web/tests/onboarding-usable-provider.e2e.ts",
     "apps/web/tests/remote-welcome.e2e.ts",
+    "apps/web/tests/workspace-apps-e2e-support.ts",
+    "apps/web/tests/workspace-apps.e2e.ts",
     "apps/web/tests/workspace-management.e2e.ts",
     "apps/web/tests/replay-round-trip.e2e.ts",
     "apps/web/tests/hmr-live.e2e.ts",
