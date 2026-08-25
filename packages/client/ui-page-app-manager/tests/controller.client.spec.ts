@@ -372,6 +372,19 @@ describe('real cancellation signals (M1.2, D8/D9)', () => {
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
   })
 
+  it('reaches the installPackage remote wire method, never the reserved install spelling', async () => {
+    const remote = new FakeRemote()
+    const slots = new FakeSlots()
+    const { controller, dispose } = await harness(remote, slots)
+    await controller.install(installSource(), new AbortController().signal)
+    await flush()
+    // The gateway namespace service reserves `install` on its prototype, so
+    // the controller's install action must call the `installPackage` remote.
+    expect(remote.calls.filter(call => call.method === 'installPackage')).toHaveLength(1)
+    expect(remote.calls.filter(call => call.method === 'install')).toHaveLength(0)
+    dispose()
+  })
+
   it('aborts setEnabled and uninstall through the controller signal', async () => {
     const remote = new FakeRemote()
     const slots = new FakeSlots()
@@ -406,7 +419,7 @@ describe('real cancellation signals (M1.2, D8/D9)', () => {
     await expect(controller.install(installSource(), external.signal))
       .rejects.toMatchObject({ name: 'AbortError' })
     // The remote was never asked: the mutation rejected before the call.
-    expect(remote.calls.filter(call => call.method === 'install')).toHaveLength(0)
+    expect(remote.calls.filter(call => call.method === 'installPackage')).toHaveLength(0)
     dispose()
   })
 })

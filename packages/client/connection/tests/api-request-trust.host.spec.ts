@@ -14,7 +14,7 @@ function request(headers: Record<string, string | undefined>): { headers: Record
 
 /** The seven page-app manager mutations, in Typert `${namespace}/${method}` wire form. */
 const PAGE_APP_MANAGER_METHODS: readonly string[] = [
-  'pageAppManager/install',
+  'pageAppManager/installPackage',
   'pageAppManager/setEnabled',
   'pageAppManager/setHidden',
   'pageAppManager/reorder',
@@ -204,10 +204,10 @@ describe('shared fetch handler dispatcher order (privileged fence first)', () =>
   it('lets a loopback page-app manager mutation through the interceptor, gateway, and executor', async () => {
     const dispatch = sharedDispatcher()
     try {
-      const response = await dispatch.handler.fetch(envelopeRequest('pageAppManager/install', '127.0.0.1:3080'))
+      const response = await dispatch.handler.fetch(envelopeRequest('pageAppManager/installPackage', '127.0.0.1:3080'))
       expect(response.status).toBe(200)
       expect([dispatch.matcherCalls, dispatch.gatewayCalls, dispatch.executorCalls, dispatch.fallbackCalls])
-        .toEqual([['pageAppManager/install'], ['pageAppManager/install'], ['pageAppManager/install'], []])
+        .toEqual([['pageAppManager/installPackage'], ['pageAppManager/installPackage'], ['pageAppManager/installPackage'], []])
     } finally {
       await dispatch.remove()
     }

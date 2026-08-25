@@ -59,7 +59,7 @@ function stubRemote(): PageAppManagerRemoteMethods & PageAppRemoteEvents {
   const never = (): Promise<PageAppRemoteResult<never>> => Promise.resolve(ok(undefined as never))
   return {
     list: () => Promise.resolve(ok(EMPTY_SNAPSHOT)),
-    install: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId, _signal: AbortSignal) => never(),
+    installPackage: (_source: PageAppInstallSource, _clientInstanceId: PageAppClientInstanceId, _signal: AbortSignal) => never(),
     setEnabled: (_pageId: string, _enabled: boolean, _signal: AbortSignal) => never(),
     setHidden: (_pageId: string, _hidden: boolean) => never(),
     reorder: (_pageIds: readonly string[]) => never(),

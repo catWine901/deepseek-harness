@@ -26,7 +26,7 @@ Workspace 选项卡（order 20，位于只读 `all` 选项卡之后）列出每�
 
 #### 模型看到什么
 
-没有任何直接内容——client manager 不注册提示词或工具 schema；它服务于 operator 的设置添加流程，并渲染生成的 `pageAppManager` Remote 投影（`install`、`setEnabled`、`uninstall`）。
+没有任何直接内容——client manager 不注册提示词或工具 schema；它服务于 operator 的设置添加流程，并渲染生成的 `pageAppManager` Remote 投影（`installPackage`、`setEnabled`、`uninstall`）。
 
 #### Token 影响
 

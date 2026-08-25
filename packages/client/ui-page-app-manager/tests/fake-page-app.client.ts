@@ -106,12 +106,12 @@ export class FakeRemote implements PageAppManagerRemoteMethods, PageAppRemoteEve
     return this.onList()
   }
 
-  public install(
+  public installPackage(
     source: PageAppInstallSource,
     clientInstanceId: PageAppClientInstanceId,
     signal: AbortSignal,
   ): Promise<PageAppRemoteResult<number>> {
-    this.calls.push({ method: 'install', args: [source, clientInstanceId, signal] })
+    this.calls.push({ method: 'installPackage', args: [source, clientInstanceId, signal] })
     return this.onInstall(source, clientInstanceId, signal)
   }
 

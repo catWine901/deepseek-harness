@@ -38,7 +38,7 @@ function fakeHttpServer(
 
 /** The seven page-app manager mutations, in Typert `${namespace}/${method}` wire form. */
 const PAGE_APP_MANAGER_METHODS = [
-  'pageAppManager/install',
+  'pageAppManager/installPackage',
   'pageAppManager/setEnabled',
   'pageAppManager/setHidden',
   'pageAppManager/reorder',

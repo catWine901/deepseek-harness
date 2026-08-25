@@ -23,7 +23,7 @@ export type PageAppRemoteResult<T> = {
 /** The generated `pageAppManager` namespace methods the controller calls. */
 export interface PageAppManagerRemoteMethods {
   list(): Promise<PageAppRemoteResult<PageAppManagerSnapshot>>
-  install(
+  installPackage(
     source: PageAppInstallSource,
     clientInstanceId: PageAppClientInstanceId,
     signal: AbortSignal,

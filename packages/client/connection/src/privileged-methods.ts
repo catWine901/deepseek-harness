@@ -59,7 +59,7 @@ export const PRIVILEGED_METHODS: ReadonlySet<string> = new Set([
   'llm.discoverModels',
   // The page-app manager's live-recomposition mutations, in the Typert
   // `${namespace}/${method}` form the Gateway claims.
-  'pageAppManager/install',
+  'pageAppManager/installPackage',
   'pageAppManager/setEnabled',
   'pageAppManager/setHidden',
   'pageAppManager/reorder',

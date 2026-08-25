@@ -267,7 +267,7 @@ export class ProfileRuntime extends Service {
 The exact privileged additions are:
 
 ```ts
-'pageAppManager/install'
+'pageAppManager/installPackage'
 'pageAppManager/setEnabled'
 'pageAppManager/setHidden'
 'pageAppManager/reorder'
@@ -278,7 +278,7 @@ The exact privileged additions are:
 
 Typert Gateway forms endpoints as `${namespace}/${method}`. Existing dotted names in the privileged set belong to the legacy API Proxy and remain unchanged; do not normalize one transport's spelling into the other or use prefix matching.
 
-- [ ] Add a table-driven route test that submits each exact slash endpoint (for example `/api/pageAppManager/install` with envelope method `pageAppManager/install`) from a non-loopback request while both the Typert interceptor and fallback API proxy are capable of claiming it.
+- [ ] Add a table-driven route test that submits each exact slash endpoint (for example `/api/pageAppManager/installPackage` with envelope method `pageAppManager/installPackage`) from a non-loopback request while both the Typert interceptor and fallback API proxy are capable of claiming it.
 - [ ] Assert HTTP 403, zero Gateway calls, zero API Proxy calls, and zero executor calls for every row.
 - [ ] Run `pnpm exec vitest run packages/client/connection/tests/node-half.host.spec.ts packages/client/connection/tests/api-request-trust.host.spec.ts`; expect the Typert-claimed cases to fail before the hoist.
 - [ ] Move the exact-name set to `privileged-methods.ts`. In `HostConnectionService.createSharedFetchHandler`, extract the endpoint and apply the empty-trust-list check before reading or matching the Typert interceptor; only then select interceptor versus fallback. Remove the fallback-only copy from `index.ts`. Retain the ordinary trusted-host fence for the route as a whole.

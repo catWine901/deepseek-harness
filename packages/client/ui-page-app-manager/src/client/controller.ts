@@ -201,7 +201,7 @@ export class PageAppController {
       throw ctrl.signal.reason
     }
     try {
-      const revision = unwrap(await this.deps.remote.install(source, this.deps.clientInstanceId, ctrl.signal))
+      const revision = unwrap(await this.deps.remote.installPackage(source, this.deps.clientInstanceId, ctrl.signal))
       void revision
       await this.refresh()
     } finally {

@@ -376,7 +376,7 @@ interface PageAppManagerRemote {
 
 **State machine / call order / failure semantics.** A cancel aborts the Remote call; Host rollback runs under D8; a second acknowledgement or a stale revision is rejected (existing rules). Non-loopback or cross-origin mutation requests receive 403 before Gateway dispatch and before any pnpm spawn (route tests).
 
-**Compatibility.** The exact privileged endpoint spellings (`pageAppManager/install` etc.) stay byte-identical with the generated Typert endpoints; the route-test matrix stays.
+**Compatibility.** The exact privileged endpoint spellings (`pageAppManager/installPackage` etc.) stay byte-identical with the generated Typert endpoints; the route-test matrix stays.
 
 **Non-goals.** No capability permission sandbox (brief §58); no per-Feature permission model in v1.
 

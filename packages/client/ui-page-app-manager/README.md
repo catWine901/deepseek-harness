@@ -26,7 +26,7 @@ The Workspace tab (order 20, after the read-only `all` tab) lists every managed 
 
 #### What the model sees
 
-Nothing directly — the client manager registers no prompt or tool schema; it serves the operator Settings add-flow and renders the generated `pageAppManager` Remote projection (`install`, `setEnabled`, `uninstall`).
+Nothing directly — the client manager registers no prompt or tool schema; it serves the operator Settings add-flow and renders the generated `pageAppManager` Remote projection (`installPackage`, `setEnabled`, `uninstall`).
 
 #### Token effect
 
