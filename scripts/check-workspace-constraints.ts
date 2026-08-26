@@ -93,6 +93,7 @@ export interface PackageManifest {
     bundle?: {
       patch?: string
     }
+    workspace?: unknown
   }
 }
 
@@ -154,6 +155,9 @@ const packageFileExtras: Readonly<Record<string, readonly string[]>> = {
   // The Python runtime uses a distinct closed-resolution bin; the public CLI
   // keeps config-owned bare-package resolution through lib/bin.js.
   '@deepseek-ai/dsh-sdk-jsonrpc-demo': ['lib/packaged-bin.js'],
+  // The manager bundles its command runner into a content-hashed shared chunk;
+  // the entry imports that relative file at runtime, so it is publishable payload.
+  '@deepseek-ai/dsh-page-app-manager': ['lib/execa-*.js'],
   // The argv-prefix runner entry ships beside the lib as its own bundle;
   // sandbox-local resolves it through the package's ./runner export. tsdown
   // also shares its generated FFI code through a hashed runtime chunk.
@@ -254,7 +258,37 @@ export function checkExperimentalManifest({ dir, manifest }: WorkspaceManifest):
   return errors
 }
 
-function checkWorkspace({ dir, manifest }: WorkspaceManifest): string[] {
+const workspaceFeatureDependencySections = ['dependencies', 'peerDependencies', 'devDependencies', 'optionalDependencies'] as const
+const forbiddenWorkspaceFeatureDependencies = ['cordis', '@deepseek-ai/cordis'] as const
+
+/** Validate and classify the strict-mode Workspace Feature manifest seam. */
+export function checkWorkspaceFeatureManifest(manifest: PackageManifest, label: string): {
+  readonly isWorkspaceFeature: boolean
+  readonly errors: readonly string[]
+} {
+  const workspace = manifest.dsh?.workspace
+  if (workspace === undefined) return { isWorkspaceFeature: false, errors: [] }
+  if (typeof workspace !== 'object' || workspace === null
+    || !('schemaVersion' in workspace) || workspace.schemaVersion !== 1) {
+    return {
+      isWorkspaceFeature: false,
+      errors: [`${label}: dsh.workspace must be an object with schemaVersion 1`],
+    }
+  }
+
+  const errors: string[] = []
+  for (const section of workspaceFeatureDependencySections) {
+    const dependencies = manifest[section]
+    for (const dependency of forbiddenWorkspaceFeatureDependencies) {
+      if (dependencies?.[dependency] !== undefined) {
+        errors.push(`${label}: Workspace Feature must not declare ${dependency} in ${section}`)
+      }
+    }
+  }
+  return { isWorkspaceFeature: true, errors }
+}
+
+export function checkWorkspace({ dir, manifest }: WorkspaceManifest): string[] {
   const errors = checkExperimentalManifest({ dir, manifest })
   const label = manifest.name ?? dir
   const isLandlockPackageDir = dir.startsWith('native/landlock-run/packages/')
@@ -333,13 +367,20 @@ function checkWorkspace({ dir, manifest }: WorkspaceManifest): string[] {
   }
 
   if (dir.startsWith('packages/') && manifest.name?.startsWith('@deepseek-ai/dsh-')) {
-    const peer = manifest.peerDependencies?.['@deepseek-ai/cordis']
-    const dev = manifest.devDependencies?.['@deepseek-ai/cordis']
+    const workspaceFeature = checkWorkspaceFeatureManifest(manifest, label)
+    errors.push(...workspaceFeature.errors)
+    // Workspace Features are deliberately Cordis-free: the Workbench Contract
+    // is their only runtime seam, so the ordinary DSH framework-peer rule does
+    // not apply to manifests admitted through dsh.workspace.
+    if (!workspaceFeature.isWorkspaceFeature) {
+      const peer = manifest.peerDependencies?.['@deepseek-ai/cordis']
+      const dev = manifest.devDependencies?.['@deepseek-ai/cordis']
 
-    if (!peer) errors.push(`${label}: @deepseek-ai/cordis must be a peerDependency`)
-    if (!dev) errors.push(`${label}: @deepseek-ai/cordis must also be a devDependency`)
-    if (peer && dev && peer !== dev) {
-      errors.push(`${label}: @deepseek-ai/cordis peer (${peer}) and dev (${dev}) ranges must match`)
+      if (!peer) errors.push(`${label}: @deepseek-ai/cordis must be a peerDependency`)
+      if (!dev) errors.push(`${label}: @deepseek-ai/cordis must also be a devDependency`)
+      if (peer && dev && peer !== dev) {
+        errors.push(`${label}: @deepseek-ai/cordis peer (${peer}) and dev (${dev}) ranges must match`)
+      }
     }
     if (manifest.version !== repositoryVersion) {
       errors.push(`${label}: package.json version must match root version ${repositoryVersion ?? '(missing)'}`)

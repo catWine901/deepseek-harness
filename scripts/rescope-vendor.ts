@@ -133,6 +133,22 @@ const GENERIC_SKIPS: readonly GenericSkip[] = [
   { file: 'packages/extensions/ui-cordis/src/client/CordisPanel.tsx', upstream: ['cordis'] },
   { file: 'packages/extensions/ui-cordis/src/client/CordisRunRow.tsx', upstream: ['cordis'] },
   { file: 'packages/extensions/ui-cordis/src/client/locales.ts', upstream: ['cordis'] },
+  // Workspace Apps boundary code and its specifications intentionally name the
+  // upstream package too: Features must reject both the old public name and
+  // this repository's rescoped fork. The Loader builtin scheme is likewise a
+  // protocol token (`cordis:<name>`), not an npm specifier.
+  { file: 'packages/boot/page-app-profile/src/layer.ts', upstream: ['cordis'] },
+  { file: 'packages/examples/page-app-fixture/tests/fixture.spec.ts', upstream: ['cordis'] },
+  { file: 'packages/host/page-app-manager/src/validation.ts', upstream: ['cordis'] },
+  { file: 'packages/host/page-app-manager/tests/validation.spec.ts', upstream: ['cordis'] },
+  { file: 'scripts/verify-page-app-source-boundary.ts', upstream: ['cordis'] },
+  { file: 'scripts/verify-page-app-source-boundary.spec.ts', upstream: ['cordis'] },
+  { file: 'scripts/check-workspace-constraints.ts', upstream: ['cordis'] },
+  { file: 'scripts/check-workspace-constraints.spec.ts', upstream: ['cordis'] },
+  { file: 'docs/subsystems/workspace-apps.md', upstream: ['cordis'] },
+  { file: 'docs/subsystems/workspace-apps.zh.md', upstream: ['cordis'] },
+  { file: 'docs/superpowers/plans/2026-08-25-dsh-workspace-manager-architecture-optimization.md', upstream: ['cordis'] },
+  { file: 'docs/superpowers/specs/2026-08-25-dsh-workspace-manager-architecture-optimization-design.md', upstream: ['cordis'] },
 ]
 
 /** A string that must appear exactly `count` times once the rescope has run. */
@@ -180,20 +196,28 @@ const EXACT_EDITS: readonly ExactEdit[] = [
   {
     id: 'constraints-manifest-lookup',
     file: 'scripts/check-workspace-constraints.ts',
-    find: `    const peer = manifest.peerDependencies?.cordis
-    const dev = manifest.devDependencies?.cordis
+    find: `    // Workspace Features are deliberately Cordis-free: the Workbench Contract
+    // is their only runtime seam, so the ordinary DSH framework-peer rule does
+    // not apply to manifests admitted through dsh.workspace.
+    if (!workspaceFeature.isWorkspaceFeature) {
+      const peer = manifest.peerDependencies?.cordis
+      const dev = manifest.devDependencies?.cordis
 
-    if (!peer) errors.push(\`\${label}: cordis must be a peerDependency\`)
-    if (!dev) errors.push(\`\${label}: cordis must also be a devDependency\`)
-    if (peer && dev && peer !== dev) {
-      errors.push(\`\${label}: cordis peer (\${peer}) and dev (\${dev}) ranges must match\`)`,
-    replace: `    const peer = manifest.peerDependencies?.['@deepseek-ai/cordis']
-    const dev = manifest.devDependencies?.['@deepseek-ai/cordis']
+      if (!peer) errors.push(\`\${label}: cordis must be a peerDependency\`)
+      if (!dev) errors.push(\`\${label}: cordis must also be a devDependency\`)
+      if (peer && dev && peer !== dev) {
+        errors.push(\`\${label}: cordis peer (\${peer}) and dev (\${dev}) ranges must match\`)`,
+    replace: `    // Workspace Features are deliberately Cordis-free: the Workbench Contract
+    // is their only runtime seam, so the ordinary DSH framework-peer rule does
+    // not apply to manifests admitted through dsh.workspace.
+    if (!workspaceFeature.isWorkspaceFeature) {
+      const peer = manifest.peerDependencies?.['@deepseek-ai/cordis']
+      const dev = manifest.devDependencies?.['@deepseek-ai/cordis']
 
-    if (!peer) errors.push(\`\${label}: @deepseek-ai/cordis must be a peerDependency\`)
-    if (!dev) errors.push(\`\${label}: @deepseek-ai/cordis must also be a devDependency\`)
-    if (peer && dev && peer !== dev) {
-      errors.push(\`\${label}: @deepseek-ai/cordis peer (\${peer}) and dev (\${dev}) ranges must match\`)`,
+      if (!peer) errors.push(\`\${label}: @deepseek-ai/cordis must be a peerDependency\`)
+      if (!dev) errors.push(\`\${label}: @deepseek-ai/cordis must also be a devDependency\`)
+      if (peer && dev && peer !== dev) {
+        errors.push(\`\${label}: @deepseek-ai/cordis peer (\${peer}) and dev (\${dev}) ranges must match\`)`,
     expect: 1,
   },
   {
@@ -205,12 +229,12 @@ const EXACT_EDITS: readonly ExactEdit[] = [
         "@deepseek-ai/.+"
       ]
     },
-    "packages/util/home": {`,
+    "packages/host/directory-picker-auto": {`,
     replace: `      "ignoreDependencies": [
         "@deepseek-ai/.+"
       ]
     },
-    "packages/util/home": {`,
+    "packages/host/directory-picker-auto": {`,
     expect: 1,
   },
   {
@@ -290,7 +314,7 @@ const EXACT_EDITS: readonly ExactEdit[] = [
     id: 'root-agents-vendored-name-contract',
     file: 'AGENTS.md',
     find: 'vendored packages keep upstream names and are `private: true`. `cordis` is a peerDependency (+ dev) of every harness package.',
-    replace: 'vendored packages are rescoped ([mapping](docs/rescope.md)) and `private: true`. `@deepseek-ai/cordis` is a peerDependency (+ dev) of every harness package.',
+    replace: 'vendored packages are rescoped ([mapping](docs/rescope.md)) and `private: true`. Ordinary harness packages list `@deepseek-ai/cordis` as peerDependency (+ dev). Valid `dsh.workspace.schemaVersion: 1` Workspace Features are Cordis-free and consume only the Workbench Contract.',
     expect: 1,
   },
   {
@@ -348,7 +372,7 @@ const VENDORED_LIBRARY = /^@deepseek-ai\\/(cosmokit|schemastery)(\\/|$)/
     id: 'vendoring-cookbook-name-invariant-zh',
     file: 'docs/cookbook/adding-a-vendored-package.zh.md',
     find: '保留上游的 `name`/`version`/`exports`/`type`',
-    replace: '改写 `name` 的 scope（[映射](../rescope.md)），保留上游的 `version`/`exports`/`type`',
+    replace: '改写 `name` 的 scope（[映射](../rescope.zh.md)），保留上游的 `version`/`exports`/`type`',
     expect: 1,
   },
   {

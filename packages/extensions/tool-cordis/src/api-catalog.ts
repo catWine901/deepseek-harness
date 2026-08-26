@@ -5179,10 +5179,6 @@ export const TYPE_API: readonly TypeApiEntry[] = [
     declaration: 'export interface WorkbenchEventSubscription {\n    on(name: string, listener: (payload: unknown) => void): () => void;\n    emit(name: string, payload?: unknown): void;\n}',
   },
   {
-    name: 'WorkbenchSurfaceRegistration',
-    declaration: 'export interface WorkbenchSurfaceRegistration {\n    readonly pageId: string;\n    readonly packageName: string;\n    readonly render?: unknown;\n}',
-  },
-  {
     name: 'WorkflowAgentEndInfo',
     declaration: 'export interface WorkflowAgentEndInfo extends WorkflowAgentInfo {\n    outcome: WorkflowAgentOutcome;\n}',
   },

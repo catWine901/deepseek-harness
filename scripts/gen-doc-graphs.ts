@@ -548,6 +548,21 @@ const SERVICE_ROLES: ServiceRole[] = [
     note: 'Composes the __DSH_BOOT__ entry graph from an incremental dsh.client scan, serves plugin bundles, and notifies rebuilt/graph-changed subscribers.',
   },
   {
+    key: 'pageAppManager',
+    pkg: 'page-app-manager',
+    title: 'Profile-scoped Workspace Apps manager',
+    mode: 'core',
+    note: 'Owns package transactions, registry projections, activation acknowledgement, recovery, and the generated Host Remote surface; delivery is an out-of-tree profile install rather than a permanent web-bundle row.',
+  },
+  {
+    key: 'workbenchRuntime',
+    pkg: 'page-app-manager',
+    title: 'Workspace App Feature runtime capability',
+    mode: 'core',
+    consumers: ['page-app-manager'],
+    note: 'The manager provides the versioned lifecycle, surface, event, storage, and Host-call face; each Feature wrapper depends on it so provider loss parks the wrapped subtree and provider return reloads it.',
+  },
+  {
     key: 'workflowEngine',
     pkg: 'workflow',
     title: 'Workflow script engine',

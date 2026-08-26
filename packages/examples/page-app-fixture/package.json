@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-page-app-fixture",
   "description": "Real Cordis-free Workspace Apps Feature fixture: contract-v1 workspace manifest, bundle patch, and a keyed workspace surface registered through the Workbench Contract",
-  "version": "1.0.0",
+  "version": "0.1.1-rc.2",
   "publishConfig": {
     "access": "public"
   },
@@ -34,8 +34,8 @@
     "lib/index.js",
     "lib/invariant.js",
     "lib/client.js",
-    "lib/types/**/*.d.ts",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "lib/types/**/*.d.ts"
   ],
   "dsh": {
     "bundle": {

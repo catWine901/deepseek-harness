@@ -273,6 +273,10 @@ function ciSharedStaticGates(): Gate[] {
     pnpmScript('optional-dependency-imports', 'verify-optional-dependency-imports', {
       label: 'optional dependency imports',
     }),
+    pnpmScript('page-app-source-boundary', 'verify-page-app-source-boundary', {
+      label: 'Workspace Apps Feature source boundary',
+    }),
+    pnpmScript('pnpm-version', 'verify-pnpm-version', { label: 'pnpm version' }),
     pnpmScript('client-packages', 'verify-client-packages', { label: 'client packages' }),
     pnpmScript('issue-management', 'test:issue-management', { label: 'Issue management policy' }),
   ]

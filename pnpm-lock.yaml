@@ -1384,9 +1384,6 @@ importers:
       '@deepseek-ai/dsh-client-ui-model-selection':
         specifier: workspace:^
         version: link:../../client/ui-model-selection
-      '@deepseek-ai/dsh-client-ui-page-app-manager':
-        specifier: workspace:^
-        version: link:../../client/ui-page-app-manager
       '@deepseek-ai/dsh-client-ui-permission-presets':
         specifier: workspace:^
         version: link:../../client/ui-permission-presets
@@ -1486,9 +1483,6 @@ importers:
       '@deepseek-ai/dsh-message-feedback':
         specifier: workspace:^
         version: link:../../feedback/message-feedback
-      '@deepseek-ai/dsh-page-app-manager':
-        specifier: workspace:^
-        version: link:../../host/page-app-manager
       '@deepseek-ai/dsh-session-log-export':
         specifier: workspace:^
         version: link:../../session-query/session-log-export
@@ -8866,6 +8860,9 @@ importers:
       '@deepseek-ai/dsh-app-boot':
         specifier: workspace:^
         version: link:../../packages/boot/app-boot
+      '@deepseek-ai/dsh-page-app-profile':
+        specifier: workspace:^
+        version: link:../../packages/boot/page-app-profile
       '@deepseek-ai/dsh-atomic-write':
         specifier: workspace:^
         version: link:../../packages/util/atomic-write

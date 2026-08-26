@@ -357,6 +357,14 @@ describe('Node 24 lane ownership', () => {
 
     expect(subject.map(item => item.id)).not.toContain('build')
     expect(subject.map(item => item.id)).not.toContain('doc-typecheck')
+    expect(subject.find(item => item.id === 'page-app-source-boundary')).toMatchObject({
+      displayCommand: 'pnpm run verify-page-app-source-boundary',
+      args: ['/private/pnpm.cjs', 'run', 'verify-page-app-source-boundary'],
+    })
+    expect(subject.find(item => item.id === 'pnpm-version')).toMatchObject({
+      displayCommand: 'pnpm run verify-pnpm-version',
+      args: ['/private/pnpm.cjs', 'run', 'verify-pnpm-version'],
+    })
   })
 
   it('owns the build and orders its artifact consumers', () => {
