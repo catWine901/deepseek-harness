@@ -19,7 +19,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { SlotCore } from '@deepseek-ai/dsh-client-ui-slots'
 import type {
   LiveSlotNode, LocaleFace, OwnerOf, SlotEntryDef, SlotMap, SlotRenderer, SlotRendererHost,
-  SlotScope, SlotSpec, StoreDecl, StoreFactory, StoredEntry, StoreInstanceLike,
+  SlotRegistration, SlotScope, SlotSpec, StoreDecl, StoreFactory, StoredEntry, StoreInstanceLike,
 } from '@deepseek-ai/dsh-client-ui-slots'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
@@ -85,7 +85,12 @@ interface ErasedRegisterOptions {
 
 /** Erased core call face (the service re-erases at its own boundary; the core's typed face targets end callers). */
 interface ErasedCore {
-  register(options: object, component: unknown, ownerPackage?: string): () => void
+  register(
+    options: object,
+    component: unknown,
+    ownerPackage?: string,
+    onRetire?: () => void,
+  ): SlotRegistration
 }
 
 /**
@@ -366,7 +371,7 @@ export class SlotRegistry extends Service {
   }
 
   /** Delegating registration path: factory minting + registrant stamp + derived ownerPackage + core write + instance-axis bookkeeping. */
-  private _register(options: ErasedRegisterOptions, component: unknown): () => void {
+  private _register(options: ErasedRegisterOptions, component: unknown): SlotRegistration {
     // Exclusive stores pass the factory itself: minted here into a per-entry
     // handle so the stored entry always carries a resolvable handle (the
     // core's shared-handle scope pinning applies to it harmlessly).
@@ -383,22 +388,41 @@ export class SlotRegistry extends Service {
       ...(store !== undefined ? { store } : {}),
       ...(registrant !== undefined ? { registrant } : {}),
     }
-    // Core write first: all load-time validation (undeclared target,
-    // duplicate declaration, kind conflicts, cross-scope handle) throws
-    // there before this layer commits anything.
-    const dispose = (this._core as unknown as ErasedCore).register(erased, component, ownerPackage)
+    let storeAcquired = false
+    const releaseStore = (): void => {
+      if (store === undefined || !storeAcquired) return
+      storeAcquired = false
+      this._release(store)
+    }
     if (store !== undefined) {
-      // Register succeeded, so the target's spec is on the ledger.
-      const scope = (this._core.specDynamic(options.name) as SlotSpec<SlotEntryDef>).scope
-      this._acquire(store, scope)
+      const spec = this._core.specDynamic(options.name)
+      // An undeclared target still fails in the core without touching the
+      // store axis. Declared targets acquire first so a re-entrant cascade
+      // during core publication can retire the runtime state immediately.
+      if (spec !== undefined) {
+        this._acquire(store, spec.scope)
+        storeAcquired = true
+      }
+    }
+    let coreRegistration: SlotRegistration
+    try {
+      coreRegistration = (this._core as unknown as ErasedCore)
+        .register(erased, component, ownerPackage, releaseStore)
+    } catch (error) {
+      releaseStore()
+      throw error
     }
     let disposed = false
-    return () => {
+    const registration = (() => {
       if (disposed) return
       disposed = true
-      dispose()
-      if (store !== undefined) this._release(store)
+      coreRegistration()
+    }) as SlotRegistration
+    registration.retarget = (target) => {
+      if (disposed) throw new Error('slot registration cannot retarget after disposal')
+      coreRegistration.retarget(target)
     }
+    return registration
   }
 
   /** Build once after both object-layer services mount; per-session provide bundles still resolve lazily. */
@@ -480,11 +504,22 @@ export class SlotRegistry extends Service {
 // inside the class — see its JSDoc for why it must live on the prototype).
 // Element access reaches the private _register legally and keeps it a
 // TS-visible read.
-;(SlotRegistry.prototype as { register: (options: object, component: unknown) => () => void }).register
-  = function register(this: SlotRegistry, rawOptions: object, component: unknown): () => void {
+;(SlotRegistry.prototype as { register: (options: object, component: unknown) => SlotRegistration }).register
+  = function register(this: SlotRegistry, rawOptions: object, component: unknown): SlotRegistration {
     // The core's overloads proved the shares; the implementation works on
     // the erased view (same pattern as the core's own implementation arm).
     const options = rawOptions as ErasedRegisterOptions
-    // oxlint-disable-next-line typescript/no-misused-promises -- synchronous cleanup; direct return preserves disposer identity
-    return this.ctx.effect(() => this['_register'](options, component), 'slots.register()')
+    let inner: SlotRegistration | undefined
+    const disposeEffect = this.ctx.effect(() => {
+      inner = this['_register'](options, component)
+      return inner
+    }, 'slots.register()')
+    // Keep the exact caller-bound Cordis effect disposer as the public
+    // authority; retarget is an additional synchronous capability on it.
+    const registration = disposeEffect as unknown as SlotRegistration
+    registration.retarget = (target) => {
+      if (inner === undefined) throw new Error('slot registration is not active')
+      inner.retarget(target)
+    }
+    return registration
   }

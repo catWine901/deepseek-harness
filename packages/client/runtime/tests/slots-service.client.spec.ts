@@ -9,13 +9,16 @@ import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { describe, expect, it, vi } from 'vitest'
 import type { FC } from 'react'
-import type { SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
+import type { SlotRegistration, SlotRendererHost } from '@deepseek-ai/dsh-client-ui-slots'
 import { SlotRegistry } from '../src/client/slots.ts'
 
 // Test-only slot keys (merged so the typed entries/spec faces accept them).
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface SlotMap {
     't.host': { kind: 'single'; scope: 'root' }
+    't.target': { kind: 'single'; scope: 'root' }
+    't.child': { kind: 'single'; scope: 'root' }
+    't.deep': { kind: 'single'; scope: 'root' }
     't.panel': { kind: 'single'; scope: 'session' }
     't.rows': { kind: 'list'; scope: 'root' }
   }
@@ -29,7 +32,7 @@ const C: FC<object> = () => null
  * semantics under test are final.
  */
 interface ErasedService {
-  register(options: object, component: unknown): () => void
+  register(options: object, component: unknown): SlotRegistration
   inject(name: string, callback: () => (() => void) | Iterable<() => void>): () => void
   install(renderer: object): void
   renderSlot(key: string, owner: object): unknown
@@ -207,6 +210,318 @@ describe('load-time validation', () => {
     }, C)).toThrow(/already has a registration/)
     // The failing call's declaration must not have landed.
     expect(() => bench.erased.register({ name: 't.host' }, C)).toThrow(/is not declared/)
+  })
+})
+
+describe('registration retarget service face', () => {
+  it('preserves the stored entry and resolved store instance, then disposes the moved entry once', async () => {
+    const bench = await boot()
+    const host = captureHost(bench, {
+      't.host': { kind: 'single', scope: 'root' },
+      't.target': { kind: 'single', scope: 'root' },
+    })
+    const { handle } = fakeHandle()
+    const registration = bench.erased.register({ name: 't.host', store: handle }, C)
+    const entry = bench.svc.entries('t.host')[0]!
+    const instance = host.storeOf(entry, undefined)
+
+    registration.retarget('t.target')
+
+    expect(bench.svc.entries('t.host')).toHaveLength(0)
+    expect(bench.svc.entries('t.target')).toEqual([entry])
+    expect(host.storeOf(entry, undefined)).toBe(instance)
+    expect(handle.create).toHaveBeenCalledOnce()
+    registration()
+    registration()
+    expect(bench.svc.entries('t.target')).toHaveLength(0)
+    expect(() => host.storeOf(entry, undefined)).toThrow(/not registered/)
+  })
+
+  it('keeps the same disposer authoritative after retarget and caller-fiber teardown', async () => {
+    const bench = await boot()
+    const host = captureHost(bench, {
+      't.host': { kind: 'single', scope: 'root' },
+      't.target': { kind: 'single', scope: 'root' },
+    })
+    const { handle } = fakeHandle()
+    let registration: SlotRegistration | undefined
+    const fiber = bench.ctx.plugin({
+      name: 'retarget-owner',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        registration = (pluginCtx.slots as unknown as ErasedService)
+          .register({ name: 't.host', store: handle }, C)
+      },
+    })
+    await fiber.await()
+    if (registration === undefined) throw new Error('registration was not captured')
+    const entry = bench.svc.entries('t.host')[0]!
+    expect(host.storeOf(entry, undefined)).toBeDefined()
+    registration.retarget('t.target')
+
+    await fiber.dispose()
+
+    expect(bench.svc.entries('t.target')).toHaveLength(0)
+    expect(() => host.storeOf(entry, undefined)).toThrow(/not registered/)
+    expect(() => { registration?.(); registration?.() }).not.toThrow()
+    expect(() => { registration?.retarget('t.host') }).toThrow(/cannot retarget/)
+  })
+
+  it('releases the store axis immediately when the retargeted entry is cascaded', async () => {
+    const bench = await boot()
+    let host: SlotRendererHost | undefined
+    bench.erased.install({ renderRoot: (value: SlotRendererHost) => { host = value; return null } })
+    bench.ctx.reflect.provide('sessions', fakeSessions())
+    bench.ctx.reflect.provide('workspaces', fakeWorkspaces())
+    const disposeFrame = bench.erased.register({
+      name: 'root',
+      children: {
+        't.host': { kind: 'single', scope: 'root' },
+        't.target': { kind: 'single', scope: 'root' },
+      },
+    }, C)
+    bench.erased.renderSlot('root', {})
+    if (host === undefined) throw new Error('renderer never received the host')
+    const rendererHost = host
+    const { handle } = fakeHandle()
+    let registration: SlotRegistration | undefined
+    const fiber = bench.ctx.plugin({
+      name: 'cascaded-retarget-owner',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        registration = (pluginCtx.slots as unknown as ErasedService)
+          .register({ name: 't.host', store: handle }, C)
+      },
+    })
+    await fiber.await()
+    if (registration === undefined) throw new Error('registration was not captured')
+    const capturedRegistration = registration
+    const entry = bench.svc.entries('t.host')[0]!
+    expect(rendererHost.storeOf(entry, undefined)).toBeDefined()
+    capturedRegistration.retarget('t.target')
+
+    disposeFrame()
+
+    expect(bench.svc.entries('t.target')).toHaveLength(0)
+    expect(() => rendererHost.storeOf(entry, undefined)).toThrow(/not registered/)
+    const disposeReplacementFrame = bench.erased.register({
+      name: 'root', children: { 't.panel': { kind: 'single', scope: 'session' } },
+    }, C)
+    const disposeReplacement = bench.erased.register({ name: 't.panel', store: handle }, C)
+    const replacementEntry = bench.svc.entries('t.panel')[0]!
+    const replacementInstance = rendererHost.storeOf(replacementEntry, 's1')
+
+    await fiber.dispose()
+
+    // The old retirement token was consumed by the cascade; disposing its
+    // fiber cannot underflow or release a later registration of the handle.
+    expect(rendererHost.storeOf(replacementEntry, 's1')).toBe(replacementInstance)
+    expect(() => { capturedRegistration(); capturedRegistration() }).not.toThrow()
+    expect(() => { capturedRegistration.retarget('t.host') }).toThrow(/cannot retarget/)
+    disposeReplacement()
+    disposeReplacementFrame()
+  })
+
+  it('rejects its own direct and deep declaration descendants without disturbing the service store axis', async () => {
+    const bench = await boot()
+    const host = captureHost(bench, {
+      't.host': { kind: 'single', scope: 'root' },
+      't.target': { kind: 'single', scope: 'root' },
+    })
+    const { handle } = fakeHandle()
+    const registration = bench.erased.register({
+      name: 't.host',
+      store: handle,
+      children: { 't.child': { kind: 'single', scope: 'root' } },
+    }, C)
+    bench.erased.register({
+      name: 't.child', children: { 't.deep': { kind: 'single', scope: 'root' } },
+    }, C)
+    const entry = bench.svc.entries('t.host')[0]!
+    const instance = host.storeOf(entry, undefined)
+
+    expect(() => { registration.retarget('t.child') }).toThrow(/own declaration subtree/)
+    expect(() => { registration.retarget('t.deep') }).toThrow(/own declaration subtree/)
+
+    expect(bench.svc.entries('t.host')).toEqual([entry])
+    expect(bench.svc.spec('t.deep')).toEqual({ kind: 'single', scope: 'root' })
+    expect(host.storeOf(entry, undefined)).toBe(instance)
+    registration.retarget('t.target')
+    expect(bench.svc.entries('t.target')).toEqual([entry])
+    expect(host.storeOf(entry, undefined)).toBe(instance)
+    registration()
+  })
+
+  it('rejects registration from an inactive caller effect without a ledger write', async () => {
+    const bench = await boot()
+    bench.erased.register({
+      name: 'root', children: { 't.host': { kind: 'single', scope: 'root' } },
+    }, C)
+    let caller: ErasedService | undefined
+    const fiber = bench.ctx.plugin({
+      name: 'inactive-register-owner',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => { caller = pluginCtx.slots },
+    })
+    await fiber.await()
+    await fiber.dispose()
+    expect(() => { caller?.register({ name: 't.host' }, C) }).toThrow(/inactive (?:context|effect)/i)
+    expect(bench.svc.entries('t.host')).toHaveLength(0)
+  })
+})
+
+describe('registration retirement error safety', () => {
+  it('rolls back both ledgers when an initial mutation listener throws', async () => {
+    const bench = await boot()
+    const host = captureHost(bench, {
+      't.host': { kind: 'single', scope: 'root' },
+      't.panel': { kind: 'single', scope: 'session' },
+    })
+    const { handle } = fakeHandle()
+    let inserted: ReturnType<SlotRegistry['entries']>[number] | undefined
+    const failure = new Error('initial t.host mutation failed')
+    const off = bench.ctx.on('slots/changed', (key) => {
+      if (key !== 't.host') return
+      inserted ??= bench.svc.entries('t.host')[0]
+      throw failure
+    })
+
+    expect(() => bench.erased.register({
+      name: 't.host',
+      store: handle,
+      children: { 't.rows': { kind: 'list', scope: 'root' } },
+    }, C)).toThrow()
+    off()
+    if (inserted === undefined) throw new Error('listener did not observe the inserted entry')
+    const rolledBackEntry = inserted
+
+    expect(bench.svc.entries('t.host')).toHaveLength(0)
+    expect(bench.svc.spec('t.rows')).toBeUndefined()
+    expect(() => host.storeOf(rolledBackEntry, undefined)).toThrow(/not registered/)
+    const replacement = bench.erased.register({ name: 't.panel', store: handle }, C)
+    const replacementEntry = bench.svc.entries('t.panel')[0]!
+    expect(host.storeOf(replacementEntry, 's1')).toBeDefined()
+    replacement()
+  })
+
+  it('does not orphan declarations or split stores when initial publication cascades the parent', async () => {
+    const bench = await boot()
+    let host: SlotRendererHost | undefined
+    bench.erased.install({ renderRoot: (value: SlotRendererHost) => { host = value; return null } })
+    bench.ctx.reflect.provide('sessions', fakeSessions())
+    bench.ctx.reflect.provide('workspaces', fakeWorkspaces())
+    const disposeFrame = bench.erased.register({
+      name: 'root',
+      children: {
+        't.host': { kind: 'single', scope: 'root' },
+        't.panel': { kind: 'single', scope: 'session' },
+      },
+    }, C)
+    bench.erased.renderSlot('root', {})
+    if (host === undefined) throw new Error('renderer never received the host')
+    const rendererHost = host
+    const { handle } = fakeHandle()
+    const off = bench.ctx.on('slots/changed', (key) => {
+      if (key === 't.host') disposeFrame()
+    })
+
+    const staleRegistration = bench.erased.register({
+      name: 't.host',
+      store: handle,
+      children: { 't.rows': { kind: 'list', scope: 'root' } },
+    }, C)
+    off()
+
+    expect(bench.svc.entries('t.host')).toHaveLength(0)
+    expect(bench.svc.spec('t.host')).toBeUndefined()
+    expect(bench.svc.spec('t.rows')).toBeUndefined()
+    expect(() => { staleRegistration(); staleRegistration() }).not.toThrow()
+    const replacementFrame = bench.erased.register({
+      name: 'root', children: { 't.panel': { kind: 'single', scope: 'session' } },
+    }, C)
+    const replacement = bench.erased.register({ name: 't.panel', store: handle }, C)
+    const replacementEntry = bench.svc.entries('t.panel')[0]!
+    expect(rendererHost.storeOf(replacementEntry, 's1')).toBeDefined()
+    replacement()
+    replacementFrame()
+  })
+
+  it('explicit disposer releases store and children before propagating a mutation failure', async () => {
+    const bench = await boot()
+    const host = captureHost(bench, {
+      't.host': { kind: 'single', scope: 'root' },
+      't.panel': { kind: 'single', scope: 'session' },
+    })
+    const { handle } = fakeHandle()
+    const registration = bench.erased.register({
+      name: 't.host',
+      store: handle,
+      children: { 't.rows': { kind: 'list', scope: 'root' } },
+    }, C)
+    bench.erased.register({ name: 't.rows', id: 'row' }, C)
+    const entry = bench.svc.entries('t.host')[0]!
+    expect(host.storeOf(entry, undefined)).toBeDefined()
+    const failure = new Error('t.host mutation failed')
+    const off = bench.ctx.on('slots/changed', (key) => {
+      if (key === 't.host') throw failure
+    })
+
+    expect(() => { registration() }).toThrow(failure)
+    off()
+
+    expect(() => host.storeOf(entry, undefined)).toThrow(/not registered/)
+    expect(bench.svc.spec('t.rows')).toBeUndefined()
+    expect(bench.svc.entries('t.rows')).toHaveLength(0)
+    const replacement = bench.erased.register({ name: 't.panel', store: handle }, C)
+    const replacementEntry = bench.svc.entries('t.panel')[0]!
+    const replacementInstance = host.storeOf(replacementEntry, 's1')
+    expect(() => { registration(); registration() }).not.toThrow()
+    expect(host.storeOf(replacementEntry, 's1')).toBe(replacementInstance)
+    replacement()
+  })
+
+  it('fiber disposal releases store and children despite a mutation failure', async () => {
+    const bench = await boot()
+    const host = captureHost(bench, {
+      't.host': { kind: 'single', scope: 'root' },
+      't.panel': { kind: 'single', scope: 'session' },
+    })
+    const { handle } = fakeHandle()
+    let entry: ReturnType<SlotRegistry['entries']>[number] | undefined
+    const fiber = bench.ctx.plugin({
+      name: 'throwing-retirement-owner',
+      inject: ['slots'],
+      apply: (pluginCtx: Context) => {
+        ;(pluginCtx.slots as unknown as ErasedService).register({
+          name: 't.host',
+          store: handle,
+          children: { 't.rows': { kind: 'list', scope: 'root' } },
+        }, C)
+        pluginCtx.slots.register({ name: 't.rows', id: 'row' }, C)
+        entry = pluginCtx.slots.entries('t.host')[0]
+      },
+    })
+    await fiber.await()
+    if (entry === undefined) throw new Error('entry was not captured')
+    const capturedEntry = entry
+    expect(host.storeOf(capturedEntry, undefined)).toBeDefined()
+    const failure = new Error('fiber t.host mutation failed')
+    const off = bench.ctx.on('slots/changed', (key) => {
+      if (key === 't.host') throw failure
+    })
+
+    // Cordis logs effect cleanup failures while draining the whole fiber; the
+    // fiber disposer itself resolves after every owned effect is attempted.
+    await expect(fiber.dispose()).resolves.toBeUndefined()
+    off()
+
+    expect(() => host.storeOf(capturedEntry, undefined)).toThrow(/not registered/)
+    expect(bench.svc.spec('t.rows')).toBeUndefined()
+    expect(bench.svc.entries('t.rows')).toHaveLength(0)
+    const replacement = bench.erased.register({ name: 't.panel', store: handle }, C)
+    const replacementEntry = bench.svc.entries('t.panel')[0]!
+    expect(host.storeOf(replacementEntry, 's1')).toBeDefined()
+    replacement()
   })
 })
 

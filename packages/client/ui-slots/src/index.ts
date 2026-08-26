@@ -580,6 +580,23 @@ export interface StoredEntry {
 }
 
 /**
+ * Lifecycle authority for one registered entry. Calling the handle disposes
+ * the entry; {@link SlotRegistration.retarget} moves that same live entry
+ * between compatible single slots without collapsing its child declarations.
+ */
+export interface SlotRegistration {
+  /** Dispose the entry and its declaration subtree exactly once. */
+  (): void
+  /**
+   * Move the live entry to another declared single slot with the same scope.
+   * The move preserves entry identity, children, descendants, store, metadata,
+   * and this disposer authority.
+   * @param name - compatible target slot.
+   */
+  retarget(name: keyof SlotMap & string): void
+}
+
+/**
  * Resolve a possibly-thunked list label at read time (thunks follow the
  * active locale; owners projecting ledger rows call this instead of reading
  * `options.label` raw).
@@ -686,6 +703,8 @@ export interface LiveSlotNode {
 export class SlotCore {
   private records = new Map<string, SlotRecord>()
   private mutateListeners = new Set<(key: string) => void>()
+  /** Runtime-layer final-retirement hooks, keyed by immutable entry identity. */
+  private retireCallbacks = new WeakMap<StoredEntry, () => void>()
   /** Shared-handle scope ledger: handle → the scope it first mounted under + live mount count. */
   private handleScopes = new Map<object, { scope: SlotScope; count: number }>()
   // Dirty records, not keys: records are never removed, so holding the
@@ -740,7 +759,7 @@ export class SlotCore {
    * shape fields (keyed `key`; list `id`/`order`/`label`).
    * @param component - component honoring the four-share composed props
    * contract ({@link ComposedProps}); checked at this call site.
-   * @returns disposer removing the registration and its declarations
+   * @returns callable registration handle removing the registration and its declarations
    * (idempotent; stale disposers after a cascade are no-ops).
    */
   /* jscpd:ignore-start -- the two register overloads are deliberately
@@ -762,7 +781,7 @@ export class SlotCore {
         HandleOf<NoInfer<H>>, object, NoInfer<M>, NoInfer<N>
       >>
       & RendersCheck<C, D>,
-  ): () => void
+  ): SlotRegistration
   /**
    * Inject-bearing overload: identical semantics to the overload above, plus
    * the registrant's business face — `I` is inferred from the inject
@@ -771,7 +790,7 @@ export class SlotCore {
    * @param options - registration options plus the `inject` business-face factory.
    * @param component - component honoring the four-share composed props
    * contract including the inject share `I`.
-   * @returns disposer removing the registration and its declarations.
+   * @returns callable registration handle removing the registration and its declarations.
    */
   register<
     K extends keyof SlotMap & string,
@@ -790,13 +809,20 @@ export class SlotCore {
         HandleOf<NoInfer<H>>, I, NoInfer<M>, NoInfer<N>
       >>
       & RendersCheck<C, D>,
-  ): () => void
+  ): SlotRegistration
   /* jscpd:ignore-end */
   // The third parameter is the runtime Service's internal ownerPackage channel:
   // derived caller provenance carried separate from the public options object
   // (neither typed overload exposes it, and the implementation never reads an
   // options.ownerPackage key — callers cannot supply or override the stamp).
-  register(options: ErasedOptions, component: unknown, ownerPackage?: string): () => void {
+  // The fourth argument is the runtime Service's internal final-retirement
+  // hook; it is deliberately absent from both public overloads.
+  register(
+    options: ErasedOptions,
+    component: unknown,
+    ownerPackage?: string,
+    onRetire?: () => void,
+  ): SlotRegistration {
     const rec = this.records.get(options.name)
     if (!rec?.spec) {
       throw new Error(`slot "${options.name}" is not declared (a parent entry's children table must declare it)`)
@@ -877,6 +903,7 @@ export class SlotCore {
       ...(options.registrant !== undefined ? { registrant: options.registrant } : {}),
       ownerPackage,
     })
+    if (onRetire !== undefined) this.retireCallbacks.set(entry, onRetire)
     const next = [...rec.entries, entry]
     // Stable sorts: priority ascending for every kind, ties keep registration
     // sequence — a cell's winner is its first occurrence, chain tries lower
@@ -890,9 +917,8 @@ export class SlotCore {
     // entries() keeps returning the same stable reference between mutations
     // while a forged entry can neither be pushed nor replace an existing slot.
     rec.entries = Object.freeze(next)
-    this.markDirty(options.name, rec)
-    if (options.children) {
-      const declarations: [key: string, record: SlotRecord][] = []
+    const declarations: [key: string, record: SlotRecord][] = []
+    if (options.children !== undefined) {
       for (const [childKey, childSpec] of Object.entries(options.children)) {
         const childRec = this.record(childKey)
         childRec.spec = childSpec
@@ -901,21 +927,147 @@ export class SlotCore {
         childRec.declarationEpoch += 1
         declarations.push([childKey, childRec])
       }
-      // Synchronous listeners may register into or try to redeclare a sibling;
-      // publish only after the whole children table owns its declarations.
-      for (const [childKey, childRec] of declarations) {
-        this.markDirty(childKey, childRec)
+    }
+    let currentName = options.name
+    let currentRecord = rec
+    let disposed = false
+    let retargeting = false
+    const registration = (() => {
+      if (disposed) return
+      disposed = true
+      if (!currentRecord.entries.includes(entry)) return
+      currentRecord.entries = currentRecord.entries.filter(e => e !== entry)
+      const errors: unknown[] = []
+      // Keep mutation-before-release: root observers must be able to move a
+      // live child out before the removed entry's declarations collapse.
+      try {
+        this.markDirty(currentName, currentRecord)
+      } catch (error) {
+        errors.push(error)
       }
-      for (const [, childRec] of declarations) {
-        this.notifyDeclaration(childRec)
+      try {
+        this.releaseEntry(entry)
+      } catch (error) {
+        errors.push(error)
+      }
+      this.throwErrors(errors, 'slot registration retirement failed')
+    }) as SlotRegistration
+    registration.retarget = (targetName) => {
+      const target = targetName as string
+      if (disposed || !currentRecord.entries.includes(entry)) {
+        throw new Error('slot registration cannot retarget after disposal or declaration collapse')
+      }
+      if (target === currentName) return
+      if (retargeting) throw new Error('slot registration retarget is already in progress')
+      retargeting = true
+      try {
+        const sourceSpec = currentRecord.spec
+        /* v8 ignore next -- a live entry necessarily belongs to a declared record */
+        if (sourceSpec === undefined) throw new Error(`slot "${currentName}" is not declared`)
+        const targetRecord = this.records.get(target)
+        if (targetRecord?.spec === undefined) {
+          throw new Error(`slot "${target}" is not declared (a parent entry's children table must declare it)`)
+        }
+        if (sourceSpec.kind !== 'single' || targetRecord.spec.kind !== 'single') {
+          throw new Error('slot retarget requires source and target to be single slots')
+        }
+        if (sourceSpec.scope !== targetRecord.spec.scope) {
+          throw new Error(
+            `slot retarget requires the same scope (source "${currentName}" is "${sourceSpec.scope}", target "${target}" is "${targetRecord.spec.scope}")`,
+          )
+        }
+        // Moving a declaring entry into any slot below one of its own direct
+        // declarations would make the slot tree cyclic (directly or through
+        // nested declarers). Walk only the target's ancestry and reject when
+        // the first child below the source belongs to this entry; a sibling
+        // subtree declared by another source-slot entry remains a valid target.
+        let descendant = target
+        const visited = new Set<string>()
+        while (!visited.has(descendant)) {
+          visited.add(descendant)
+          const parent = this.records.get(descendant)?.parent
+          if (parent === undefined) break
+          if (parent === currentName) {
+            if (Object.prototype.hasOwnProperty.call(entry.children ?? {}, descendant)) {
+              throw new Error(`slot registration cannot retarget into its own declaration subtree (target "${target}")`)
+            }
+            break
+          }
+          descendant = parent
+        }
+        const priority = entry.options.priority ?? 0
+        const occupant = targetRecord.entries.find(candidate => (candidate.options.priority ?? 0) === priority)
+        if (occupant !== undefined) {
+          throw new Error(`single slot "${target}" already has a registration at priority ${String(priority)}`)
+        }
+        const childRecords: SlotRecord[] = []
+        if (entry.children !== undefined) {
+          for (const childKey of Object.keys(entry.children)) {
+            const childRecord = this.records.get(childKey)
+            if (childRecord?.spec === undefined || childRecord.parent !== currentName) {
+              throw new Error(`slot registration cannot retarget after child declaration "${childKey}" changed`)
+            }
+            childRecords.push(childRecord)
+          }
+        }
+
+        const sourceName = currentName
+        const sourceRecord = currentRecord
+        const nextSource = sourceRecord.entries.filter(candidate => candidate !== entry)
+        const nextTarget = [...targetRecord.entries, entry]
+          .sort((a, b) => (a.options.priority ?? 0) - (b.options.priority ?? 0))
+        sourceRecord.entries = Object.freeze(nextSource)
+        targetRecord.entries = Object.freeze(nextTarget)
+        for (const childRecord of childRecords) {
+          childRecord.parent = target
+          childRecord.declaredBy = `an entry in "${target}"${entry.registrant ? ` (${entry.registrant})` : ''}`
+        }
+        // Commit routing and BOTH dirty/version records before either
+        // synchronous mutation event. Same-target reentry is idempotent;
+        // another target cannot interleave with this two-key publication.
+        currentName = target
+        currentRecord = targetRecord
+        this.markDirtyTogether(sourceName, sourceRecord, target, targetRecord)
+      } finally {
+        retargeting = false
       }
     }
-    return () => {
-      if (!rec.entries.includes(entry)) return
-      rec.entries = rec.entries.filter(e => e !== entry)
+
+    // Commit the entry and its entire children table before the first
+    // synchronous observer runs. Publication is best-effort across every key:
+    // if any listener fails, retire the just-created entry and its declaration
+    // subtree before propagating the completed-work errors. A re-entrant
+    // parent cascade may already have retired it; the stale registration then
+    // makes rollback an idempotent no-op and cannot recreate orphan children.
+    const publicationErrors: unknown[] = []
+    try {
       this.markDirty(options.name, rec)
-      this.releaseEntry(entry)
+    } catch (error) {
+      publicationErrors.push(error)
     }
+    for (const [childKey, childRec] of declarations) {
+      try {
+        this.markDirty(childKey, childRec)
+      } catch (error) {
+        publicationErrors.push(error)
+      }
+    }
+    for (const [, childRec] of declarations) {
+      try {
+        this.notifyDeclaration(childRec)
+      } catch (error) {
+        publicationErrors.push(error)
+      }
+    }
+    if (publicationErrors.length > 0) {
+      try {
+        registration()
+      } catch (error) {
+        publicationErrors.push(error)
+      }
+      this.throwErrors(publicationErrors, 'slot registration publication failed')
+    }
+    return registration
   }
 
   /**
@@ -1150,12 +1302,21 @@ export class SlotCore {
    * axis: ledger rows, slots, contributions, and store mounts die together.
    */
   private releaseEntry(entry: StoredEntry): void {
+    const errors: unknown[] = []
+    const retire = this.retireCallbacks.get(entry)
+    if (retire !== undefined) {
+      this.retireCallbacks.delete(entry)
+      try {
+        retire()
+      } catch (error) {
+        errors.push(error)
+      }
+    }
     if (entry.store !== undefined && typeof entry.store !== 'function') {
       const pinned = this.handleScopes.get(entry.store)
       if (pinned && --pinned.count === 0) this.handleScopes.delete(entry.store)
     }
-    if (!entry.children) return
-    for (const childKey of Object.keys(entry.children)) {
+    for (const childKey of Object.keys(entry.children ?? {})) {
       const childRec = this.records.get(childKey)
       /* v8 ignore next -- defensive: declaring always creates the record */
       if (!childRec) continue
@@ -1165,10 +1326,25 @@ export class SlotCore {
       childRec.parent = undefined
       childRec.declarationEpoch += 1
       childRec.entries = NO_ENTRIES
-      this.markDirty(childKey, childRec)
-      this.notifyDeclaration(childRec)
-      for (const dead of doomed) this.releaseEntry(dead)
+      try {
+        this.markDirty(childKey, childRec)
+      } catch (error) {
+        errors.push(error)
+      }
+      try {
+        this.notifyDeclaration(childRec)
+      } catch (error) {
+        errors.push(error)
+      }
+      for (const dead of doomed) {
+        try {
+          this.releaseEntry(dead)
+        } catch (error) {
+          errors.push(error)
+        }
+      }
     }
+    this.throwErrors(errors, 'slot declaration cascade failed')
   }
 
   private record(key: string): SlotRecord {
@@ -1191,7 +1367,48 @@ export class SlotCore {
 
   private markDirty(key: string, rec: SlotRecord): void {
     rec.version += 1
-    for (const fn of [...this.mutateListeners]) fn(key)
+    this.scheduleDirty(rec)
+    const errors: unknown[] = []
+    this.collectMutationErrors(key, errors)
+    this.throwErrors(errors, `slot mutation listeners failed for "${key}"`)
+  }
+
+  /** Atomically prepare two record notifications, then emit both even if one listener throws. */
+  private markDirtyTogether(
+    firstKey: string,
+    first: SlotRecord,
+    secondKey: string,
+    second: SlotRecord,
+  ): void {
+    first.version += 1
+    second.version += 1
+    this.scheduleDirty(first)
+    this.scheduleDirty(second)
+    const errors: unknown[] = []
+    this.collectMutationErrors(firstKey, errors)
+    this.collectMutationErrors(secondKey, errors)
+    this.throwErrors(errors, 'slot mutation listeners failed')
+  }
+
+  /** Run every synchronous mutation observer for one key without starvation. */
+  private collectMutationErrors(key: string, errors: unknown[]): void {
+    for (const fn of [...this.mutateListeners]) {
+      try {
+        fn(key)
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+  }
+
+  /** Preserve one thrown value verbatim; aggregate several completed-work failures. */
+  private throwErrors(errors: readonly unknown[], message: string): void {
+    if (errors.length === 1) throw errors[0]
+    if (errors.length > 1) throw new AggregateError(errors, message)
+  }
+
+  /** Queue one record for the microtask-batched subscriber flush. */
+  private scheduleDirty(rec: SlotRecord): void {
     this.dirty.add(rec)
     if (!this.flushScheduled) {
       this.flushScheduled = true
@@ -1200,7 +1417,15 @@ export class SlotCore {
   }
 
   private notifyDeclaration(rec: SlotRecord): void {
-    for (const fn of [...rec.declarationListeners]) fn()
+    const errors: unknown[] = []
+    for (const fn of [...rec.declarationListeners]) {
+      try {
+        fn()
+      } catch (error) {
+        errors.push(error)
+      }
+    }
+    this.throwErrors(errors, 'slot declaration listeners failed')
   }
 
   private flush(): void {

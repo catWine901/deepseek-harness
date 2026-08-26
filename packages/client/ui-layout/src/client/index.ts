@@ -7,8 +7,9 @@
  * manager owns the outer `root` seat; this package is the Original DSH
  * Surface occupant inside it. ctx.layout is the cross-plugin panel-action
  * contract; navigation state lives with the runtime sessions service. A
- * second effect seats the theme presenter, which projects ctx.theme
- * snapshots onto document.body.
+ * single registration retargets between those compatible seats without
+ * collapsing its child declaration tree. A second effect seats the theme
+ * presenter, which projects ctx.theme snapshots onto document.body.
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-theme/client'
@@ -124,11 +125,9 @@ export const inject = ['slots', 'theme']
  * absent or its declaring occupant is not live, the frame registers into the
  * built-in 'root' seat at priority 1 (strictly worse than the manager's
  * default 0) so Native DSH renders with no manager and survives a root-shell
- * crash without a browser refresh. One 'slots/changed' subscription reconciles
- * both paths; the switch collapses the active path's child declarations
- * before the other registers, so the single declarer rule and the single-seat
- * same-priority throw never fire (the core commits the root-entries mutation
- * before notifying child declarations, which makes the yield synchronous).
+ * crash without a browser refresh. One 'slots/changed' subscription retargets
+ * the same registration between compatible single/root seats, preserving the
+ * child declarations and every already-loaded descendant contribution.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
@@ -136,38 +135,33 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => {
     const disposeService = ctx.reflect.provide('layout', layout)
     /** The active composition path: the manager's builtin seat or the root fallback. */
-    let active: 'builtin' | 'root' | null = null
-    let disposeActive: (() => void) | null = null
+    let active: 'builtin' | 'root'
 
-    /** Register AppFrame into one seat with the four children, store, and actions. */
-    const registerFrame = (target: 'builtin' | 'root'): (() => void) => {
-      // The inject hook's only side effect connects the root store to
-      // ctx.layout; conversation business actions belong to their registrants.
-      const inject = (actions: PanelActions) => {
-        layout.attachPanels(actions)
-        return {}
-      }
+    // The inject hook's only side effect connects the root store to ctx.layout;
+    // conversation business actions belong to their registrants.
+    const inject = (actions: PanelActions) => {
+      layout.attachPanels(actions)
+      return {}
+    }
+
+    /** Register AppFrame once through one of the two catalog-visible seats. */
+    const registerFrame = (target: 'builtin' | 'root') => {
       if (target === 'builtin') {
         return ctx.slots.register({
           name: 'page-app.shell.builtin',
+          priority: 1,
           children: {
             'sidebar': { kind: 'single', scope: 'root' },
             'conversation': { kind: 'single', scope: 'session-maybe' },
             'details': { kind: 'single', scope: 'session' },
             'shell.overlay': { kind: 'list', scope: 'root' },
           },
-          // Exclusive store: the factory itself — the framework instantiates
-          // per entry and delivers useStore/actions to AppFrame as standard
-          // props.
           store: createLayoutStore,
           inject,
         }, AppFrame)
       }
       return ctx.slots.register({
         name: 'root',
-        // Strictly worse than the manager's default 0: the cell's lowest live
-        // priority renders, so the manager wins while live and the fallback
-        // wins once the manager is absent or its entry abdicated.
         priority: 1,
         children: {
           'sidebar': { kind: 'single', scope: 'root' },
@@ -180,19 +174,6 @@ export function apply(ctx: ClientContext): void {
       }, AppFrame)
     }
 
-    /** Switch (or keep) the active path; the previous path's children collapse first. */
-    const activate = (target: 'builtin' | 'root'): void => {
-      if (active === target) return
-      // Commit the target BEFORE tearing down the previous path: the teardown
-      // fires nested 'slots/changed' mutations that re-enter reconcile, and a
-      // re-entrant reconcile must see the target as already active.
-      active = target
-      const disposePrevious = disposeActive
-      disposeActive = null
-      disposePrevious?.()
-      disposeActive = registerFrame(target)
-    }
-
     /**
      * Reconcile the two paths against the ledger on every slot mutation. Path
      * (i) requires the builtin seat to be declared BY A LIVE root occupant: an
@@ -201,19 +182,41 @@ export function apply(ctx: ClientContext): void {
      * refresh. The fallback is the only root registrant at priority 1; any
      * other live occupant is the manager.
      */
-    const reconcile = (): void => {
+    const desiredTarget = (): 'builtin' | 'root' => {
       const builtinDeclared = ctx.slots.spec('page-app.shell.builtin') !== undefined
       const managerLive = ctx.slots.entriesOfSlot('root')
         .some(entry => (entry.options.priority ?? 0) !== 1)
-      if (builtinDeclared && managerLive) activate('builtin')
-      else activate('root')
+      return builtinDeclared && managerLive ? 'builtin' : 'root'
     }
 
+    active = desiredTarget()
+    let registration: ReturnType<typeof registerFrame> | undefined
+    const reconcile = (): void => {
+      // register() publishes its entry and child declarations synchronously.
+      // A loader reacting to one of those mutations may mount or collapse the
+      // manager before register() returns; the final reconcile below observes
+      // that settled ledger once the registration handle is available.
+      if (registration === undefined) return
+      const target = desiredTarget()
+      if (target === active) return
+      // Retarget commits both ledgers before emitting old/new mutations. A
+      // re-entrant reconcile can safely issue the same idempotent move, while
+      // a failed preflight leaves this route unchanged for a later retry.
+      registration.retarget(target === 'builtin' ? 'page-app.shell.builtin' : 'root')
+      active = target
+    }
     const off = ctx.on('slots/changed', reconcile)
-    reconcile()
+    try {
+      registration = registerFrame(active)
+      reconcile()
+    } catch (error) {
+      off()
+      registration?.()
+      throw error
+    }
     return () => {
       off()
-      disposeActive?.()
+      registration()
       // provide()'s disposer settles asynchronously; teardown is synchronous fire-and-forget.
       void disposeService()
     }

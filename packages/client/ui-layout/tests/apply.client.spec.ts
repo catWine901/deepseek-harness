@@ -145,36 +145,85 @@ describe('dual-path root fallback (M3, D5)', () => {
   it('yields to the builtin path when the manager declares the seat (manager-first load order)', async () => {
     const { ctx, slots } = await bench()
     const shell = declareBuiltinSeat(slots)
+    const Descendant = () => null
+    const disposeInjection = slots.inject('sidebar', () => slots.register({ name: 'sidebar' }, Descendant))
+    let rootFrameObserved = false
+    const off = ctx.on('slots/changed', (key) => {
+      if (key !== 'root') return
+      rootFrameObserved ||= slots.entries('root').some(entry => entry.component === AppFrame)
+    })
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
-    // Manager-first: AppFrame lands in the builtin seat; root holds only the
-    // manager's entry — the fallback never takes the cell.
+    off()
+    // Manager-first uses the literal builtin registration branch directly;
+    // root never transiently carries AppFrame beside the live manager.
+    expect(rootFrameObserved).toBe(false)
+    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
+    const builtinFrame = slots.entries('page-app.shell.builtin')[0]!
+    expect(builtinFrame.component).toBe(AppFrame)
+    expect(builtinFrame.options.priority).toBe(1)
+    expect(slots.entries('sidebar')[0]!.component).toBe(Descendant)
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
+    expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
+    shell()
+    expect(slots.entries('root')).toEqual([builtinFrame])
+    expect(slots.entries('sidebar')[0]!.component).toBe(Descendant)
+    const shell2 = declareBuiltinSeat(slots)
+    expect(slots.entries('page-app.shell.builtin')).toEqual([builtinFrame])
+    expect(slots.entries('sidebar')[0]!.component).toBe(Descendant)
+    shell2()
+    disposeInjection()
+  })
+
+  it('does not miss a manager mounted synchronously during the initial AppFrame registration', async () => {
+    const { ctx, slots } = await bench()
+    let shell: (() => void) | undefined
+    const offBootstrap = ctx.on('slots/changed', () => {
+      // Model a one-shot loader observer: AppFrame's first mutation unlocks
+      // the manager, whose root entry and builtin declaration are both
+      // committed before ui-layout's register() call returns.
+      offBootstrap()
+      shell = declareBuiltinSeat(slots)
+    })
+
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+
+    expect(shell).toBeTypeOf('function')
     expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
     expect(slots.entries('page-app.shell.builtin')[0]!.component).toBe(AppFrame)
     expect(slots.entries('root')).toHaveLength(1)
     expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
     expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
-    shell()
+    shell?.()
+    await fiber.dispose()
   })
 
-  it('yields to the builtin path when the manager arrives after ui-layout (layout-first load order)', async () => {
+  it('retargets the one AppFrame and preserves a loaded descendant across late manager takeover and release', async () => {
     const { ctx, slots } = await bench()
     const fiber = ctx.plugin({ inject: [...inject], apply })
     await fiber.await()
     expect(slots.entries('root')).toHaveLength(1)
     expect(slots.entries('root')[0]!.options.priority).toBe(1)
+    const frame = slots.entries('root')[0]!
+    const Descendant = () => null
+    const disposeDescendant = slots.register({ name: 'sidebar' }, Descendant)
+    const descendant = slots.entries('sidebar')[0]!
     const shell = declareBuiltinSeat(slots)
-    // The fallback collapses its own children declarations before the builtin
-    // path re-registers the same four — no duplicate-children throw.
     expect(slots.entries('root')).toHaveLength(1)
     expect(slots.entries('root')[0]!.component).not.toBe(AppFrame)
-    expect(slots.entries('page-app.shell.builtin')).toHaveLength(1)
-    expect(slots.entries('page-app.shell.builtin')[0]!.component).toBe(AppFrame)
+    expect(slots.entries('page-app.shell.builtin')).toEqual([frame])
+    expect(frame.options.priority).toBe(1)
+    expect(slots.entries('sidebar')).toEqual([descendant])
     expect(slots.spec('sidebar')).toEqual({ kind: 'single', scope: 'root' })
     expect(slots.spec('conversation')).toEqual({ kind: 'single', scope: 'session-maybe' })
     expect(slots.spec('details')).toEqual({ kind: 'single', scope: 'session' })
     expect(slots.spec('shell.overlay')).toEqual({ kind: 'list', scope: 'root' })
     shell()
+    expect(slots.entries('root')).toEqual([frame])
+    expect(slots.entries('sidebar')).toEqual([descendant])
+    disposeDescendant()
   })
 
   it('never holds two root occupants (distinct priorities, no same-priority throw)', async () => {

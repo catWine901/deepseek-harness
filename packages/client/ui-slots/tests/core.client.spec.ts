@@ -10,11 +10,14 @@ import { SlotCore } from '@deepseek-ai/dsh-client-ui-slots'
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface SlotMap {
     'test.single': { kind: 'single'; scope: 'root' }
+    'test.single.target': { kind: 'single'; scope: 'root' }
+    'test.single.third': { kind: 'single'; scope: 'root' }
     'test.session': { kind: 'single'; scope: 'session' }
     'test.list': { kind: 'list'; scope: 'root' }
     'test.keyed': { kind: 'keyed'; scope: 'session' }
     'test.chain': { kind: 'chain'; scope: 'session'; owner: { tags: string[] } }
     'test.grandchild': { kind: 'single'; scope: 'root' }
+    'test.deep': { kind: 'single'; scope: 'root' }
   }
 }
 
@@ -37,6 +40,8 @@ function mountFrame(core: SlotCore) {
     name: 'root',
     children: {
       'test.single': { kind: 'single', scope: 'root' },
+      'test.single.target': { kind: 'single', scope: 'root' },
+      'test.single.third': { kind: 'single', scope: 'root' },
       'test.session': { kind: 'single', scope: 'session' },
       'test.list': { kind: 'list', scope: 'root' },
       'test.keyed': { kind: 'keyed', scope: 'session' },
@@ -123,6 +128,312 @@ describe('lifecycle cascade (one axis)', () => {
     expect(core.isLive(entry)).toBe(true)
     dispose()
     expect(core.isLive(entry)).toBe(false)
+  })
+
+  it('finishes retirement and later same-key listeners before propagating a mutation failure', () => {
+    const core = new SlotCore()
+    const store = fakeHandle()
+    const registration = core.register({
+      name: 'root',
+      store,
+      children: {
+        'test.single': { kind: 'single', scope: 'root' },
+        'test.session': { kind: 'single', scope: 'session' },
+      },
+    }, Comp as never)
+    core.register({ name: 'test.single' }, Comp)
+    const failure = new Error('root mutation failed')
+    const laterListener = vi.fn()
+    const offFailing = core.onMutate((key) => {
+      if (key === 'root') throw failure
+    })
+    const offLater = core.onMutate((key) => {
+      if (key === 'root') laterListener()
+    })
+
+    expect(() => { registration() }).toThrow(failure)
+    offFailing()
+    offLater()
+
+    expect(laterListener).toHaveBeenCalledOnce()
+    expect(core.specDynamic('test.single')).toBeUndefined()
+    expect(core.specDynamic('test.session')).toBeUndefined()
+    expect(core.entries('test.single')).toHaveLength(0)
+    expect(() => { registration(); registration() }).not.toThrow()
+    core.register({
+      name: 'root', children: { 'test.session': { kind: 'single', scope: 'session' } },
+    }, Comp as never)
+    expect(() => core.register({ name: 'test.session', store }, Comp as never)).not.toThrow()
+  })
+
+  it('rolls back an initial registration when a mutation listener throws', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    const store = fakeHandle()
+    const failure = new Error('initial test.single mutation failed')
+    const off = core.onMutate((key) => {
+      if (key === 'test.single') throw failure
+    })
+
+    expect(() => core.register({
+      name: 'test.single',
+      store,
+      children: { 'test.grandchild': { kind: 'single', scope: 'root' } },
+    }, Comp as never)).toThrow()
+    off()
+
+    expect(core.entries('test.single')).toHaveLength(0)
+    expect(core.specDynamic('test.grandchild')).toBeUndefined()
+    // Both the entry ledger and the core store pin roll back, so the same
+    // handle remains legal under a different scope.
+    expect(() => core.register({ name: 'test.session', store }, Comp as never)).not.toThrow()
+  })
+
+  it('does not orphan child declarations when an initial mutation cascades its parent', () => {
+    const core = new SlotCore()
+    const disposeFrame = mountFrame(core)
+    const store = fakeHandle()
+    const off = core.onMutate((key) => {
+      if (key === 'test.single') disposeFrame()
+    })
+
+    const staleRegistration = core.register({
+      name: 'test.single',
+      store,
+      children: { 'test.grandchild': { kind: 'single', scope: 'root' } },
+    }, Comp as never)
+    off()
+
+    expect(core.entries('test.single')).toHaveLength(0)
+    expect(core.specDynamic('test.single')).toBeUndefined()
+    expect(core.specDynamic('test.grandchild')).toBeUndefined()
+    expect(() => { staleRegistration(); staleRegistration() }).not.toThrow()
+    core.register({
+      name: 'root', children: { 'test.session': { kind: 'single', scope: 'session' } },
+    }, Comp as never)
+    expect(() => core.register({ name: 'test.session', store }, Comp as never)).not.toThrow()
+  })
+})
+
+describe('atomic single-slot retarget', () => {
+  it('preserves the entry, descendants, metadata, store pin, and original disposer authority', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    const store = fakeHandle()
+    const registration = core.register({
+      name: 'test.single',
+      children: { 'test.grandchild': { kind: 'single', scope: 'root' } },
+      store,
+      registrant: 'layout-frame',
+    }, Comp as never)
+    core.register({ name: 'test.grandchild' }, Comp)
+    const entry = core.entries('test.single')[0]!
+    const descendant = core.entries('test.grandchild')[0]!
+    const declarationEpoch = core.declarationEpoch('test.grandchild')
+    const declarationChanged = vi.fn()
+    const offDeclaration = core.subscribeDeclaration('test.grandchild', declarationChanged)
+
+    registration.retarget('test.single.target')
+
+    expect(core.entries('test.single')).toHaveLength(0)
+    expect(core.entries('test.single.target')).toEqual([entry])
+    expect(core.entries('test.grandchild')).toEqual([descendant])
+    expect(entry.registrant).toBe('layout-frame')
+    expect(entry.store).toBe(store)
+    expect(core.declarationEpoch('test.grandchild')).toBe(declarationEpoch)
+    expect(declarationChanged).not.toHaveBeenCalled()
+    const root = core.snapshot('root')[0]!
+    const target = root.children.find(child => child.name === 'test.single.target')
+    expect(target?.children.map(child => child.name)).toEqual(['test.grandchild'])
+
+    registration()
+    registration()
+    expect(core.entries('test.single.target')).toHaveLength(0)
+    expect(core.specDynamic('test.grandchild')).toBeUndefined()
+    // The original handle's one root-scope pin was released exactly once.
+    expect(() => core.register({ name: 'test.session', store }, Comp as never)).not.toThrow()
+    offDeclaration()
+  })
+
+  it('rejects undeclared, occupied, non-single, and cross-scope targets without partial mutation', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    const registration = core.register({
+      name: 'test.single',
+      children: { 'test.grandchild': { kind: 'single', scope: 'root' } },
+    }, Comp as never)
+    const entry = core.entries('test.single')[0]!
+    core.register({ name: 'test.single.target' }, Comp)
+
+    expect(() => { registration.retarget('missing' as never) }).toThrow(/not declared/)
+    expect(() => { registration.retarget('test.single.target') }).toThrow(/already has a registration/)
+    expect(() => { registration.retarget('test.list') }).toThrow(/single slots/)
+    expect(() => { registration.retarget('test.session') }).toThrow(/same scope/)
+    expect(core.entries('test.single')).toEqual([entry])
+    expect(core.entries('test.single.target')).toHaveLength(1)
+    expect(core.specDynamic('test.grandchild')).toEqual({ kind: 'single', scope: 'root' })
+  })
+
+  it('rejects direct and deep slots in its own declaration subtree without any mutation', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    const registration = core.register({
+      name: 'test.single',
+      children: { 'test.grandchild': { kind: 'single', scope: 'root' } },
+    }, Comp as never)
+    const disposeChild = core.register({
+      name: 'test.grandchild',
+      children: { 'test.deep': { kind: 'single', scope: 'root' } },
+    }, Comp as never)
+    const sourceEntry = core.entries('test.single')[0]!
+    const childEntry = core.entries('test.grandchild')[0]!
+    const sourceVersion = core.getVersion('test.single')
+    const directVersion = core.getVersion('test.grandchild')
+    const deepVersion = core.getVersion('test.deep')
+    const mutations: string[] = []
+    const offMutate = core.onMutate(key => mutations.push(key))
+
+    expect(() => { registration.retarget('test.grandchild') }).toThrow(/own declaration subtree/)
+    expect(() => { registration.retarget('test.deep') }).toThrow(/own declaration subtree/)
+
+    expect(core.entries('test.single')).toEqual([sourceEntry])
+    expect(core.entries('test.grandchild')).toEqual([childEntry])
+    expect(core.specDynamic('test.deep')).toEqual({ kind: 'single', scope: 'root' })
+    expect(core.getVersion('test.single')).toBe(sourceVersion)
+    expect(core.getVersion('test.grandchild')).toBe(directVersion)
+    expect(core.getVersion('test.deep')).toBe(deepVersion)
+    expect(mutations).toEqual([])
+    expect(core.snapshot('test.single')[0]?.children[0]?.children[0]?.name).toBe('test.deep')
+
+    // Failed validation leaves the original authority usable for a valid move.
+    registration.retarget('test.single.target')
+    expect(core.entries('test.single.target')).toEqual([sourceEntry])
+    disposeChild()
+    registration()
+    offMutate()
+  })
+
+  it('rejects a non-single source and a retired registration', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    const listRegistration = core.register({ name: 'test.list', id: 'row' }, Comp)
+    expect(() => { listRegistration.retarget('test.single.target') }).toThrow(/single slots/)
+    expect(core.entries('test.list')).toHaveLength(1)
+
+    const registration = core.register({ name: 'test.single' }, Comp)
+    registration.retarget('test.single')
+    expect(core.entries('test.single')).toHaveLength(1)
+    registration()
+    expect(() => { registration.retarget('test.single.target') }).toThrow(/cannot retarget/)
+    expect(core.entries('test.single.target')).toHaveLength(0)
+  })
+
+  it('leaves a cascaded registration stale, idempotently disposable, and unable to retarget', () => {
+    const core = new SlotCore()
+    const disposeFrame = mountFrame(core)
+    const registration = core.register({ name: 'test.single' }, Comp)
+
+    disposeFrame()
+
+    expect(() => { registration.retarget('test.single.target') }).toThrow(/cannot retarget/)
+    expect(() => { registration(); registration() }).not.toThrow()
+  })
+
+  it('publishes old and new mutations only after both ledgers show the final state', async () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    await flushMicrotasks()
+    const registration = core.register({ name: 'test.single' }, Comp)
+    const entry = core.entries('test.single')[0]!
+    await flushMicrotasks()
+    const synchronous: Array<{ key: string; source: number; target: number }> = []
+    const subscribed: Array<{ key: string; source: number; target: number }> = []
+    const snapshot = (key: string) => ({
+      key,
+      source: core.entries('test.single').length,
+      target: core.entries('test.single.target').length,
+    })
+    const offMutate = core.onMutate((key) => {
+      if (key === 'test.single' || key === 'test.single.target') synchronous.push(snapshot(key))
+    })
+    const offSource = core.subscribe('test.single', () => { subscribed.push(snapshot('test.single')) })
+    const offTarget = core.subscribe('test.single.target', () => { subscribed.push(snapshot('test.single.target')) })
+
+    registration.retarget('test.single.target')
+
+    expect(core.entries('test.single.target')).toEqual([entry])
+    expect(synchronous).toEqual([
+      { key: 'test.single', source: 0, target: 1 },
+      { key: 'test.single.target', source: 0, target: 1 },
+    ])
+    await flushMicrotasks()
+    expect(subscribed).toEqual([
+      { key: 'test.single', source: 0, target: 1 },
+      { key: 'test.single.target', source: 0, target: 1 },
+    ])
+    offMutate()
+    offSource()
+    offTarget()
+  })
+
+  it('commits both key versions and notifications before propagating a source-listener failure', async () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    await flushMicrotasks()
+    const registration = core.register({ name: 'test.single' }, Comp)
+    await flushMicrotasks()
+    const sourceVersion = core.getVersion('test.single')
+    const targetVersion = core.getVersion('test.single.target')
+    const mutations: string[] = []
+    const sourceChanged = vi.fn()
+    const targetChanged = vi.fn()
+    const offSource = core.subscribe('test.single', sourceChanged)
+    const offTarget = core.subscribe('test.single.target', targetChanged)
+    const failure = new Error('source listener failed')
+    const offMutate = core.onMutate((key) => {
+      if (key !== 'test.single' && key !== 'test.single.target') return
+      mutations.push(key)
+      if (key === 'test.single') throw failure
+    })
+
+    expect(() => { registration.retarget('test.single.target') }).toThrow(failure)
+    offMutate()
+
+    expect(core.entries('test.single')).toHaveLength(0)
+    expect(core.entries('test.single.target')).toHaveLength(1)
+    expect(core.getVersion('test.single')).toBe(sourceVersion + 1)
+    expect(core.getVersion('test.single.target')).toBe(targetVersion + 1)
+    expect(mutations).toEqual(['test.single', 'test.single.target'])
+    await flushMicrotasks()
+    expect(sourceChanged).toHaveBeenCalledOnce()
+    expect(targetChanged).toHaveBeenCalledOnce()
+    offSource()
+    offTarget()
+  })
+
+  it('allows same-target listener reentry but rejects a different target until the outer move publishes', () => {
+    const core = new SlotCore()
+    mountFrame(core)
+    const registration = core.register({ name: 'test.single' }, Comp)
+    let differentTargetError: unknown
+    const offMutate = core.onMutate((key) => {
+      if (key !== 'test.single') return
+      registration.retarget('test.single.target')
+      try {
+        registration.retarget('test.single.third')
+      } catch (error) {
+        differentTargetError = error
+      }
+    })
+
+    expect(() => { registration.retarget('test.single.target') }).not.toThrow()
+    offMutate()
+
+    expect(differentTargetError).toBeInstanceOf(Error)
+    expect((differentTargetError as Error).message).toMatch(/retarget.*in progress/)
+    expect(core.entries('test.single')).toHaveLength(0)
+    expect(core.entries('test.single.target')).toHaveLength(1)
+    expect(core.entries('test.single.third')).toHaveLength(0)
   })
 })
 
@@ -375,7 +686,10 @@ describe('subscription API', () => {
     const off = core.onMutate(key => keys.push(key))
     mountFrame(core)
     // Contribution first, then each declared child key.
-    expect(keys).toEqual(['root', 'test.single', 'test.session', 'test.list', 'test.keyed', 'test.chain'])
+    expect(keys).toEqual([
+      'root', 'test.single', 'test.single.target', 'test.single.third',
+      'test.session', 'test.list', 'test.keyed', 'test.chain',
+    ])
     keys.length = 0
     core.register({ name: 'test.list', id: 'a' }, Comp)
     expect(keys).toEqual(['test.list'])
