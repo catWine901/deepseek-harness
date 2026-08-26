@@ -125,6 +125,20 @@ describe('workspace manager extraction', () => {
     expect(manifest.peerDependencies).toMatchObject({ '@deepseek-ai/cordis': '^4.0.1' })
   })
 
+  it('targets the 0.1.1-rc.2 DSH seam without depending on its own bundled manager', () => {
+    const manifest = readJson(join(output, 'package.json'))
+    const peers = manifest.peerDependencies as Record<string, string>
+    expect(peers['@deepseek-ai/dsh-page-app-profile']).toBe('>=0.1.1-rc.2 <0.2.0')
+    expect(peers['@deepseek-ai/dsh-app-boot']).toBe('>=0.1.1-rc.2 <0.2.0')
+    expect(peers['@deepseek-ai/cordis-plugin-include']).toBe('^1.0.0')
+    expect(peers['@deepseek-ai/cordis-plugin-loader']).toBe('^1.0.0')
+    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-manager')
+
+    const readme = readFileSync(join(output, 'README.md'), 'utf8')
+    expect(readme).toContain('DeepSeek Harness 0.1.1-rc.2')
+    expect(readme).toContain('not compatible with the older 0.1.0-rc.6 public release')
+  })
+
   it('skeleton never declares dsh.workspace', () => {
     const manifest = readJson(join(output, 'package.json'))
     expect(manifest.dsh).toMatchObject({ bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } })

@@ -31,7 +31,7 @@ An out-of-tree Workspace Apps control plane for [DeepSeek Harness](https://githu
 
 ## Install
 
-Requirements: a compatible DeepSeek Harness 0.1.x installation, Node.js 20 or newer, and pnpm 11.7.0 on \`PATH\`.
+Requirements: a DeepSeek Harness 0.1.1-rc.2 source build (or a later compatible 0.1.x release), Node.js 20 or newer, and pnpm 11.7.0 on \`PATH\`. This package uses seams introduced after 0.1.0-rc.6 and is not compatible with the older 0.1.0-rc.6 public release.
 
 \`\`\`sh
 dsh plugin --profile <profile> add @catwine901/dsh-workspace-manager@1.0.0
@@ -74,7 +74,7 @@ Managed Features run below a Feature Runtime Wrapper. Provider loss parks the Fe
 
 ## Compatibility and limits
 
-- This 1.0.0 release targets the DSH 0.1.x public seam packages and \`@deepseek-ai/cordis\` 4.0.x.
+- This 1.0.0 release targets the DSH 0.1.1-rc.2 seam packages and \`@deepseek-ai/cordis\` 4.0.x.
 - Installation requires the Host client-module registry because activation must be acknowledged against an exact client-graph revision.
 - Packages that need install scripts may require an operator-managed pnpm build allowance; the manager will not grant it automatically.
 - Registry and user data are retained when the manager or an individual Workspace App is removed.
@@ -105,7 +105,7 @@ const README_ZH = `# DSH Workspace Manager
 
 ## 安装
 
-要求：兼容的 DeepSeek Harness 0.1.x、Node.js 20 或更高版本，并确保 pnpm 11.7.0 位于 \`PATH\`。
+要求：DeepSeek Harness 0.1.1-rc.2 源码构建（或后续兼容的 0.1.x 版本）、Node.js 20 或更高版本，并确保 pnpm 11.7.0 位于 \`PATH\`。本包依赖 0.1.0-rc.6 之后新增的 seam，因此不兼容较旧的 0.1.0-rc.6 公共版本。
 
 \`\`\`sh
 dsh plugin --profile <profile> add @catwine901/dsh-workspace-manager@1.0.0
@@ -148,7 +148,7 @@ dsh plugin --profile <profile> add github:catWine901/dsh-workspace-manager
 
 ## 兼容性与限制
 
-- 1.0.0 面向 DSH 0.1.x 公共 seam 包与 \`@deepseek-ai/cordis\` 4.0.x。
+- 1.0.0 面向 DSH 0.1.1-rc.2 seam 包与 \`@deepseek-ai/cordis\` 4.0.x。
 - 安装依赖 Host client-module registry，因为激活必须对精确 client graph revision 完成确认。
 - 如果包需要执行安装脚本，操作者可能需要自行配置 pnpm build allowance；Manager 不会自动授权。
 - 移除 Manager 或单个 Workspace App 时，registry 与用户数据会被保留。
@@ -248,6 +248,14 @@ function asPeers(manifest: Manifest): Record<string, string> {
   return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
 }
 
+function releasePeerSpecifier(name: string, dshVersion: string, current: string): string {
+  if (name === '@deepseek-ai/cordis') return '^4.0.1'
+  if (name === '@deepseek-ai/cordis-plugin-include'
+    || name === '@deepseek-ai/cordis-plugin-loader') return '^1.0.0'
+  if (name.startsWith('@deepseek-ai/dsh-')) return `>=${dshVersion} <0.2.0`
+  return current
+}
+
 /**
  * Resolve the only recursive-delete target owned by this extractor.
  * @param sourceRoot - DeepSeek Harness repository root.
@@ -305,7 +313,10 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
   const dependencies = Object.fromEntries(
     Object.entries(hostDependencies).filter(([name]) => !name.startsWith('@deepseek-ai/')),
   )
-  const peerDependencies = {
+  const rootManifest = readManifest(join(root, 'package.json'))
+  const dshVersion = rootManifest.version
+  if (typeof dshVersion !== 'string') throw new Error('DeepSeek Harness root package lacks a version')
+  const collectedPeers = {
     ...Object.fromEntries(
       Object.entries(hostDependencies)
         .filter(([name]) => name.startsWith('@deepseek-ai/'))
@@ -315,6 +326,11 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
     ...asPeers(normalizedClient),
     '@deepseek-ai/cordis': '^4.0.1',
   }
+  const peerDependencies = Object.fromEntries(
+    Object.entries(collectedPeers)
+      .filter(([name]) => name !== '@deepseek-ai/dsh-page-app-manager')
+      .map(([name, version]) => [name, releasePeerSpecifier(name, dshVersion, version)]),
+  )
   const clientDsh = clientManifest.dsh
   const client = clientDsh !== null && typeof clientDsh === 'object' && !Array.isArray(clientDsh)
     ? (clientDsh as Record<string, unknown>).client
@@ -325,7 +341,7 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
     version: VERSION,
     private: false,
     type: 'module',
-    packageManager: readManifest(join(root, 'package.json')).packageManager,
+    packageManager: rootManifest.packageManager,
     main: './lib/index.js',
     types: './lib/types/index.d.ts',
     exports: {
