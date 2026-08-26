@@ -6,7 +6,7 @@ import { parseArgs } from 'node:util'
 import { isEntry } from './release/process.ts'
 
 const VERSION = '1.0.0'
-const MANAGER_NAME = '@catwine901/dsh-workspace-manager'
+const MANAGER_NAME = '@tingyu9527/dsh-workspace-manager'
 const REPOSITORY_URL = 'https://github.com/catWine901/dsh-workspace-manager'
 const SOURCE_PACKAGES = [
   'packages/boot/page-app-profile',
@@ -34,7 +34,7 @@ An out-of-tree Workspace Apps control plane for [DeepSeek Harness](https://githu
 Requirements: a DeepSeek Harness 0.1.1-rc.2 source build (or a later compatible 0.1.x release), Node.js 20 or newer, and pnpm 11.7.0 on \`PATH\`. This package uses seams introduced after 0.1.0-rc.6 and is not compatible with the older 0.1.0-rc.6 public release.
 
 \`\`\`sh
-dsh plugin --profile <profile> add @catwine901/dsh-workspace-manager@1.0.0
+dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.0
 dsh --profile <profile>
 \`\`\`
 
@@ -43,8 +43,8 @@ Open **Plugins → Workspace Apps** to manage compatible Workspace App packages.
 To update or remove the manager:
 
 \`\`\`sh
-dsh plugin --profile <profile> update @catwine901/dsh-workspace-manager
-dsh plugin --profile <profile> remove @catwine901/dsh-workspace-manager
+dsh plugin --profile <profile> update @tingyu9527/dsh-workspace-manager
+dsh plugin --profile <profile> remove @tingyu9527/dsh-workspace-manager
 \`\`\`
 
 The repository can also be installed directly when it contains the release artifacts:
@@ -108,7 +108,7 @@ const README_ZH = `# DSH Workspace Manager
 要求：DeepSeek Harness 0.1.1-rc.2 源码构建（或后续兼容的 0.1.x 版本）、Node.js 20 或更高版本，并确保 pnpm 11.7.0 位于 \`PATH\`。本包依赖 0.1.0-rc.6 之后新增的 seam，因此不兼容较旧的 0.1.0-rc.6 公共版本。
 
 \`\`\`sh
-dsh plugin --profile <profile> add @catwine901/dsh-workspace-manager@1.0.0
+dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.0
 dsh --profile <profile>
 \`\`\`
 
@@ -117,8 +117,8 @@ dsh --profile <profile>
 更新或移除 Manager：
 
 \`\`\`sh
-dsh plugin --profile <profile> update @catwine901/dsh-workspace-manager
-dsh plugin --profile <profile> remove @catwine901/dsh-workspace-manager
+dsh plugin --profile <profile> update @tingyu9527/dsh-workspace-manager
+dsh plugin --profile <profile> remove @tingyu9527/dsh-workspace-manager
 \`\`\`
 
 当 GitHub 仓库已包含发布产物时，也可以直接安装：

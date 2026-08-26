@@ -75,7 +75,7 @@ describe('workspace manager extraction', () => {
   it('publishes the personal package identity with actionable repository metadata', () => {
     const manifest = readJson(join(output, 'package.json'))
     expect(manifest).toMatchObject({
-      name: '@catwine901/dsh-workspace-manager',
+      name: '@tingyu9527/dsh-workspace-manager',
       repository: {
         type: 'git',
         url: 'git+https://github.com/catWine901/dsh-workspace-manager.git',
@@ -86,7 +86,7 @@ describe('workspace manager extraction', () => {
     })
 
     const readme = readFileSync(join(output, 'README.md'), 'utf8')
-    expect(readme).toContain('dsh plugin --profile <profile> add @catwine901/dsh-workspace-manager')
+    expect(readme).toContain('dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager')
     expect(readme).toContain('## What it does')
     expect(readme).toContain('## Security and lifecycle guarantees')
   })
@@ -158,7 +158,7 @@ describe('workspace manager extraction', () => {
       stdio: 'pipe',
       shell: process.platform === 'win32',
     })
-    const tarball = join(packed, 'catwine901-dsh-workspace-manager-1.0.0.tgz')
+    const tarball = join(packed, 'tingyu9527-dsh-workspace-manager-1.0.0.tgz')
     expect(() => { scanTarballContent(tarball, member => !member.endsWith('/')) }).not.toThrow()
   })
 })
