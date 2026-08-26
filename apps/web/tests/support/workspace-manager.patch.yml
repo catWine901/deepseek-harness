@@ -1,4 +1,4 @@
-# The extracted @deepseek-ai/dsh-workspace-manager package contributes one
+# The extracted @catwine901/dsh-workspace-manager package contributes one
 # Loader row whose package has both a Host export and dsh.client metadata. The
 # monorepo source of those two faces remains split while the extraction is
 # assembled, so this test-only overlay inserts both source packages explicitly.

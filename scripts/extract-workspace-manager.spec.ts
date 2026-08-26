@@ -72,6 +72,25 @@ describe('workspace manager extraction', () => {
     }
   })
 
+  it('publishes the personal package identity with actionable repository metadata', () => {
+    const manifest = readJson(join(output, 'package.json'))
+    expect(manifest).toMatchObject({
+      name: '@catwine901/dsh-workspace-manager',
+      repository: {
+        type: 'git',
+        url: 'git+https://github.com/catWine901/dsh-workspace-manager.git',
+      },
+      homepage: 'https://github.com/catWine901/dsh-workspace-manager#readme',
+      bugs: { url: 'https://github.com/catWine901/dsh-workspace-manager/issues' },
+      publishConfig: { access: 'public' },
+    })
+
+    const readme = readFileSync(join(output, 'README.md'), 'utf8')
+    expect(readme).toContain('dsh plugin --profile <profile> add @catwine901/dsh-workspace-manager')
+    expect(readme).toContain('## What it does')
+    expect(readme).toContain('## Security and lifecycle guarantees')
+  })
+
   it('skeleton exports contain no ./src/* subpath', () => {
     const manifest = readJson(join(output, 'package.json'))
     expect(Object.keys(manifest.exports as Record<string, unknown>)).not.toContain('./src/*')
@@ -125,7 +144,7 @@ describe('workspace manager extraction', () => {
       stdio: 'pipe',
       shell: process.platform === 'win32',
     })
-    const tarball = join(packed, 'deepseek-ai-dsh-workspace-manager-1.0.0.tgz')
+    const tarball = join(packed, 'catwine901-dsh-workspace-manager-1.0.0.tgz')
     expect(() => { scanTarballContent(tarball, member => !member.endsWith('/')) }).not.toThrow()
   })
 })

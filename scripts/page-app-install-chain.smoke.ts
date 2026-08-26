@@ -174,13 +174,13 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
       cwd: extracted,
       shell: process.platform === 'win32',
     })
-    const managerTarball = join(packed, 'deepseek-ai-dsh-workspace-manager-1.0.0.tgz')
+    const managerTarball = join(packed, 'catwine901-dsh-workspace-manager-1.0.0.tgz')
     scanTarballContent(managerTarball, member => !member.endsWith('/'))
 
     const env = { ...process.env, DSH_HOME: home }
     await run(dshBin, ['plugin', '--profile', profileName, 'add', managerTarball], env)
     const installed = manifestAt(join(profileDir, 'package.json'))
-    if (!installed.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-workspace-manager')) {
+    if (!installed.dsh?.profile?.bundles?.includes('@catwine901/dsh-workspace-manager')) {
       throw new Error('workspace manager install-chain did not add the manager bundle to the fresh profile')
     }
 
@@ -203,11 +203,11 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
     if (!existsSync(marker)) throw new Error('workspace manager install-chain did not reactivate pageAppManager')
 
     await run(dshBin, [
-      'plugin', '--profile', profileName, 'remove', '@deepseek-ai/dsh-workspace-manager',
+      'plugin', '--profile', profileName, 'remove', '@catwine901/dsh-workspace-manager',
     ], env)
     const uninstalled = manifestAt(join(profileDir, 'package.json'))
-    if (uninstalled.dependencies?.['@deepseek-ai/dsh-workspace-manager'] !== undefined
-      || uninstalled.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-workspace-manager') === true) {
+    if (uninstalled.dependencies?.['@catwine901/dsh-workspace-manager'] !== undefined
+      || uninstalled.dsh?.profile?.bundles?.includes('@catwine901/dsh-workspace-manager') === true) {
       throw new Error('workspace manager install-chain uninstall retained the manager dependency or bundle')
     }
 
