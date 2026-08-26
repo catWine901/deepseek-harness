@@ -13,6 +13,7 @@ import { parseArgs } from 'node:util'
 import { releaseFamily, tarballName, type ReleaseFamily, type ReleaseMember } from './families.ts'
 import { isEntry, run } from './process.ts'
 import { PUBLISH_ORDER_FILE, tarballFiles } from './tarball.ts'
+import { scanTarballContent } from '../publication-payload.ts'
 
 /** Where pack output lands when `--out` is omitted. */
 const DEFAULT_OUTPUT = 'dist/npm'
@@ -31,6 +32,7 @@ function packMember(family: ReleaseFamily, member: ReleaseMember, destination: s
   const tarball = join(destination, filename)
   if (!existsSync(tarball)) throw new Error(`${member.name} produced no tarball at ${tarball}`)
   family.validatePayload(member, tarballFiles(tarball))
+  scanTarballContent(tarball, file => !file.endsWith('/'))
   return filename
 }
 
