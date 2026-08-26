@@ -100,15 +100,6 @@
     - id: plugin-inventory
       name: '@deepseek-ai/dsh-host-plugin-inventory'
 
-    # Profile-scoped Workspace Apps manager: ownership registry, lifecycle
-    # transactions, and the pageAppManager Remote surface. Injects the
-    # launcher-owned profile runtime (identity + acknowledged recomposition).
-    # The settlement timeout bounds the client activation acknowledgement.
-    - id: page-app-manager
-      name: '@deepseek-ai/dsh-page-app-manager'
-      config:
-        settlementTimeoutMs: 60000
-
     # The API gateway: the transport-agnostic dispatch face every client shape
     # shares. The base layer's agent-default-model service owns the default model.
     - id: api-gateway
@@ -193,13 +184,6 @@
 
     - id: locale
       name: '@deepseek-ai/dsh-client-locale'
-
-    # The outer Workspace Apps shell: owns the built-in 'root' seat, declares
-    # the builtin DSH and keyed surface seats, and contributes the Settings →
-    # Plugins → Workspace tab. Mounted before ui-layout (which occupies the
-    # builtin seat inside it).
-    - id: ui-page-app-manager
-      name: '@deepseek-ai/dsh-client-ui-page-app-manager'
 
     - id: ui-layout
       name: '@deepseek-ai/dsh-client-ui-layout'
