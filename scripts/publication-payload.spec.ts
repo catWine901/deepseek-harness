@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   hasTypertRemoteNavigation,
   isForbiddenPublicationFile,
+  validateTarballPayloadContent,
   validateTarballPayload,
 } from './publication-payload.ts'
 
@@ -65,6 +66,55 @@ describe('publication payload policy', () => {
       'package/lib/types/index.d.ts',
       'package/lib/styles/base.css',
     ])).not.toThrow()
+  })
+
+  it('flags a member containing a Windows drive path', () => {
+    expect(() => {
+      validateTarballPayloadContent(
+        ['package/lib/index.js'],
+        () => String.raw`const cache = "C:\Users\builder\workspace"`,
+        'fixture.tgz',
+      )
+    }).toThrow('fixture.tgz member package/lib/index.js contains absolute path C:\\Users\\')
+  })
+
+  it('flags a member containing a POSIX root', () => {
+    expect(() => {
+      validateTarballPayloadContent(
+        ['package/lib/index.js'],
+        () => 'const cache = "/home/builder/workspace"',
+        'fixture.tgz',
+      )
+    }).toThrow('fixture.tgz member package/lib/index.js contains absolute path /home/')
+  })
+
+  it('passes a payload with no absolute paths', () => {
+    const members = new Map([
+      ['package/package.json', '{"main":"./lib/index.js"}'],
+      ['package/lib/index.js', 'export const relative = "../assets/icon.svg"'],
+    ])
+    expect(() => {
+      validateTarballPayloadContent(
+        [...members.keys()],
+        member => members.get(member) ?? '',
+        'fixture.tgz',
+      )
+    }).not.toThrow()
+  })
+
+  it('does not treat a URL scheme suffix as a Windows drive path', () => {
+    expect(() => {
+      validateTarballPayloadContent(
+        ['package/lib/index.js'],
+        () => 'const protocol = "npm:/registry-package"',
+        'fixture.tgz',
+      )
+    }).not.toThrow()
+  })
+
+  it('member-name checks still reject src and maps', () => {
+    expect(validateFixtureTarball(['package/src/index.ts'])).toThrow(/publishes source file/)
+    expect(validateFixtureTarball(['package/lib/index.js.map'])).toThrow(/publishes source map/)
   })
 
   it('recognizes only the canonical Host-for-Client export pair', () => {

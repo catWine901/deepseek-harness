@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { startMockLlmServer } from '@deepseek-ai/dsh-llm-mock-server'
 import { execa } from 'execa'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { runPageAppInstallChain } from '../../../scripts/page-app-install-chain.smoke.ts'
 
 /** Published-entry acceptance for argument errors, profile lifecycle, and boot-free config dumps. */
 const repoRoot = fileURLToPath(new URL('../../../', import.meta.url))
@@ -670,6 +671,18 @@ describe.skipIf(!existsSync(dshBin))('dsh BUILT bin (node lib/bin.js, no tsx)', 
       rmSync(checkout, { recursive: true, force: true })
     }
   }, 90_000)
+
+  it('workspace manager tarball installs into a fresh profile and survives disable and uninstall (built bin)', async () => {
+    const result = await runPageAppInstallChain({ repoRoot, dshBin })
+    expect(result).toEqual({
+      tarballScanned: true,
+      installedAndStarted: true,
+      disabledWithNativeDsh: true,
+      managerAbsentWhileDisabled: true,
+      reenabled: true,
+      uninstalled: true,
+    })
+  }, 180_000)
 
   it('activates a dependency that gained dsh.bundle in a later update', async () => {
     // Reconcile runs against the INSTALLED state on every successful pnpm
