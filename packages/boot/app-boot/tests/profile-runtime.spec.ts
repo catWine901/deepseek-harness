@@ -26,7 +26,6 @@ import {
   PROFILE_RUNTIME_SERVICE,
   ProfileRuntime,
   readManagerLayerPatches,
-  watchUserPatches,
   type ActiveProfileIdentity,
   type ExpectedManagedRoot,
   type ProfileRuntimeApplyRequest,
@@ -731,15 +730,24 @@ describe('ProfileRuntime proxy poisoning and watcher surface', () => {
     }
   })
 
-  it('cannot route a user-patch watcher to the runtime through the public watchUserPatches API', async () => {
+  it('ProfileRuntime composition covers the user-patch watcher path formerly served by the public helper', async () => {
     const dir = tmp()
     writeFileSync(join(dir, 'noop.mjs'), NOOP_PLUGIN)
     writeFileSync(join(dir, 'cordis.yml'), '- id: base\n  name: ./noop.mjs\n')
     mkdirSync(join(dir, '.workspace-manager'), { recursive: true })
     const patchFile = join(dir, PROFILE_PATCH_FILENAME)
     writeFileSync(patchFile, '[]\n')
+    let captured: (() => Promise<void>) | undefined
     let runtime: ProfileRuntime | undefined
     const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, (hostCtx) => {
+      // Capture the runtime-owned watcher deterministically: invoking this
+      // callback is one exact-path HMR refresh without chokidar timing.
+      hostCtx.provide('hmr', {
+        registerConfig: async (_filename: string, callback: () => Promise<void>) => {
+          captured = callback
+          return async () => {}
+        },
+      })
       runtime = new ProfileRuntime(hostCtx, {
         identity: { name: 'demo', directory: dir },
         compose: managerPatches => composeProfilePatches({
@@ -750,36 +758,27 @@ describe('ProfileRuntime proxy poisoning and watcher surface', () => {
           overlays: [],
         }),
         initialManagerPatches: [],
+        watchPatches: [{ binName: NAME, filename: patchFile }],
       })
     })
     if (runtime === undefined) throw new Error('boot did not construct the profile runtime')
     try {
-      // A fake HMR captures the registered config callback deterministically
-      // (no chokidar timing), so invoking the callback simulates one refresh.
-      let captured: (() => Promise<void>) | undefined
-      ctx.provide('hmr', {
-        registerConfig: async (_filename: string, callback: () => Promise<void>) => {
-          captured = callback
-          return async () => {}
-        },
-      })
+      expect(captured).toBeDefined()
       const { layer, expected } = singleRootLayer('page', 1)
       writeFileSync(join(dir, '.workspace-manager', 'runtime-layer.yml'), layer)
       await runtime.applyManagerLayer(applyRequest(layer, [expected]))
 
-      const trigger = join(dir, 'consumer-trigger.yml')
-      writeFileSync(trigger, '[]\n')
-      // @ts-expect-error the public watcher API has no runtime-routing option
-      await watchUserPatches(ctx, { binName: NAME, filename: trigger, runtime })
-      expect(captured).toBeDefined()
+      writeFileSync(patchFile, '- id: base\n  config:\n    value: refreshed\n')
       await captured!()
 
-      // A public watcher must not have recomposed the runtime: the root
-      // include's patch list must not contain the acknowledged manager layer.
+      // The runtime-owned watcher recomposes the fresh user layer around the
+      // last acknowledged manager layer, preserving both in one generation.
       const include = [...ctx.loader.entries()].find(entry => entry.options.name === 'cordis:include')
       const config = include?.options.config as { patches?: Array<Record<string, unknown>> } | undefined
       const patches = config?.patches ?? []
-      expect(patches.some(patch => JSON.stringify(patch).includes('page'))).toBe(false)
+      expect(patches.some(patch => JSON.stringify(patch).includes('page'))).toBe(true)
+      expect([...ctx.loader.entries()].find(entry => entry.options.id === 'base')?.options.config)
+        .toEqual({ value: 'refreshed' })
     } finally {
       await ctx.fiber.dispose()
     }
@@ -1330,7 +1329,7 @@ describe('M7 managed-root wrapper derivation', () => {
     }
   }
 
-  it('derives wrapper root rows that inject workbenchRuntime and mount feature rows as children', async () => {
+  it('no direct-root form remains (derivation emits wrapper rows only)', async () => {
     const profile = tmp()
     stageFeaturePackage(profile)
     stageManagerPackage(profile)

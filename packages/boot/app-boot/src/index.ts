@@ -224,72 +224,12 @@ export function loadLayeredEnv(
   ])
 }
 
-const bootstrapIncludes = new WeakMap<Context, Entry>()
-
 // The include's YAML dialect (`!!js` scalars become expression nodes the
 // Loader interpolates against each entry's injection-ready context), imported
 // from the include itself so patch parsing and config dumping can never drift
 // from what the include mounts. User patch layers share it so they may
 // reference `process.env`.
 const userPatchesSchema = entryListSchema
-
-/** Options for live user patch-layer reconciliation. */
-export interface UserPatchWatchOptions {
-  /** Diagnostic prefix used by {@link loadOptionalPatches}. */
-  binName: string
-  /** Absolute path of the watched patch file (a profile's `cordis.patch.yml`). */
-  filename: string
-  /**
-   * Compose the full patch list for a fresh user-layer generation —
-   * the same composition the app booted with, so a reload can interleave the
-   * new user patches between app-owned layers (bundle layers below,
-   * overlays above). Identity when omitted: the user layer
-   * is the whole patch list.
-   */
-  compose?: (userPatches: PatchOptions[]) => PatchOptions[]
-}
-
-/**
- * Watch the user patch layer through Cordis HMR and transactionally reapply it to the boot include.
- * @param ctx - settled app context containing the root Include and an active HMR service.
- * @param options - diagnostic, file, and patch-composition inputs.
- * @returns an asynchronous disposer after the exact-path watcher is ready.
- * @throws when HMR or the root Include is absent, watcher setup fails, or initial path resolution fails.
- */
-export async function watchUserPatches(
-  ctx: Context,
-  options: UserPatchWatchOptions,
-): Promise<() => Promise<void>> {
-  const { binName, filename, compose = (patches: PatchOptions[]) => patches } = options
-  const hmr = ctx.get('hmr')
-  if (hmr === undefined) throw new Error(`${binName}: user patch-layer watching requires the Cordis HMR service`)
-  const entry = bootstrapIncludes.get(ctx)
-  if (entry === undefined) throw new Error(`${binName}: user patch-layer watching requires the root Include entry`)
-  const register = hmr.registerConfig(filename, async () => {
-    // Re-read the include's non-patch options per refresh: a writer that
-    // updates the root Include's other options between refreshes (none exists
-    // today) must not have them silently reverted by a user-layer reload.
-    const { patches: _previousPatches, ...includeConfig } = entry.options.config as Include.Config
-    const userPatches = loadOptionalPatches(binName, filename) ?? []
-    const patches = compose(userPatches)
-    await entry.update({
-      config: {
-        ...includeConfig,
-        patches,
-      },
-    })
-  })
-  try {
-    return await register
-  } catch (error) {
-    // A surface can dispose the whole tree while the watcher is still opening;
-    // the HMR effect registration then fails with INACTIVE_EFFECT. That is the
-    // app exiting exactly as asked, not a watch failure, so return a no-op
-    // disposer instead of crashing.
-    if ((error as { code?: string } | null)?.code === 'INACTIVE_EFFECT') return async () => {}
-    throw error
-  }
-}
 
 /**
  * Load an optional patch-list file: a top-level YAML array of loader patch
@@ -500,7 +440,7 @@ function groupedDump(
 }
 
 /**
- * Mount and remember the exact root Include entry used by app boot and user patch-layer HMR.
+ * Mount the exact root Include entry used by app boot and ProfileRuntime recomposition.
  * @param ctx - context carrying an initialized Loader service.
  * @param absoluteConfigPath - absolute YAML or JSON configuration path.
  * @param patches - initial app and user patches, applied in order.
@@ -550,9 +490,7 @@ export async function mountRootInclude(
   const includeId = await ctx.loader.create(rootInclude)
   const loader = ctx.get('loader')
   if (loader === undefined) return undefined
-  const entry = loader.resolve(includeId)
-  bootstrapIncludes.set(ctx, entry)
-  return entry
+  return loader.resolve(includeId)
 }
 
 /**

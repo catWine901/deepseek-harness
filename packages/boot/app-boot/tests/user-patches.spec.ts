@@ -18,7 +18,7 @@ import {
   boot,
   loadOptionalPatches,
   PROFILE_PATCH_FILENAME,
-  watchUserPatches,
+  ProfileRuntime,
 } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
@@ -107,6 +107,27 @@ function writeTree(dir: string): string {
 
 function entryConfig(ctx: Context, id: string): unknown {
   return [...ctx.loader.entries()].find(entry => entry.options.id === id)?.options.config
+}
+
+async function bootWatchedProfile(
+  dir: string,
+  filename: string,
+  appPatches: readonly PatchOptions[] = [],
+): Promise<Context> {
+  const compose = (): PatchOptions[] => [
+    ...appPatches,
+    ...(loadOptionalPatches(NAME, filename) ?? []),
+  ]
+  return boot(NAME, writeTree(dir), compose(), async (hostCtx) => {
+    await hostCtx.plugin(Timer)
+    await hostCtx.plugin(Hmr, { root: [], ignored: [], debounce: 0 })
+    new ProfileRuntime(hostCtx, {
+      identity: { name: 'demo', directory: dir },
+      compose,
+      initialManagerPatches: [],
+      watchPatches: [{ binName: NAME, filename }],
+    })
+  })
 }
 
 describe('Loader config interpolation', () => {
@@ -312,22 +333,15 @@ describe('boot with user patches', () => {
     }
   })
 
-  it('watches add, failure, recovery, and removal through transactional HMR', { timeout: 20_000 }, async () => {
+  it('recomposes add, failure, recovery, and removal through the ProfileRuntime watcher', async () => {
     const dir = tmp()
     const userDir = tmp()
     const filename = join(userDir, PROFILE_PATCH_FILENAME)
     const basePatches = [{ id: 'noop', config: { value: 'generated' } }]
-    const ctx = await boot(NAME, writeTree(dir), basePatches)
-    await ctx.plugin(Timer)
-    await ctx.plugin(Hmr, { root: [], ignored: [], debounce: 0 })
+    const ctx = await bootWatchedProfile(dir, filename, basePatches)
     const failures: Array<{ filename: string; error: Error }> = []
     ctx.on('hmr/config-update-failed', (failedFilename, error) => {
       failures.push({ filename: failedFilename, error })
-    })
-    const dispose = await watchUserPatches(ctx, {
-      binName: NAME,
-      filename,
-      compose: userPatches => [...basePatches, ...userPatches],
     })
     try {
       writeFileSync(filename, '- id: noop\n  config:\n    value: live\n')
@@ -354,69 +368,19 @@ describe('boot with user patches', () => {
       await eventually(() => (entryConfig(ctx, 'noop') as { value?: string }).value === 'generated', 'user patch removal did not restore the app-owned patch')
       expect(failures).toHaveLength(2)
       await settleChokidarChangeThrottle()
-
-      // Default compose: the user layer IS the whole patch list, so a
-      // fresh generation replaces the app-owned layer instead of stacking on it.
-      await dispose()
-      const disposeDefault = await watchUserPatches(ctx, { binName: NAME, filename })
-      try {
-        writeFileSync(filename, '- id: noop\n  config:\n    value: identity\n')
-        await eventually(() => (entryConfig(ctx, 'noop') as { value?: string }).value === 'identity', 'default-compose user patch was not applied')
-      } finally {
-        await disposeDefault()
-      }
-    } finally {
-      await dispose()
-      await ctx.fiber.dispose()
-    }
-  })
-
-  it('fails loud when the exact watcher lacks HMR or a root Include', async () => {
-    const dir = tmp()
-    const withoutHmr = await boot(NAME, writeTree(dir))
-    await expect(watchUserPatches(withoutHmr, { binName: NAME, filename: join(tmp(), PROFILE_PATCH_FILENAME) })).rejects.toThrow('requires the Cordis HMR service')
-    await withoutHmr.fiber.dispose()
-
-    const withoutInclude = new Context()
-    withoutInclude.baseUrl = pathToFileURL(`${tmp()}/`).href
-    await withoutInclude.plugin(Loader)
-    await withoutInclude.plugin(Timer)
-    await withoutInclude.plugin(Hmr, { root: [], ignored: [], debounce: 0 })
-    await expect(watchUserPatches(withoutInclude, { binName: NAME, filename: join(tmp(), PROFILE_PATCH_FILENAME) })).rejects.toThrow('requires the root Include entry')
-    await withoutInclude.fiber.dispose()
-  })
-
-  it('returns a no-op disposer when the tree is disposed while the watcher opens', async () => {
-    // A surface can dispose the whole tree while registerConfig's effect
-    // registration is still in flight (the HMR effect then fails with
-    // INACTIVE_EFFECT); the app is exiting exactly as asked, so the watcher
-    // must not crash the process. The stub makes the race deterministic — the
-    // live-teardown ordering itself is not stageable.
-    const dir = tmp()
-    const ctx = await boot(NAME, writeTree(dir))
-    try {
-      const teardown = Object.assign(new Error('cannot create effect on inactive context'), { code: 'INACTIVE_EFFECT' })
-      ctx.provide('hmr', { registerConfig: () => Promise.reject(teardown) })
-      const dispose = await watchUserPatches(ctx, { binName: NAME, filename: join(tmp(), PROFILE_PATCH_FILENAME) })
-      await expect(dispose()).resolves.toBeUndefined()
     } finally {
       await ctx.fiber.dispose()
     }
-  })
 
-  it('propagates registration failures other than mid-teardown', async () => {
-    const dir = tmp()
-    const filename = join(tmp(), PROFILE_PATCH_FILENAME)
-    const ctx = await boot(NAME, writeTree(dir))
+    // A launcher can make the user layer the whole live composition by
+    // supplying no app-owned patches to the ProfileRuntime compose closure.
+    const identityDir = tmp()
+    const identity = await bootWatchedProfile(identityDir, filename)
     try {
-      await ctx.plugin(Timer)
-      await ctx.plugin(Hmr, { root: [], ignored: [], debounce: 0 })
-      const dispose = await watchUserPatches(ctx, { binName: NAME, filename })
-      // Same user-layer path registered twice: HMR refuses; not a teardown race.
-      await expect(watchUserPatches(ctx, { binName: NAME, filename })).rejects.toThrow('already registered')
-      await dispose()
+      writeFileSync(filename, '- id: noop\n  config:\n    value: identity\n')
+      await eventually(() => (entryConfig(identity, 'noop') as { value?: string }).value === 'identity', 'identity user patch was not applied')
     } finally {
-      await ctx.fiber.dispose()
+      await identity.fiber.dispose()
     }
   })
 })
