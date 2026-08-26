@@ -845,27 +845,48 @@ class ProfileRuntimeState {
 const states = new WeakMap<ProfileRuntime, ProfileRuntimeState>()
 
 /**
- * Resolve the module-private state for a service instance, validating every
- * proxy step. A direct registry hit takes precedence: a raw instance's own
- * properties — including a consumer-written `symbols.original` key — can
- * never redirect state, because the raw instance is the registry key and a
- * direct hit is returned first. Only objects that are NOT directly registered
- * may be unwrapped through the traceable proxy's `symbols.original` escape
- * hatch, and the unwrapped target must itself resolve to registered state;
- * anything else fails loud. `this` inside a proxied method arrives as the
- * shadow receiver, which also unwraps to the registered raw instance.
- * @param runtime - the service instance in any proxy form.
+ * Resolve the module-private state by walking the traceable proxy chain to
+ * the registered raw instance. Every hop checks the state registry BEFORE
+ * following the proxy's `symbols.original` escape hatch, so a directly
+ * registered object resolves immediately: a raw instance's own properties —
+ * including a consumer-written `symbols.original` key — can never redirect
+ * state, because the raw instance is the registry key and the direct hit is
+ * returned first. Only objects that are NOT directly registered are unwrapped,
+ * one layer at a time, until the registered raw instance is reached; the walk
+ * stops on `undefined`, on a non-object target, and on any object already
+ * visited (a self/cycle reference) and reports the miss instead of looping.
+ * `this` inside a proxied method arrives as the shadow receiver, which also
+ * unwraps through the chain.
+ * @param runtime - the service instance in any raw or traceable proxy form.
+ * @returns the module-private state, or undefined when no hop is registered.
+ */
+function resolveState(runtime: ProfileRuntime): ProfileRuntimeState | undefined {
+  const visited = new Set<object>()
+  let current: unknown = runtime
+  while (typeof current === 'object' && current !== null) {
+    if (visited.has(current)) return undefined
+    visited.add(current)
+    const direct = states.get(current as ProfileRuntime)
+    if (direct !== undefined) return direct
+    current = (current as Record<symbol, unknown>)[symbols.original]
+  }
+  return undefined
+}
+
+/**
+ * Resolve the module-private state for a service instance, failing loud when
+ * the instance is not registered. A direct registry hit takes precedence at
+ * every hop; see {@link resolveState} for the full walk contract.
+ * @param runtime - the service instance in any raw or traceable proxy form.
  * @returns the module-private state.
+ * @throws {Error} when no hop in the proxy chain is registered.
  */
 function stateOf(runtime: ProfileRuntime): ProfileRuntimeState {
-  const direct = states.get(runtime)
-  if (direct !== undefined) return direct
-  const target = (runtime as unknown as Record<symbol, unknown>)[symbols.original] as ProfileRuntime | undefined
-  if (target !== undefined) {
-    const viaOriginal = states.get(target)
-    if (viaOriginal !== undefined) return viaOriginal
+  const state = resolveState(runtime)
+  if (state === undefined) {
+    throw new Error('page-app profile runtime: state is unavailable for this instance')
   }
-  throw new Error('page-app profile runtime: state is unavailable for this instance')
+  return state
 }
 
 /**
@@ -875,20 +896,13 @@ function stateOf(runtime: ProfileRuntime): ProfileRuntimeState {
  * bind/settle/recompose through any public string, symbol, or package API.
  * Directly registered raw instances are resolved without consulting any
  * writable own property; only non-registered proxy forms are unwrapped, and
- * only when the unwrapped target is itself registered.
- * @param runtime - the service instance (raw or the traceable proxy).
- * @returns the control, or undefined when the instance was not constructed by
- * this module (never happens for instances built through {@link ProfileRuntime}).
+ * only when the unwrapped chain resolves to a registered instance.
+ * @param runtime - the service instance (raw or any traceable proxy layer).
+ * @returns the control, or undefined when no hop in the proxy chain is
+ * registered (never happens for instances built through {@link ProfileRuntime}).
  */
 export function profileRuntimeControl(runtime: ProfileRuntime): ProfileRuntimeControl | undefined {
-  const direct = states.get(runtime)
-  if (direct !== undefined) return direct.control
-  const target = (runtime as unknown as Record<symbol, unknown>)[symbols.original] as ProfileRuntime | undefined
-  if (target !== undefined) {
-    const viaOriginal = states.get(target)
-    if (viaOriginal !== undefined) return viaOriginal.control
-  }
-  return undefined
+  return resolveState(runtime)?.control
 }
 
 /**
