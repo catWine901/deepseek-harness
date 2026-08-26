@@ -24,6 +24,7 @@
 // assertConsumed for the teardown fixture-consumption check).
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -43,7 +44,14 @@ import {
   composeEntries,
   healProfilesModuleFallback,
   loadOverlayPatches,
+  prepareManagerRuntimeLayer,
+  ProfileRuntime,
+  readManagerLayerPatches,
 } from '@deepseek-ai/dsh-app-boot'
+// The launcher/boot-only control is deliberately absent from the package root
+// (the launcher binds and settles inside boot()); the web e2e lane builds its
+// own include tree, so it imports the control test-side from app-boot source.
+import { profileRuntimeControl } from '../../../packages/boot/app-boot/src/profile-runtime.ts'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import { LlmAdapter } from '@deepseek-ai/dsh-llm'
@@ -300,6 +308,14 @@ export interface LaunchOptions {
   remoteAuthority?: string
   /** Reuse an existing harness home so a second Host can verify user settings across origins. */
   harnessHome?: string
+  /**
+   * Wire the launcher-owned profile runtime so the page-app manager row
+   * activates for real (identity = the scaffold profile, acknowledged
+   * recomposition over the composed patch stack, boot-time manager layer
+   * derived from a surviving registry). Opt-in: every other scenario boots
+   * with the manager row inert, exactly as before.
+   */
+  enablePageAppManager?: boolean
 }
 
 /** Dispose the booted tree and remove both owned temp roots, reporting every independent cleanup failure. */
@@ -396,15 +412,50 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
   const extraOverlayPatches = options.extraOverlayPath === undefined
     ? []
     : loadOverlayPatches('web e2e scaffold', options.extraOverlayPath)
-  const composedRows = composeEntries([basePatches, surfacePatches, extraOverlayPatches])
+  // The scaffold profile dir and its boot-time manager layer, prepared exactly
+  // as the launcher does when the page-app manager must activate: the runtime
+  // layer is regenerated from a surviving registry before the initial
+  // composition, so a previously installed fixture mounts again on a later
+  // boot of the same home.
+  const profileDir = join(harnessHome, 'profiles', 'scaffold')
+  const managerPatches: PatchOptions[] = []
+  if (options.enablePageAppManager === true) {
+    await mkdir(profileDir, { recursive: true })
+    // The real launcher initializes a minimal private profile manifest before
+    // any pnpm operation (initProfile). Without it, the manager's `pnpm add`
+    // walks up and treats the parent `profiles/` directory as the project root,
+    // leaving the profile dependency map unchanged — mirror the launcher shape
+    // (manifest + hoisted workspace) so the install writes into this profile.
+    // Create-if-missing only: a reused harness home must keep the dependency
+    // the manager installed on an earlier boot of the same profile.
+    const profileManifestPath = join(profileDir, 'package.json')
+    if (!existsSync(profileManifestPath)) {
+      await writeFile(profileManifestPath, JSON.stringify({
+        name: 'dsh-profile-scaffold',
+        private: true,
+        dependencies: {},
+      }, undefined, 2) + '\n')
+    }
+    const profileWorkspacePath = join(profileDir, 'pnpm-workspace.yaml')
+    if (!existsSync(profileWorkspacePath)) {
+      await writeFile(profileWorkspacePath, [
+        'packages:',
+        '  - .',
+        '',
+        'nodeLinker: hoisted',
+        'autoInstallPeers: false',
+        '',
+      ].join('\n'))
+    }
+    await prepareManagerRuntimeLayer('web e2e scaffold', profileDir)
+    managerPatches.push(...readManagerLayerPatches('web e2e scaffold', profileDir))
+  }
+  const composedRows = composeEntries([basePatches, surfacePatches, managerPatches, extraOverlayPatches])
   const webRuntimeConfig = composedRows.find(row => row.id === 'web-runtime')?.config as {
     surfaceContext?: boolean
   } | undefined
   const surfaceContext = webRuntimeConfig?.surfaceContext !== false
-  const patches: PatchOptions[] = [
-    ...basePatches,
-    ...surfacePatches,
-    ...extraOverlayPatches,
+  const hermeticPatches: PatchOptions[] = [
     // The roster's `roots` is an assembly fact AppCLIEntry resolves and patches
     // in, exactly like `distIndex` on the webserver row — the shipped preset
     // directory sits beside the composition that names it, and no config author
@@ -516,6 +567,17 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
       : [{ id: 'llm-deepseek', disabled: true }],
   ]
 
+  // The composed patch stack, in launcher order: bundles → manager layer →
+  // overlays → the lane's hermetic test patches (identical to the old single
+  // array when the manager layer is empty).
+  const patches: PatchOptions[] = [
+    ...basePatches,
+    ...surfacePatches,
+    ...managerPatches,
+    ...extraOverlayPatches,
+    ...hermeticPatches,
+  ]
+
   // Sessions inherit the gateway's process.cwd() default; run the boot from
   // the temp workspace so tool cwd, session cwd, and fixtures agree.
   const originalCwd = process.cwd()
@@ -528,7 +590,6 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     // harness home, with bare plugin names resolving through the flat module
     // fallback the launcher heals under <home>/profiles.
     healProfilesModuleFallback(INSTALL_ANCHOR, harnessHome)
-    const profileDir = join(harnessHome, 'profiles', 'scaffold')
     await mkdir(profileDir, { recursive: true })
     const rootConfig = join(profileDir, 'cordis.yml')
     await writeFile(rootConfig, '[]\n')
@@ -546,18 +607,60 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
       },
     })
     await ctx.plugin(Loader)
+    // Anchor bare-specifier imports to the generated profile config. Its parent
+    // `profiles/node_modules` is the flat dependency closure that the launcher
+    // heals from the CLI installation; anchoring to an individual bundle would
+    // hide sibling bundle dependencies such as the base layer's LLM plugins.
+    // Relative names still resolve beside the profile config; cordis: builtins
+    // never reach this seam (tree.ts handles them first). The partial shape
+    // mirrors the loader-composition tests.
+    const profileRequire = createRequire(rootConfig)
+    ctx.loader.internal = {
+      version: 'v2',
+      import: async (name: string, baseUrl: string): Promise<unknown> => {
+        if (name.startsWith('.')) return await import(new URL(name, baseUrl).href) as unknown
+        const resolved = profileRequire.resolve(name)
+        return await import(pathToFileURL(resolved).href) as unknown
+      },
+    } as unknown as NonNullable<typeof ctx.loader.internal>
     ctx.loader.builtins.include = Include
     // `cordis:group` beside it, exactly as `boot()` registers it: a group row is
     // how a preset gives one `isolate` realm to a provider and its consumers,
     // and a preset resolving package names from its own directory cannot reach
     // `@deepseek-ai/cordis-plugin-group` by name.
     ctx.loader.builtins.group = Group
-    await ctx.loader.create({
+    // Launcher-owned profile runtime, wired before any config-tree entry mounts
+    // so the manager row's `profileRuntime` inject resolves (boot()'s prepare).
+    // The scaffold composes the same patch stack the runtime recomposes, so an
+    // acknowledged manager layer swaps only the manager slice between bundles
+    // and the overlays. Bind and settle mirror boot() (via the test-side
+    // control import).
+    let pageAppRuntime: ProfileRuntime | undefined
+    if (options.enablePageAppManager === true) {
+      pageAppRuntime = new ProfileRuntime(ctx, {
+        identity: { name: 'scaffold', directory: profileDir },
+        compose: generationPatches => [
+          ...basePatches,
+          ...surfacePatches,
+          ...generationPatches,
+          ...extraOverlayPatches,
+          ...hermeticPatches,
+        ],
+        initialManagerPatches: [...managerPatches],
+      })
+    }
+    const includeId = await ctx.loader.create({
       name: 'cordis:include',
       config: { path: pathToFileURL(rootConfig).href, patches },
     })
+    if (pageAppRuntime !== undefined) {
+      profileRuntimeControl(pageAppRuntime)?.bindRootInclude(ctx.loader.resolve(includeId))
+    }
     await ctx.loader.await()
     assertEntriesLoaded(ctx, 'web e2e scaffold')
+    if (pageAppRuntime !== undefined) {
+      await profileRuntimeControl(pageAppRuntime)?.markSettled()
+    }
     if (options.welcomeNoticePending !== true) {
       await ctx.settings.mutate(settingsNamespace(WELCOME_NOTICE_SETTINGS_NAMESPACE), [{
         op: 'set', path: [WELCOME_NOTICE_ACK_FIELD], value: WELCOME_NOTICE_VERSION,

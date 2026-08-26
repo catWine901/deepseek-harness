@@ -1,16 +1,17 @@
 /**
  * Host half of the page-app fixture. Contract v1 keeps the Feature module free
- * of Cordis: the Workbench Runtime wrapper (M7) composes this row and exposes
- * only the WorkbenchContext to it, so the node half stays an empty mount until
- * the wrapper injects the surface context (M9).
+ * of Cordis: the Workbench Runtime wrapper composes this row and provides the
+ * workbenchRuntime service, so the node half stays an empty mount — the
+ * surface contribution lives in the client half, which consumes the
+ * Workbench Contract surface entry from the injected, caller-bound bridge.
  * @module @deepseek-ai/dsh-page-app-fixture
  */
 
 /** Stable Loader entry name for the fixture's host row. */
 export const name = 'dsh-page-app-fixture'
 
-/** No services required: the wrapper supplies the WorkbenchContext at mount. */
+/** No services required: the host wrapper supplies its Workbench Runtime. */
 export const inject: readonly string[] = []
 
-/** Mount the host half; the wrapper drives the surface lifecycle (M9). */
+/** Mount the host half; the wrapper drives the surface lifecycle. */
 export function apply(): void {}

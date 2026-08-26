@@ -4192,12 +4192,21 @@ importers:
 
   packages/examples/page-app-fixture:
     devDependencies:
+      '@deepseek-ai/dsh-client-ui-page-app-manager':
+        specifier: workspace:^
+        version: link:../../client/ui-page-app-manager
       '@deepseek-ai/dsh-invariants':
         specifier: workspace:^
         version: link:../../runtime-diagnostics/invariants
       '@deepseek-ai/dsh-page-app-profile':
         specifier: workspace:^
         version: link:../../boot/page-app-profile
+      '@types/react':
+        specifier: ~18.3.1
+        version: 18.3.31
+      react:
+        specifier: ^18.2.0
+        version: 18.3.1
 
   packages/experimental/agent-team:
     dependencies:

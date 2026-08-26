@@ -21,7 +21,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { Context, FiberState, Service, symbols } from '@deepseek-ai/cordis'
 import type { Entry, EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
@@ -66,17 +66,19 @@ export function managedRootWrapperId(pageId: string): string {
 
 /**
  * Whether the manager package that owns the Feature Runtime Wrapper module is
- * installed in the profile. Profile-local pnpm installs (hoisted linker) place
- * the manager directly under the profile's own `node_modules` — the same
- * anchor the Loader resolves the wrapper module against — so an uninstalled
- * manager is observable from the profile alone and never falls through to an
- * ambient parent store.
+ * resolvable from the profile. The manager may be profile-local, or supplied
+ * by the launcher's controlled `$DSH_HOME/profiles/node_modules` fallback;
+ * no higher ancestor is accepted, so an ambient parent store cannot satisfy
+ * the wrapper dependency.
  * @param profileDir - absolute profile directory.
  * @returns true when the manager package.json exists in the profile's own
- * node_modules.
+ * node_modules or its controlled `profiles` fallback.
  */
 export function managerWrapperResolvable(profileDir: string): boolean {
-  return existsSync(join(profileDir, 'node_modules', PAGE_APP_MANAGER_PACKAGE_NAME, 'package.json'))
+  if (existsSync(join(profileDir, 'node_modules', PAGE_APP_MANAGER_PACKAGE_NAME, 'package.json'))) return true
+  const profilesDir = dirname(profileDir)
+  return basename(profilesDir) === 'profiles'
+    && existsSync(join(profilesDir, 'node_modules', PAGE_APP_MANAGER_PACKAGE_NAME, 'package.json'))
 }
 
 /**

@@ -11,6 +11,7 @@
 export * from './controller.ts'
 export * from './stores.ts'
 export * from './contracts.ts'
+export * from './workbench.ts'
 export * from './apply.ts'
 export * from './PageAppShell.tsx'
 export * from './PageAppRail.tsx'

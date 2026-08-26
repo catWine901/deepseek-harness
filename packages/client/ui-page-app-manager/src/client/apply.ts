@@ -31,6 +31,7 @@ import { PageAppShell, type PageAppShellInjected } from './PageAppShell.tsx'
 import { PageAppSettingsTab, type PageAppSettingsTabInjected } from './PageAppSettingsTab.tsx'
 import { parsePageAppInstallSourceClient } from './source.ts'
 import { en, zh, type PageAppSettingsKey } from './locales.ts'
+import { WorkbenchClientBridgeService } from './workbench.ts'
 
 /** Dictionary namespace owned by this plugin (Workspace Apps settings copy). */
 export const NS = 'settings.pageApp'
@@ -191,6 +192,10 @@ export const inject = ['slots', 'locale']
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  // The manager owns the service provider; Cordis binds each getter access to
+  // the Feature caller, so a Feature receives the narrow workbench contract
+  // instead of the raw slot ledger.
+  new WorkbenchClientBridgeService(ctx)
   const controller = createController(ctx)
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'ui-page-app-manager: dictionaries')
   ctx.effect(() => {

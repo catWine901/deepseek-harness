@@ -1,7 +1,9 @@
 /**
- * Fixture skeleton spec: the example Feature package must be a valid
- * contract-v1 workspace package whose source and declared dependencies stay
- * Cordis-free (the Strict-Mode source/dependency boundaries).
+ * Fixture spec: the example Feature package must be a valid contract-v1
+ * workspace package, register its surface through the Workbench Contract
+ * entry (never through the client context's slot ledger), and stay Cordis-free
+ * in source and in every declared dependency (the Strict-Mode source/
+ * dependency boundaries).
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -14,12 +16,14 @@ const PACKAGE_NAME = '@deepseek-ai/dsh-page-app-fixture'
 /** Repository root (this spec lives at packages/examples/page-app-fixture/tests/). */
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../')
 const FIXTURE_DIR = 'packages/examples/page-app-fixture'
+/** The client half whose contract shape this spec pins. */
+const CLIENT_SOURCE_PATH = join(REPOSITORY_ROOT, FIXTURE_DIR, 'src/client/index.tsx')
 
 function readFixturePackage(): Record<string, unknown> {
   return JSON.parse(readFileSync(join(REPOSITORY_ROOT, FIXTURE_DIR, 'package.json'), 'utf8')) as Record<string, unknown>
 }
 
-describe('page-app fixture skeleton', () => {
+describe('page-app fixture', () => {
   it('parses as a valid contract-v1 workspace package', () => {
     const manifest = parsePageAppManifest(PACKAGE_NAME, readFixturePackage())
     expect(manifest.schemaVersion).toBe(1)
@@ -27,12 +31,23 @@ describe('page-app fixture skeleton', () => {
     expect(manifest.id).toBe('dsh-page-app-fixture')
   })
 
-  it('stays Cordis-free in source (source boundary)', () => {
-    const result = verifyPageAppSourceBoundary(REPOSITORY_ROOT, FIXTURE_DIR)
-    expect(result.failures).toEqual([])
+  it('fixture registers its surface through the Workbench Contract (no ctx.slots call)', () => {
+    const clientSource = readFileSync(CLIENT_SOURCE_PATH, 'utf8')
+    // The fixture never reaches the client slot ledger through the context:
+    // `ctx.slots` must not appear anywhere in the fixture source.
+    expect(clientSource).not.toContain('ctx.slots')
+    // The surface contribution goes through the Workbench Contract's single
+    // entry, consumed from the injected WorkbenchContext face.
+    expect(clientSource).toContain('registerWorkspaceSurface')
+    expect(clientSource).toMatch(/workbench\.surfaces\.registerWorkspaceSurface/)
   })
 
-  it('declares no Cordis dependency', () => {
+  it('fixture source contains no cordis import and declares no cordis dependency', () => {
+    // Source boundary: static imports, re-exports, require, and dynamic
+    // import() of cordis / @deepseek-ai/cordis are all violations.
+    const boundary = verifyPageAppSourceBoundary(REPOSITORY_ROOT, FIXTURE_DIR)
+    expect(boundary.failures).toEqual([])
+    // Dependency boundary: no dependency section may name cordis.
     const pkg = readFixturePackage()
     for (const section of ['dependencies', 'peerDependencies', 'devDependencies', 'optionalDependencies'] as const) {
       const value = pkg[section]
