@@ -189,6 +189,9 @@ flowchart LR
   pkg_modules["modules"]
   pkg_hmr["hmr"]
   svc_clientModules["ctx.clientModules<br/>Client plugin graph host"]
+  pkg_page_app_manager["page-app-manager"]
+  svc_pageAppManager["ctx.pageAppManager<br/>Profile-scoped Workspace Apps manager"]
+  svc_workbenchRuntime["ctx.workbenchRuntime<br/>Workspace App Feature runtime capability"]
   pkg_workflow["workflow"]
   svc_workflowEngine["ctx.workflowEngine<br/>Workflow script engine"]
   pkg_workflow_worker_thread["workflow-worker-thread"]
@@ -247,6 +250,8 @@ flowchart LR
   pkg_lsp_local --> svc_lsp
   pkg_message_feedback --> svc_messageFeedback
   pkg_modules --> svc_clientModules
+  pkg_page_app_manager --> svc_pageAppManager
+  pkg_page_app_manager --> svc_workbenchRuntime
   pkg_permission_presets --> svc_permissionPresets
   pkg_plan_mode --> svc_planMode
   pkg_pwsh_local --> svc_shell
@@ -417,6 +422,7 @@ flowchart LR
   svc_webServer --> pkg_connection
   svc_webServer --> pkg_hmr
   svc_webServer --> pkg_modules
+  svc_workbenchRuntime --> pkg_page_app_manager
   svc_workflowEngine --> pkg_tool_ralph
   svc_workflowEngine --> pkg_tool_workflow
   svc_workspaceRegistry --> pkg_apiproxy
@@ -479,6 +485,8 @@ flowchart LR
 | `ctx.directoryPicker` | `seam` | `directory-picker` | `directory-picker-native`, `directory-picker-browse` | `apiproxy` | - | Discriminated interaction capability: the native backend opens one OS chooser on the host display, the browse backend serves listing/creation primitives for the in-app browser; dual-face backends fill ui-workspace directory-flow slots from their browser halves (no wire advertisement). |
 | `ctx.webServer` | `core` | `webserver` | - | `connection`, `modules`, `hmr` | - | Plain node:http carrier: named-route registry, index transform taps, and the static dist fallback; web-transport plugins register their own routes. |
 | `ctx.clientModules` | `core` | `modules` | - | `hmr` | - | Composes the __DSH_BOOT__ entry graph from an incremental dsh.client scan, serves plugin bundles, and notifies rebuilt/graph-changed subscribers. |
+| `ctx.pageAppManager` | `core` | [`page-app-manager`](../packages/host/page-app-manager) | - | - | - | Owns package transactions, registry projections, activation acknowledgement, recovery, and the generated Host Remote surface; delivery is an out-of-tree profile install rather than a permanent web-bundle row. |
+| `ctx.workbenchRuntime` | `core` | [`page-app-manager`](../packages/host/page-app-manager) | - | [`page-app-manager`](../packages/host/page-app-manager) | - | The manager provides the versioned lifecycle, surface, event, storage, and Host-call face; each Feature wrapper depends on it so provider loss parks the wrapped subtree and provider return reloads it. |
 | `ctx.workflowEngine` | `seam` | [`workflow`](../packages/workflow/workflow) | [`workflow-worker-thread`](../packages/workflow/workflow-worker-thread) | [`tool-workflow`](../packages/workflow/tool-workflow), [`tool-ralph`](../packages/workflow/tool-ralph) | - | One engine per context, as in bash, with no named-provider registry; the general workflow and fixed Ralph consumers start runs whose agent() calls fan out through ctx.subagents. |
 | `ctx.lsp` | `seam` | [`lsp`](../packages/lsp/lsp) | `lsp-local` | [`tool-lsp`](../packages/lsp/tool-lsp) | - | Provider registration and selection plus normalized query execution over exactly four operations; the seam offers no protocol escape hatch, so a backend translates into the normalized request and result. |
 | `ctx.apiProxy` | `core` | `apiproxy` | - | `connection` | - | The transport-agnostic host gateway face: it dispatches browser API calls, and each open host stream subscribes to the events it forwards rather than being pushed to through a broadcast verb. |

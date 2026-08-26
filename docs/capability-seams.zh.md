@@ -191,6 +191,9 @@ flowchart LR
   pkg_modules["modules"]
   pkg_hmr["hmr"]
   svc_clientModules["ctx.clientModules<br/>Client plugin graph host"]
+  pkg_page_app_manager["page-app-manager"]
+  svc_pageAppManager["ctx.pageAppManager<br/>Profile-scoped Workspace Apps manager"]
+  svc_workbenchRuntime["ctx.workbenchRuntime<br/>Workspace App Feature runtime capability"]
   pkg_workflow["workflow"]
   svc_workflowEngine["ctx.workflowEngine<br/>Workflow script engine"]
   pkg_workflow_worker_thread["workflow-worker-thread"]
@@ -249,6 +252,8 @@ flowchart LR
   pkg_lsp_local --> svc_lsp
   pkg_message_feedback --> svc_messageFeedback
   pkg_modules --> svc_clientModules
+  pkg_page_app_manager --> svc_pageAppManager
+  pkg_page_app_manager --> svc_workbenchRuntime
   pkg_permission_presets --> svc_permissionPresets
   pkg_plan_mode --> svc_planMode
   pkg_pwsh_local --> svc_shell
@@ -419,6 +424,7 @@ flowchart LR
   svc_webServer --> pkg_connection
   svc_webServer --> pkg_hmr
   svc_webServer --> pkg_modules
+  svc_workbenchRuntime --> pkg_page_app_manager
   svc_workflowEngine --> pkg_tool_ralph
   svc_workflowEngine --> pkg_tool_workflow
   svc_workspaceRegistry --> pkg_apiproxy
@@ -481,6 +487,8 @@ flowchart LR
 | `ctx.directoryPicker` | `seam` | `directory-picker` | `directory-picker-native`, `directory-picker-browse` | `apiproxy` | - | 带判别标记的交互能力：原生后端在 Host 显示设备上打开一个操作系统选择器，浏览后端为应用内浏览器提供列表与创建原语；双端后端通过其浏览器侧填充 ui-workspace 目录流程的 slot（不通过协议发布）。 |
 | `ctx.webServer` | `core` | `webserver` | - | `connection`, `modules`, `hmr` | - | 普通的 node:http 载体：具名路由注册表、索引转换 tap，以及静态 dist 回退；Web 传输插件注册自己的路由。 |
 | `ctx.clientModules` | `core` | `modules` | - | `hmr` | - | 通过增量 `dsh.client` 扫描组合 __DSH_BOOT__ 入口图，提供插件组合包，并通知重建／图变更订阅方。 |
+| `ctx.pageAppManager` | `core` | [`page-app-manager`](../packages/host/page-app-manager) | - | - | - | 拥有包事务、注册表投影、激活确认、恢复及生成的 Host Remote 表面；其交付方式是 Profile 级出树安装，而非永久的 Web bundle 行。 |
+| `ctx.workbenchRuntime` | `core` | [`page-app-manager`](../packages/host/page-app-manager) | - | [`page-app-manager`](../packages/host/page-app-manager) | - | 管理器提供版本化的生命周期、表面、事件、存储及 Host 调用接口；每个功能包装层都依赖该服务，因此提供方丢失时会停驻被包装子树，提供方恢复时会重新加载。 |
 | `ctx.workflowEngine` | `seam` | [`workflow`](../packages/workflow/workflow) | [`workflow-worker-thread`](../packages/workflow/workflow-worker-thread) | [`tool-workflow`](../packages/workflow/tool-workflow), [`tool-ralph`](../packages/workflow/tool-ralph) | - | 每个上下文使用一个引擎，与 bash 相同，且没有具名提供方注册表；通用工作流与固定 Ralph 消费方启动运行，其中的 agent() 调用通过 ctx.subagents 扇出。 |
 | `ctx.lsp` | `seam` | [`lsp`](../packages/lsp/lsp) | `lsp-local` | [`tool-lsp`](../packages/lsp/tool-lsp) | - | 提供方注册与选择，加上恰好四种操作的标准化查询执行；该 seam 不提供协议逃生口，后端必须转换为标准化请求和结果。 |
 | `ctx.apiProxy` | `core` | `apiproxy` | - | `connection` | - | 与传输无关的 Host 网关接口：它分派浏览器 API 调用，每条打开的 Host 流自行订阅转发事件，而不是由广播方法向其推送。 |

@@ -2,7 +2,7 @@
 
 English | [中文](workspace-apps.zh.md)
 
-The Workspace Apps subsystem: a permanent far-left launcher plus a Surface Host that lets a DSH Profile install, manage, and run full-page workspace plugins. The subsystem deliberately manages **only** packages installed through its own Settings flow — external DSH plugins never appear, are never adopted, and are never enumerated. Ownership is a Profile-scoped managed registry; everything else (runtime health, Plugin Inventory, Loader rows) is derived and never authoritative.
+The Workspace Apps subsystem lets a DSH Profile install, manage, and run full-page workspace plugins through an optional manager. The manager is an out-of-tree npm package installed per Profile through `dsh plugin`; it contributes the far-left launcher, Surface Host, and Settings → Plugins → Workspace flow instead of shipping as permanent `dsh-web-app` rows. The subsystem manages **only** Feature packages installed through that Settings flow — external DSH plugins never appear, are never adopted, and are never enumerated.
 
 Source: [`packages/host/page-app-manager/src/index.ts`](../../packages/host/page-app-manager/src/index.ts), [`packages/client/ui-page-app-manager/src/client/apply.ts`](../../packages/client/ui-page-app-manager/src/client/apply.ts)
 
@@ -14,9 +14,27 @@ Source: [`packages/host/page-app-manager/src/index.ts`](../../packages/host/page
 - Hide (presentation), disable (runtime unload), and uninstall (dependency + registry removal) are three distinct operations.
 - Install and uninstall are transactional, with a durable journal and backups; any failure before commit rolls back, and a failed rollback exposes `recovery-required` rather than pretending the system is clean.
 
+Two Profiles under one Harness home have independent manager dependencies, registries, runtime layers, revisions, and orders. Installing a manager or Feature in one Profile never makes its row or code visible in another.
+
+## Workbench Contract v1
+
+A managed Feature declares `dsh.workspace.schemaVersion: 1`, one package, one page, and one Managed Root. Admission rejects unsupported versions, invalid root/client composition, ownership collisions, and direct Cordis dependencies. The repository source check additionally rejects static imports, re-exports, dynamic imports, `require`, and direct dependency declarations for `cordis` or `@deepseek-ai/cordis` inside declared Feature source scopes. This source check cannot prove a prebuilt third-party artifact whose source is unavailable.
+
+Manager product code concentrates Cordis, Include, and Loader operations in the Cordis Compatibility Adapter. Each admitted root is rendered beneath a deterministic Feature Runtime Wrapper that injects the manager-provided `workbenchRuntime` service and mounts the Feature's original rows with their package provenance intact. Features register lifecycle callbacks and their workspace surface through the versioned Workbench API; they never receive a raw Cordis context.
+
+The manager fiber owns the provider. When it unloads, Cordis removes `workbenchRuntime` and parks every dependent wrapper fiber; when it returns, Cordis reloads those wrappers. This uses the Loader's ordinary dependency lifecycle and does not maintain a second Feature lifecycle graph.
+
 ## The client surface
 
-The client package owns the built-in `root` seat and declares two child seats: the built-in DSH seat (`page-app.shell.builtin`, occupied by the ordinary DSH layout) and the keyed managed-surface seat (`page-app.shell.surface`). The shell keeps visited surfaces mounted (HTML `hidden` toggle only, so editor/draft/scroll state survives switching), unmounts disabled/uninstalled surfaces, and always keeps DSH reachable. A Settings → Plugins → Workspace tab provides add, show/hide, reorder, info, enable/disable, and uninstall, all through the Host-owned service — the browser never runs pnpm or touches the filesystem.
+With the manager active, its client package owns the built-in `root` seat and declares two child seats: the built-in DSH seat (`page-app.shell.builtin`, occupied by the ordinary DSH layout) and the keyed managed-surface seat (`page-app.shell.surface`). The shell keeps visited surfaces mounted (HTML `hidden` toggle only, so editor/draft/scroll state survives switching), unmounts disabled/uninstalled surfaces, and always keeps DSH reachable. A failed managed surface is isolated behind a retry/uninstall face while the rail and DSH remain usable.
+
+Without the manager, or after its root entry abdicates on a render failure, `ui-layout` renders Native DSH without a browser refresh. It owns one priority-1 `AppFrame` registration and atomically retargets that same live entry between `root` and `page-app.shell.builtin`: the move preflights compatible single/root seats, commits both ledgers before publishing mutations, and preserves entry identity, child declarations, already-loaded descendants, store state, metadata, and disposer authority. A manager that arrives late can therefore take over and later leave without collapsing or reloading the Native DSH subtree. Manager Settings mutations call the Host-owned service — the browser never runs pnpm or touches the filesystem.
+
+## Installation and CLI coexistence
+
+The extracted manager package is packed, scanned for source files, source maps, `workspace:` specifiers, and absolute local paths, then exercised through a fresh-Profile install/disable/re-enable/uninstall chain. The repository requires the active pnpm version to equal its `packageManager` pin.
+
+Generic `dsh plugin` mutations and manager transactions use the same Profile lock. A package declaring `dsh.workspace` is classified as a managed Feature and is never appended to `dsh.profile.bundles`; install it through the Workspace Apps Settings flow so the registry remains the ownership authority.
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 

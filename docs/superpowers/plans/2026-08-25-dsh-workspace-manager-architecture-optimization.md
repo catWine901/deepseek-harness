@@ -262,9 +262,9 @@ git worktree add C:/Users/17948/Documents/Codex/2026-08-25/xian/work/dsh-ws-lane
 
 **测试文件与测试名称：**
 - `packages/client/ui-page-app-manager/tests/controller.client.spec.ts`（新增用例）：`passes a real AbortController signal to install and aborts on controller disposal`、`aborts setEnabled and uninstall through the controller signal`、`a pre-aborted signal rejects the mutation without reaching the remote`
-- `packages/client/ui-page-app-manager/tests/settings.client.spec.ts`（新增用例）：`cancel button aborts the in-flight install and clears the busy state`、`cancel button is absent when no install is running`
+- `packages/client/ui-page-app-manager/tests/settings.client.spec.tsx`（新增用例）：`cancel button aborts the in-flight install and clears the busy state`、`cancel button is absent when no install is running`
 
-**RED 命令与预期失败：** `pnpm exec vitest run packages/client/ui-page-app-manager/tests/controller.client.spec.ts packages/client/ui-page-app-manager/tests/settings.client.spec.ts`；预期：新用例失败（`void signal` 不 abort；Settings 无取消按钮）。
+**RED 命令与预期失败：** `pnpm exec vitest run packages/client/ui-page-app-manager/tests/controller.client.spec.ts packages/client/ui-page-app-manager/tests/settings.client.spec.tsx`；预期：新用例失败（`void signal` 不 abort；Settings 无取消按钮）。
 
 **最小 GREEN 实现步骤：**
 - [ ] 1. controller：`install/setEnabled/uninstall` 内部 `const ctrl = new AbortController()`；`this.disposers.push(() => ctrl.abort())`；外部 signal 的 abort 监听转发到 ctrl；Remote 调用传 `ctrl.signal`；`dispose()` 置位并 abort（disposers 既有机制扩展）。
@@ -561,9 +561,9 @@ export function assertSupportedContractVersion(version: number, supported: reado
 
 **测试文件与测试名称：**
 - `packages/client/ui-page-app-manager/tests/apply.client.spec.ts`（新增用例）：`clears the graph-wait interval on controller disposal`（fake timers 断言无残留 interval）
-- `packages/client/ui-page-app-manager/tests/settings.client.spec.ts`（新增用例）：`renders the projected operation state label from the snapshot`
+- `packages/client/ui-page-app-manager/tests/settings.client.spec.tsx`（新增用例）：`renders the projected operation state label from the snapshot`
 
-**RED 命令与预期失败：** `pnpm exec vitest run packages/client/ui-page-app-manager/tests/apply.client.spec.ts packages/client/ui-page-app-manager/tests/settings.client.spec.ts`；预期：interval 残留断言失败、标签用例失败（无 state 面）。
+**RED 命令与预期失败：** `pnpm exec vitest run packages/client/ui-page-app-manager/tests/apply.client.spec.ts packages/client/ui-page-app-manager/tests/settings.client.spec.tsx`；预期：interval 残留断言失败、标签用例失败（无 state 面）。
 
 **最小 GREEN 实现步骤：**
 - [ ] 1. buildGraphWait 取消化；controller stop 链清除。

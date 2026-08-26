@@ -14,8 +14,15 @@ import {
   readPageAppRegistry,
   renderPageAppRuntimeLayer,
   resolvePageAppProfilePaths,
+  type ValidatedManagedRoot,
   withPageAppProfileLock,
 } from '@deepseek-ai/dsh-page-app-profile'
+
+declare const profileDir: string
+declare const packageName: string
+declare const parsedPackageJson: unknown
+declare const roots: readonly ValidatedManagedRoot[]
+declare const token: string
 
 const paths = resolvePageAppProfilePaths(profileDir)
 // directory: <profileDir>/.workspace-manager
@@ -26,7 +33,7 @@ const paths = resolvePageAppProfilePaths(profileDir)
 
 const manifest = parsePageAppManifest(packageName, parsedPackageJson)
 const registry = await readPageAppRegistry(profileDir)
-const layer = renderPageAppRuntimeLayer(registry?.entries.map(toManagedRoot) ?? [])
+const layer = renderPageAppRuntimeLayer(roots)
 
 await withPageAppProfileLock(profileDir, { kind: 'manager', token }, async () => {
   // one mutation per profile: pnpm and owned-file writes stay under the lock

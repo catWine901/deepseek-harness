@@ -1457,6 +1457,22 @@ export interface Config {
 
 来源：[`packages/feedback/message-feedback/src/index.ts:49`](../packages/feedback/message-feedback/src/index.ts)
 
+<a id="deepseek-aidsh-page-app-manager"></a>
+
+## `@deepseek-ai/dsh-page-app-manager`
+
+需要：`PROFILE_RUNTIME_SERVICE` · `loader`
+
+```ts config-catalog
+/** Plugin configuration of the Host page-app manager (validated by the zod `Config` in `index.ts`). */
+export interface PageAppManagerConfig {
+  /** Host cap on the client activation acknowledgement wait, in milliseconds. */
+  readonly settlementTimeoutMs?: number
+}
+```
+
+来源：[`packages/host/page-app-manager/src/types.ts:16`](../packages/host/page-app-manager/src/types.ts)
+
 <a id="deepseek-aidsh-permission-presets"></a>
 
 ## `@deepseek-ai/dsh-permission-presets`
@@ -3246,6 +3262,7 @@ export interface Config {
 - `@deepseek-ai/dsh-client-ui-layout`（[`packages/client/ui-layout/src/index.ts`](../packages/client/ui-layout/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-message-feedback`（[`packages/client/ui-message-feedback/src/index.ts`](../packages/client/ui-message-feedback/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-model-selection`（[`packages/client/ui-model-selection/src/index.ts`](../packages/client/ui-model-selection/src/index.ts)）
+- `@deepseek-ai/dsh-client-ui-page-app-manager`（[`packages/client/ui-page-app-manager/src/index.ts`](../packages/client/ui-page-app-manager/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-permission-presets`（[`packages/client/ui-permission-presets/src/index.ts`](../packages/client/ui-permission-presets/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-plan`（[`packages/client/ui-plan/src/index.ts`](../packages/client/ui-plan/src/index.ts)）
 - `@deepseek-ai/dsh-client-ui-reference`（[`packages/client/ui-reference/src/index.ts`](../packages/client/ui-reference/src/index.ts)）
@@ -3277,6 +3294,7 @@ export interface Config {
 - `@deepseek-ai/dsh-host-plugin-inventory` — 需要 `loader`（[`packages/host/plugin-inventory/src/index.ts`](../packages/host/plugin-inventory/src/index.ts)）
 - `@deepseek-ai/dsh-llm`（[`packages/llm/llm/src/index.ts`](../packages/llm/llm/src/index.ts)）
 - `@deepseek-ai/dsh-lsp`（[`packages/lsp/lsp/src/index.ts`](../packages/lsp/lsp/src/index.ts)）
+- `@deepseek-ai/dsh-page-app-fixture`（[`packages/examples/page-app-fixture/src/index.ts`](../packages/examples/page-app-fixture/src/index.ts)）
 - `@deepseek-ai/dsh-schedule` — 需要 `agents` · `sessions` · `tools` · `sessionPersistence`（[`packages/schedule/schedule/src/index.ts`](../packages/schedule/schedule/src/index.ts)）
 - `@deepseek-ai/dsh-session`（[`packages/core/session/src/index.ts`](../packages/core/session/src/index.ts)）
 - `@deepseek-ai/dsh-session-checkpoint-policy` — 需要 `llm` · `sessionPersistence` · `sessions` · `tools`（[`packages/session/session-checkpoint-policy/src/index.ts`](../packages/session/session-checkpoint-policy/src/index.ts)）
@@ -3339,6 +3357,7 @@ export interface Config {
 - `@deepseek-ai/dsh-loader-smoke`（[`packages/test-support/loader-smoke/src/index.ts`](../packages/test-support/loader-smoke/src/index.ts)）
 - `@deepseek-ai/dsh-native-command`（[`packages/util/native-command/src/index.ts`](../packages/util/native-command/src/index.ts)）
 - `@deepseek-ai/dsh-output-retention`（[`packages/util/output-retention/src/index.ts`](../packages/util/output-retention/src/index.ts)）
+- `@deepseek-ai/dsh-page-app-profile`（[`packages/boot/page-app-profile/src/index.ts`](../packages/boot/page-app-profile/src/index.ts)）
 - `@deepseek-ai/dsh-sandbox-windows-acl`（[`packages/sandbox/sandbox-windows-acl/src/index.ts`](../packages/sandbox/sandbox-windows-acl/src/index.ts)）
 - `@deepseek-ai/dsh-scope`（[`packages/core/scope/src/index.ts`](../packages/core/scope/src/index.ts)）
 - `@deepseek-ai/dsh-sdk-client`（[`packages/sdk/client/src/index.ts`](../packages/sdk/client/src/index.ts)）

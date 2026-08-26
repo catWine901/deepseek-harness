@@ -24,6 +24,8 @@
 
 [`dsh-base`](../packages/bundle/base/README.zh.md) 是每个 profile 的第一层：模型适配器、工具、持久化、沙箱与审批策略、设置、凭据、遥测。[`dsh-web-app`](../packages/bundle/web-app/README.zh.md) 增加浏览器应用；[`dsh-headless`](../packages/bundle/headless/README.zh.md) 增加一次性运行器，且完全不带服务器。
 
+[工作区应用](subsystems/workspace-apps.zh.md)是按 Profile 安装的可选树外管理器，而不是常驻 Web 组合包层。它提供托管功能包装层所依赖的版本化 Workbench Runtime；没有该管理器时，这些包装层保持不活动，`ui-layout` 通过根回退渲染 Native DSH。
+
 各层按此顺序应用在空条目列表之上：先按 profile 列出的顺序应用每个组合包，然后是 profile 的 `cordis.patch.yml`，然后是 home 级的那份，最后是任意 `--patch` overlay。一条 patch 按 id 定位某个条目并替换其整个 config，或插入新条目。
 
 要查看你的机器实际启动的配置树：
