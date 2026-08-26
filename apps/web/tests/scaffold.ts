@@ -112,6 +112,8 @@ export function webSnapshotMode(): WebSnapshotMode {
 /** The shipped composition under test: the dsh-base and dsh-web-app bundle patches over the empty profile root. */
 const BASE_PATCH_PATH = join(REPO_ROOT, 'packages/bundle/base/cordis.patch.yml')
 const WEB_PATCH_PATH = join(REPO_ROOT, 'packages/bundle/web-app/cordis.patch.yml')
+/** Test-side source split of the external Workspace Manager package composition. */
+const WORKSPACE_MANAGER_PATCH_PATH = join(REPO_ROOT, 'apps/web/tests/support/workspace-manager.patch.yml')
 /** The installation anchor whose dependency surface the profile module fallback mirrors. */
 const INSTALL_ANCHOR = join(REPO_ROOT, 'apps/cli/package.json')
 /** The deployment's own agent-preset root, shipped beside the app's config. */
@@ -319,11 +321,11 @@ export interface LaunchOptions {
    */
   profileName?: string
   /**
-   * Wire the launcher-owned profile runtime so the page-app manager row
-   * activates for real (identity = the scaffold profile, acknowledged
-   * recomposition over the composed patch stack, boot-time manager layer
-   * derived from a surviving registry). Opt-in: every other scenario boots
-   * with the manager row inert, exactly as before.
+   * Inject the external Workspace Manager composition and wire the
+   * launcher-owned profile runtime so it activates for real (identity = the
+   * scaffold profile, acknowledged recomposition over the composed patch
+   * stack, boot-time manager layer derived from a surviving registry).
+   * Opt-in: every other scenario boots only the shipped Native DSH surface.
    */
   enablePageAppManager?: boolean
 }
@@ -421,6 +423,9 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
   // drifting).
   const basePatches = loadOverlayPatches('web e2e scaffold', BASE_PATCH_PATH)
   const surfacePatches = loadOverlayPatches('web e2e scaffold', WEB_PATCH_PATH)
+  const workspaceManagerPatches = options.enablePageAppManager === true
+    ? loadOverlayPatches('web e2e scaffold external workspace manager', WORKSPACE_MANAGER_PATCH_PATH)
+    : []
   const extraOverlayPatches = options.extraOverlayPath === undefined
     ? []
     : loadOverlayPatches('web e2e scaffold', options.extraOverlayPath)
@@ -461,7 +466,13 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     await prepareManagerRuntimeLayer('web e2e scaffold', profileDir)
     managerPatches.push(...readManagerLayerPatches('web e2e scaffold', profileDir))
   }
-  const composedRows = composeEntries([basePatches, surfacePatches, managerPatches, extraOverlayPatches])
+  const composedRows = composeEntries([
+    basePatches,
+    surfacePatches,
+    workspaceManagerPatches,
+    managerPatches,
+    extraOverlayPatches,
+  ])
   const webRuntimeConfig = composedRows.find(row => row.id === 'web-runtime')?.config as {
     surfaceContext?: boolean
   } | undefined
@@ -578,12 +589,12 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
       : [{ id: 'llm-deepseek', disabled: true }],
   ]
 
-  // The composed patch stack, in launcher order: bundles → manager layer →
-  // overlays → the lane's hermetic test patches (identical to the old single
-  // array when the manager layer is empty).
+  // The external Workspace Manager is installed after the shipped Web
+  // surface, matching the append order of a real out-of-tree plugin install.
   const patches: PatchOptions[] = [
     ...basePatches,
     ...surfacePatches,
+    ...workspaceManagerPatches,
     ...managerPatches,
     ...extraOverlayPatches,
     ...hermeticPatches,
@@ -653,6 +664,7 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
         compose: generationPatches => [
           ...basePatches,
           ...surfacePatches,
+          ...workspaceManagerPatches,
           ...generationPatches,
           ...extraOverlayPatches,
           ...hermeticPatches,

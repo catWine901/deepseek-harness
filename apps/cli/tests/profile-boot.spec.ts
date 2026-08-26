@@ -8,6 +8,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { FiberState } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import { composeEntries, initProfile, prepareManagerRuntimeLayer, PROFILE_PATCH_FILENAME, readManagerLayerPatches } from '@deepseek-ai/dsh-app-boot'
 import { createLaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
@@ -120,7 +121,17 @@ describe('launcher startup with a valid registry', () => {
     try {
       const profileDir = join(home, 'profiles', 'demo')
       initProfile(profileDir, ['fixture-bundle-a'])
-      stageProfileBundle(profileDir, 'fixture-bundle-a', '- insert:\n    - id: base\n      name: ./noop.mjs\n')
+      stageProfileBundle(profileDir, 'fixture-bundle-a', [
+        '- insert:',
+        '    - id: base',
+        '      name: ./noop.mjs',
+        '',
+        '    - id: page-app-manager',
+        "      name: '@deepseek-ai/dsh-page-app-manager'",
+        '      config:',
+        '        settlementTimeoutMs: 60000',
+        '',
+      ].join('\n'))
       writeFileSync(join(profileDir, 'noop.mjs'), 'export const name = "noop"\nexport function apply() {}\n')
 
       // The manager package the registry row names, and the client plugin the
@@ -189,9 +200,11 @@ describe('launcher startup with a valid registry', () => {
       try {
         expect(runtime).toBeDefined()
         const base = [...ctx.loader.entries()].find(entry => entry.options.id === 'base')
+        const wrapper = [...ctx.loader.entries()].find(entry => entry.options.id === 'page-app.wrapper.fixture-page')
         const managed = [...ctx.loader.entries()].find(entry => entry.options.id === 'fixture-root')
         expect(base?.fiber).toBeDefined()
-        expect(managed?.fiber).toBeDefined()
+        expect(wrapper?.fiber?.state).toBe(FiberState.ACTIVE)
+        expect(managed?.fiber?.state).toBe(FiberState.ACTIVE)
       } finally {
         await ctx.fiber.dispose()
       }

@@ -19,9 +19,9 @@ export const FIXTURE_LABEL = 'Page App Fixture'
 /** The built-in DSH rail row label. */
 export const DSH_RAIL_LABEL = 'DSH / Agent'
 /** The bundle-patch row id of the Host page-app manager. */
-export const PAGE_APP_MANAGER_ROW_ID = 'page-app-manager'
+const PAGE_APP_MANAGER_ROW_ID = 'page-app-manager'
 /** The link: install spec the Settings add-flow installs the fixture with. */
-export const FIXTURE_INSTALL_SPEC = `link:${join(REPO_ROOT, 'packages/examples/page-app-fixture').replace(/\\/g, '/')}`
+const FIXTURE_INSTALL_SPEC = `link:${join(REPO_ROOT, 'packages/examples/page-app-fixture').replace(/\\/g, '/')}`
 
 /** The fixture surface root locator. */
 export function fixtureSurface(page: Page): Locator {
@@ -109,7 +109,7 @@ export async function waitForFixtureRow(page: Page, health: string, timeoutMs = 
 }
 
 /** The client graph ids the served page booted with. */
-export async function bootEntryIds(page: Page): Promise<string[]> {
+async function bootEntryIds(page: Page): Promise<string[]> {
   return await page.evaluate(() => {
     const boot = (window as unknown as { __DSH_BOOT__?: { entries: { id: string }[] } }).__DSH_BOOT__
     return boot?.entries.map(entry => entry.id) ?? []

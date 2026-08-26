@@ -1,0 +1,12 @@
+# The extracted @deepseek-ai/dsh-workspace-manager package contributes one
+# Loader row whose package has both a Host export and dsh.client metadata. The
+# monorepo source of those two faces remains split while the extraction is
+# assembled, so this test-only overlay inserts both source packages explicitly.
+- insert:
+    - id: page-app-manager
+      name: '@deepseek-ai/dsh-page-app-manager'
+      config:
+        settlementTimeoutMs: 60000
+
+    - id: ui-page-app-manager
+      name: '@deepseek-ai/dsh-client-ui-page-app-manager'
