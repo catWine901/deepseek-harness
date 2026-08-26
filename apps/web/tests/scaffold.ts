@@ -47,6 +47,7 @@ import {
   prepareManagerRuntimeLayer,
   ProfileRuntime,
   readManagerLayerPatches,
+  resolveProfileDir,
 } from '@deepseek-ai/dsh-app-boot'
 // The launcher/boot-only control is deliberately absent from the package root
 // (the launcher binds and settles inside boot()); the web e2e lane builds its
@@ -189,6 +190,10 @@ export interface WebScaffold {
   persistenceRoot: string
   /** Isolated harness home the settings/credentials rows write ($DSH_HOME double). */
   harnessHome: string
+  /** Launcher-validated profile name selected inside {@link harnessHome}. */
+  profileName: string
+  /** Absolute directory of the selected profile. */
+  profileDir: string
   /** Await a settled turn end: in-process turn/end, then the agent's idle flip (which follows the persistence flush). */
   whenTurnSettled(timeoutMs?: number): Promise<SessionId>
   /**
@@ -309,6 +314,11 @@ export interface LaunchOptions {
   /** Reuse an existing harness home so a second Host can verify user settings across origins. */
   harnessHome?: string
   /**
+   * Select one launcher-validated profile below {@link harnessHome}. The
+   * historical single-profile scaffold remains the default.
+   */
+  profileName?: string
+  /**
    * Wire the launcher-owned profile runtime so the page-app manager row
    * activates for real (identity = the scaffold profile, acknowledged
    * recomposition over the composed patch stack, boot-time manager layer
@@ -363,6 +373,8 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
   // paths at load, and an in-process boot must NEVER touch the developer's
   // real ~/.dsh document or credential file.
   const harnessHome = options.harnessHome ?? join(workspaceCwd, '.dsh-home')
+  const profileName = options.profileName ?? 'scaffold'
+  const profileDir = resolveProfileDir(profileName, harnessHome)
   // Skill discovery is model-visible input, and its roots now resolve inside a
   // PRESET — a subtree this lane's include patches cannot reach, because the
   // roster mounts it directly per session rather than as a row of the booted
@@ -417,7 +429,6 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
   // layer is regenerated from a surviving registry before the initial
   // composition, so a previously installed fixture mounts again on a later
   // boot of the same home.
-  const profileDir = join(harnessHome, 'profiles', 'scaffold')
   const managerPatches: PatchOptions[] = []
   if (options.enablePageAppManager === true) {
     await mkdir(profileDir, { recursive: true })
@@ -431,7 +442,7 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     const profileManifestPath = join(profileDir, 'package.json')
     if (!existsSync(profileManifestPath)) {
       await writeFile(profileManifestPath, JSON.stringify({
-        name: 'dsh-profile-scaffold',
+        name: `dsh-profile-${profileName}`,
         private: true,
         dependencies: {},
       }, undefined, 2) + '\n')
@@ -638,7 +649,7 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
     let pageAppRuntime: ProfileRuntime | undefined
     if (options.enablePageAppManager === true) {
       pageAppRuntime = new ProfileRuntime(ctx, {
-        identity: { name: 'scaffold', directory: profileDir },
+        identity: { name: profileName, directory: profileDir },
         compose: generationPatches => [
           ...basePatches,
           ...surfacePatches,
@@ -743,6 +754,8 @@ export async function launchWebScaffold(options: LaunchOptions = {}): Promise<We
 
   return {
     harnessHome,
+    profileName,
+    profileDir,
     mode,
     baseUrl: `http://${browserHost}:${port}`,
     ctx,
