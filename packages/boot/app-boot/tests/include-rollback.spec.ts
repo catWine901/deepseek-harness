@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { Include } from '@deepseek-ai/cordis-plugin-include'
-import { boot } from '../src/index.ts'
+import { boot, loadOptionalPatches, PROFILE_PATCH_FILENAME, ProfileRuntime } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
 
@@ -27,10 +27,26 @@ describe('root Include update rollback', () => {
       '',
     ].join('\n'))
     writeFileSync(join(dir, 'cordis.yml'), '- id: effectful\n  name: ./effectful.mjs\n  config:\n    value: base\n')
+    const patchFile = join(dir, PROFILE_PATCH_FILENAME)
     const generationA: Include.Config['patches'] = [{ id: 'effectful', config: { value: 'A' } }]
-    const generationB: Include.Config['patches'] = [{ id: 'effectful', config: { fail: true } }]
-    const ctx = await boot(NAME, join(dir, 'cordis.yml'), generationA)
+    writeFileSync(patchFile, '- id: effectful\n  config:\n    value: A\n')
+    let refresh: (() => Promise<void>) | undefined
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), generationA, (hostCtx) => {
+      hostCtx.provide('hmr', {
+        registerConfig: async (_filename: string, callback: () => Promise<void>) => {
+          refresh = callback
+          return async () => {}
+        },
+      })
+      new ProfileRuntime(hostCtx, {
+        identity: { name: 'demo', directory: dir },
+        compose: () => loadOptionalPatches(NAME, patchFile) ?? [],
+        initialManagerPatches: [],
+        watchPatches: [{ binName: NAME, filename: patchFile }],
+      })
+    })
     try {
+      expect(refresh).toBeDefined()
       const include = [...ctx.loader.entries()].find(entry => entry.options.id === 'include')
       const effectful = [...ctx.loader.entries()].find(entry => entry.options.id === 'effectful')
       if (!include || !effectful) throw new Error('booted tree has no include or effectful entry')
@@ -39,10 +55,11 @@ describe('root Include update rollback', () => {
       expect(effectful.options.config).toEqual({ value: 'A' })
       expect(ctx.get('pinnedGeneration')).toEqual({ value: 'A' })
 
-      // The exact update `watchUserPatches` performs per user-layer generation:
-      // re-read the include's non-patch options and swap the patch list.
+      // The ProfileRuntime watcher reads the fresh patch file and swaps the
+      // complete generation through the serialized root Include update.
       const { patches: _previousPatches, ...includeConfig } = include.options.config as Include.Config
-      await expect(include.update({ config: { ...includeConfig, patches: generationB } }))
+      writeFileSync(patchFile, '- id: effectful\n  config:\n    fail: true\n')
+      await expect(refresh!())
         .rejects.toThrow('failed to apply loader entry effectful')
 
       // Generation A is still the active tree: same include options, same child
@@ -54,8 +71,8 @@ describe('root Include update rollback', () => {
 
       // The next generation still applies: the rejected one did not wedge the tree.
       const generationC: Include.Config['patches'] = [{ id: 'effectful', config: { value: 'C' } }]
-      await include.update({ config: { ...includeConfig, patches: generationC } })
-      await ctx.loader.await()
+      writeFileSync(patchFile, '- id: effectful\n  config:\n    value: C\n')
+      await refresh!()
       expect(include.options.config).toEqual({ ...includeConfig, patches: generationC })
       expect(effectful.options.config).toEqual({ value: 'C' })
       expect(ctx.get('pinnedGeneration')).toEqual({ value: 'C' })
