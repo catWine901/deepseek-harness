@@ -2,11 +2,11 @@ import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { scanTarballContent } from './publication-payload.ts'
-import { extractWorkspaceManager } from './extract-workspace-manager.ts'
+import { extractWorkspaceManager, resolveWorkspaceManagerDestination } from './extract-workspace-manager.ts'
 
 const repoRoot = fileURLToPath(new URL('../', import.meta.url))
 const temporaryRoot = mkdtempSync(join(tmpdir(), 'dsh-workspace-manager-extract-'))
@@ -35,7 +35,7 @@ function treeDigest(root: string): string {
 }
 
 beforeAll(() => {
-  extractWorkspaceManager(repoRoot, output)
+  extractWorkspaceManager(repoRoot, output, temporaryRoot)
 })
 
 afterAll(() => {
@@ -43,6 +43,24 @@ afterAll(() => {
 })
 
 describe('workspace manager extraction', () => {
+  it.each([
+    ['repository root', repoRoot],
+    ['repository parent', dirname(repoRoot)],
+    ['sibling worktree', join(dirname(repoRoot), 'other-worktree')],
+    ['broad existing directory', temporaryRoot],
+  ])('rejects %s as an extraction destination before deletion', (_label, candidate) => {
+    expect(() => { resolveWorkspaceManagerDestination(repoRoot, candidate) })
+      .toThrow('workspace manager extraction destination must be')
+    expect(statSync(temporaryRoot).isDirectory()).toBe(true)
+  })
+
+  it('accepts only the dedicated workspace manager output owned by the extractor', () => {
+    expect(resolveWorkspaceManagerDestination(
+      repoRoot,
+      join(repoRoot, 'dist/out-of-tree/dsh-workspace-manager'),
+    )).toBe(resolve(repoRoot, 'dist/out-of-tree/dsh-workspace-manager'))
+  })
+
   it('skeleton manifest is private false with normal semver and no workspace: references', () => {
     const manifest = readJson(join(output, 'package.json'))
     expect(manifest.version).toBe('1.0.0')
@@ -96,7 +114,7 @@ describe('workspace manager extraction', () => {
 
   it('extraction is deterministic (byte-identical on rerun)', () => {
     const first = treeDigest(output)
-    extractWorkspaceManager(repoRoot, output)
+    extractWorkspaceManager(repoRoot, output, temporaryRoot)
     expect(treeDigest(output)).toBe(first)
   })
 

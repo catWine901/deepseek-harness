@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { execa } from 'execa'
 import { extractWorkspaceManager } from './extract-workspace-manager.ts'
-import { scanTarballContent } from './publication-payload.ts'
+import { scanTarballContent, validateTarballPayloadContent } from './publication-payload.ts'
 import { isEntry } from './release/process.ts'
 
 /** Inputs for the built-bin install-chain smoke. */
@@ -22,8 +22,16 @@ export interface PageAppInstallChainResult {
   readonly tarballScanned: true
   readonly installedAndStarted: true
   readonly disabledWithNativeDsh: true
+  readonly managerAbsentWhileDisabled: true
   readonly reenabled: true
   readonly uninstalled: true
+}
+
+/** Inputs whose build output is staged into the extracted package. */
+export interface WorkspaceManagerArtifactStagingOptions {
+  readonly repoRoot: string
+  readonly clientBuildDirectory: string
+  readonly extracted: string
 }
 
 function requireArtifact(path: string): void {
@@ -33,16 +41,42 @@ function requireArtifact(path: string): void {
 }
 
 /**
- * Remove generated comments that carry a build-machine CSS source label or
- * an illustrative drive-root path. Other content stays byte-for-byte
- * unchanged, so the tarball scanner still rejects executable path data.
- * @param artifact - built client JavaScript.
- * @returns artifact without absolute-path CSS region labels.
+ * Validate and copy the generated artifacts without rewriting their bytes.
+ * @param options - built Host/client locations and extracted package root.
  */
-export function stripArtifactPathComments(artifact: string): string {
-  return artifact
-    .replace(/^[\t ]*\/\/#region \\0dsh-css:[^\r\n]*(?:\r?\n|$)/gmu, '')
-    .replace(/^[\t ]*\/\*\*[^\r\n]*[A-Za-z]:[\\/]\.\.\.[^\r\n]*\*\/(?:\r?\n|$)/gmu, '')
+export function stageWorkspaceManagerArtifacts(options: WorkspaceManagerArtifactStagingOptions): void {
+  const repoRoot = resolve(options.repoRoot)
+  const extracted = resolve(options.extracted)
+  const hostLib = join(repoRoot, 'packages/host/page-app-manager/lib')
+  const clientArtifact = join(resolve(options.clientBuildDirectory), 'client.js')
+  requireArtifact(join(hostLib, 'index.js'))
+  requireArtifact(clientArtifact)
+  const clientBytes = readFileSync(clientArtifact)
+  validateTarballPayloadContent(['lib/client.js'], () => clientBytes, 'workspace manager client build')
+
+  cpSync(hostLib, join(extracted, 'lib'), { recursive: true })
+  writeFileSync(join(extracted, 'lib/client.js'), clientBytes)
+  const clientTypes = join(repoRoot, 'packages/client/ui-page-app-manager/lib/types/client')
+  if (existsSync(clientTypes)) {
+    cpSync(clientTypes, join(extracted, 'lib/types/client'), {
+      recursive: true,
+      filter: source => statSync(source).isDirectory() || source.endsWith('.d.ts'),
+    })
+  }
+}
+
+async function buildPathFreeClient(repoRoot: string, destination: string): Promise<void> {
+  const tsdown = join(repoRoot, 'node_modules/tsdown/dist/run.mjs')
+  requireArtifact(tsdown)
+  await execa(process.execPath, [
+    tsdown,
+    '--minify',
+    '--out-dir', destination,
+    '--no-sourcemap',
+  ], {
+    cwd: join(repoRoot, 'packages/client/ui-page-app-manager'),
+  })
+  requireArtifact(join(destination, 'client.js'))
 }
 
 async function run(
@@ -68,13 +102,16 @@ async function run(
   return { stdout: result.stdout, stderr: result.stderr }
 }
 
-function writeProbe(path: string, service: string): void {
+function writeProbe(path: string, service: string, forbiddenService?: string): void {
+  const marker = forbiddenService === undefined
+    ? "'active'"
+    : `ctx.get(${JSON.stringify(forbiddenService)}) === undefined ? 'forbidden-absent' : 'forbidden-present'`
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, [
     "import { writeFileSync } from 'node:fs'",
     `export const inject = [${JSON.stringify(service)}]`,
-    'export function apply() {',
-    "  writeFileSync(process.env.DSH_MANAGER_SMOKE_MARKER, 'active')",
+    'export function apply(ctx) {',
+    `  writeFileSync(process.env.DSH_MANAGER_SMOKE_MARKER, ${marker})`,
     "  setTimeout(() => { process.emit('SIGTERM') }, 0)",
     '}',
     '',
@@ -118,14 +155,10 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
   const repoRoot = resolve(options.repoRoot)
   const dshBin = resolve(options.dshBin)
   requireArtifact(dshBin)
-  const hostLib = join(repoRoot, 'packages/host/page-app-manager/lib')
-  const clientEntry = join(repoRoot, 'packages/client/ui-page-app-manager/lib/client.js')
-  requireArtifact(join(hostLib, 'index.js'))
-  requireArtifact(clientEntry)
-
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'dsh-workspace-manager-chain-'))
   try {
     const extracted = join(temporaryRoot, 'dsh-workspace-manager')
+    const clientBuildDirectory = join(temporaryRoot, 'client-build')
     const packed = join(temporaryRoot, 'packed')
     const home = join(temporaryRoot, 'home')
     const profileName = 'workspace-manager-smoke'
@@ -133,16 +166,9 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
     const marker = join(temporaryRoot, 'active')
     const managerProbe = join(temporaryRoot, 'manager-probe.mjs')
     const nativeProbe = join(temporaryRoot, 'native-probe.mjs')
-    extractWorkspaceManager(repoRoot, extracted)
-    cpSync(hostLib, join(extracted, 'lib'), { recursive: true })
-    writeFileSync(join(extracted, 'lib/client.js'), stripArtifactPathComments(readFileSync(clientEntry, 'utf8')))
-    const clientTypes = join(repoRoot, 'packages/client/ui-page-app-manager/lib/types/client')
-    if (existsSync(clientTypes)) {
-      cpSync(clientTypes, join(extracted, 'lib/types/client'), {
-        recursive: true,
-        filter: source => statSync(source).isDirectory() || source.endsWith('.d.ts'),
-      })
-    }
+    extractWorkspaceManager(repoRoot, extracted, temporaryRoot)
+    await buildPathFreeClient(repoRoot, clientBuildDirectory)
+    stageWorkspaceManagerArtifacts({ repoRoot, clientBuildDirectory, extracted })
     mkdirSync(packed, { recursive: true })
     await execa('pnpm', ['pack', '--pack-destination', packed], {
       cwd: extracted,
@@ -159,7 +185,7 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
     }
 
     writeProbe(managerProbe, 'pageAppManager')
-    writeProbe(nativeProbe, 'sessions')
+    writeProbe(nativeProbe, 'sessions', 'pageAppManager')
     writeProfilePatch(join(profileDir, 'cordis.patch.yml'), managerProbe, false)
     await run(dshBin, ['--profile', profileName], { ...env, DSH_MANAGER_SMOKE_MARKER: marker }, 30_000)
     if (!existsSync(marker)) throw new Error('workspace manager install-chain started without activating pageAppManager')
@@ -167,7 +193,9 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
     rmSync(marker, { force: true })
     writeProfilePatch(join(profileDir, 'cordis.patch.yml'), nativeProbe, true)
     await run(dshBin, ['--profile', profileName], { ...env, DSH_MANAGER_SMOKE_MARKER: marker }, 30_000)
-    if (!existsSync(marker)) throw new Error('workspace manager install-chain disable left no native DSH service active')
+    if (readFileSync(marker, 'utf8') !== 'forbidden-absent') {
+      throw new Error('workspace manager install-chain disable left pageAppManager active')
+    }
 
     rmSync(marker, { force: true })
     writeProfilePatch(join(profileDir, 'cordis.patch.yml'), managerProbe, false)
@@ -187,6 +215,7 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
       tarballScanned: true,
       installedAndStarted: true,
       disabledWithNativeDsh: true,
+      managerAbsentWhileDisabled: true,
       reenabled: true,
       uninstalled: true,
     }

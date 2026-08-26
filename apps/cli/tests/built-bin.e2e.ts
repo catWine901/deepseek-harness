@@ -678,6 +678,7 @@ describe.skipIf(!existsSync(dshBin))('dsh BUILT bin (node lib/bin.js, no tsx)', 
       tarballScanned: true,
       installedAndStarted: true,
       disabledWithNativeDsh: true,
+      managerAbsentWhileDisabled: true,
       reenabled: true,
       uninstalled: true,
     })

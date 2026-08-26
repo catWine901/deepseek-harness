@@ -1,7 +1,7 @@
 /** Deterministically extract the Workspace Manager's out-of-tree repository skeleton. */
 
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join, parse, relative, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { isEntry } from './release/process.ts'
 
@@ -114,14 +114,34 @@ function asPeers(manifest: Manifest): Record<string, string> {
 }
 
 /**
+ * Resolve the only recursive-delete target owned by this extractor.
+ * @param sourceRoot - DeepSeek Harness repository root.
+ * @param candidate - requested extraction destination.
+ * @param ownedOutputRoot - dedicated parent owned by the caller; the CLI uses dist/out-of-tree.
+ * @returns the canonical workspace-manager output directory.
+ */
+export function resolveWorkspaceManagerDestination(
+  sourceRoot: string,
+  candidate: string,
+  ownedOutputRoot = join(sourceRoot, 'dist/out-of-tree'),
+): string {
+  const expected = resolve(ownedOutputRoot, 'dsh-workspace-manager')
+  const output = resolve(candidate)
+  if (output !== expected) {
+    throw new Error(`workspace manager extraction destination must be ${expected}; got ${output}`)
+  }
+  return output
+}
+
+/**
  * Generate the independent Workspace Manager repository skeleton.
  * @param sourceRoot - DeepSeek Harness repository root.
  * @param destination - output directory replaced atomically at directory granularity.
+ * @param ownedOutputRoot - dedicated output parent whose workspace-manager child may be replaced.
  */
-export function extractWorkspaceManager(sourceRoot: string, destination: string): void {
+export function extractWorkspaceManager(sourceRoot: string, destination: string, ownedOutputRoot?: string): void {
   const root = resolve(sourceRoot)
-  const output = resolve(destination)
-  if (output === parse(output).root || output === root) throw new Error(`refusing to replace extraction destination ${output}`)
+  const output = resolveWorkspaceManagerDestination(root, destination, ownedOutputRoot)
 
   const sourceManifests = SOURCE_PACKAGES.map(packagePath => readManifest(join(root, packagePath, 'package.json')))
   const extractedNames = new Set(sourceManifests.map((manifest) => {
