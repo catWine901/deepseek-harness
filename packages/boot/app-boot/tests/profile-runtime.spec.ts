@@ -33,7 +33,7 @@ import {
 } from '../src/index.ts'
 // Module-internal capability: reachable only from this package's own sources
 // (the package entry surface deliberately does not re-export it).
-import { profileRuntimeControl } from '../src/profile-runtime.ts'
+import { managerWrapperResolvable, profileRuntimeControl } from '../src/profile-runtime.ts'
 
 const NAME = 'dsh-test-bin'
 const NOOP_PLUGIN = 'export const name = "noop"\nexport function apply() {}\n'
@@ -1274,6 +1274,23 @@ describe('M7 managed-root wrapper derivation', () => {
       version: '0.1.1-rc.2',
     }))
   }
+
+  it('accepts the profile and controlled profiles fallback, but not a higher ancestor, for the manager wrapper', () => {
+    const directProfile = join(tmp(), 'profiles', 'direct')
+    stageManagerPackage(directProfile)
+    expect(managerWrapperResolvable(directProfile)).toBe(true)
+
+    const fallbackHome = tmp()
+    const fallbackProfilesDir = join(fallbackHome, 'profiles')
+    const fallbackProfile = join(fallbackProfilesDir, 'fallback')
+    stageManagerPackage(fallbackProfilesDir)
+    expect(managerWrapperResolvable(fallbackProfile)).toBe(true)
+
+    const ancestorHome = tmp()
+    const ancestorProfile = join(ancestorHome, 'profiles', 'ancestor')
+    stageManagerPackage(ancestorHome)
+    expect(managerWrapperResolvable(ancestorProfile)).toBe(false)
+  })
 
   /** A valid registry v1 document with one enabled row for the fixture page. */
   function writeRegistry(profileDir: string): void {
