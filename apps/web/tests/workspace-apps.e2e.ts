@@ -196,8 +196,9 @@ describe('web e2e: workspace apps keyless chain', () => {
     await fixtureSurface(page).waitFor({ timeout: 20_000 })
     // This is the new generation's real one-second fixture timer, installed
     // by its React effect through the injected Workbench lifecycle face.
+    const numberMatcher: unknown = expect.any(Number)
     await expect.poll(() => intervalProbe(page), { timeout: 10_000 })
-      .toMatchObject({ created: expect.any(Number), active: expect.any(Number) })
+      .toMatchObject({ created: numberMatcher, active: numberMatcher })
     const mountedInterval = await intervalProbe(page)
     expect(mountedInterval.created).toBeGreaterThan(0)
     expect(mountedInterval.active).toBeGreaterThan(0)
