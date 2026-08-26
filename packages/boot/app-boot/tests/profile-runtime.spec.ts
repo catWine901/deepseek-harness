@@ -1329,7 +1329,7 @@ describe('M7 managed-root wrapper derivation', () => {
     }
   }
 
-  it('derives wrapper root rows that inject workbenchRuntime and mount feature rows as children', async () => {
+  it('no direct-root form remains (derivation emits wrapper rows only)', async () => {
     const profile = tmp()
     stageFeaturePackage(profile)
     stageManagerPackage(profile)
