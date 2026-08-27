@@ -1,6 +1,6 @@
 /** Local packed-artifact smoke for the out-of-tree Workspace Manager install chain. */
 
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -64,7 +64,6 @@ export function resolvePackedTarball(stdout: string, packedDirectory: string): s
  * @param options - built Host/client locations and extracted package root.
  */
 export function stageWorkspaceManagerArtifacts(options: WorkspaceManagerArtifactStagingOptions): void {
-  const repoRoot = resolve(options.repoRoot)
   const extracted = resolve(options.extracted)
   const hostLib = resolve(options.hostBuildDirectory)
   const clientArtifact = join(resolve(options.clientBuildDirectory), 'client.js')
@@ -72,6 +71,7 @@ export function stageWorkspaceManagerArtifacts(options: WorkspaceManagerArtifact
   requireArtifact(join(hostLib, 'wrapper.js'))
   requireArtifact(join(hostLib, 'types/index.d.ts'))
   requireArtifact(join(hostLib, 'types/wrapper.d.ts'))
+  requireArtifact(join(hostLib, 'types/client/index.d.ts'))
   requireArtifact(clientArtifact)
   assertWorkspaceManagerHostClosure(hostLib)
   const clientBytes = readFileSync(clientArtifact)
@@ -79,13 +79,6 @@ export function stageWorkspaceManagerArtifacts(options: WorkspaceManagerArtifact
 
   cpSync(hostLib, join(extracted, 'lib'), { recursive: true })
   writeFileSync(join(extracted, 'lib/client.js'), clientBytes)
-  const clientTypes = join(repoRoot, 'packages/client/ui-page-app-manager/lib/types/client')
-  if (existsSync(clientTypes)) {
-    cpSync(clientTypes, join(extracted, 'lib/types/client'), {
-      recursive: true,
-      filter: source => statSync(source).isDirectory() || source.endsWith('.d.ts'),
-    })
-  }
 }
 
 async function buildPathFreeClient(repoRoot: string, destination: string): Promise<void> {

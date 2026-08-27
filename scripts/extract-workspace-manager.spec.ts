@@ -10,6 +10,7 @@ import {
   buildWorkspaceManagerHost,
   WORKSPACE_MANAGER_BUNDLE_IMPORTS,
   WORKSPACE_MANAGER_EXTERNAL_SEAMS,
+  WORKSPACE_MANAGER_FORBIDDEN_PUBLIC_IMPORTS,
   WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES,
 } from './build-workspace-manager-host.ts'
 import { scanTarballContent } from './publication-payload.ts'
@@ -156,6 +157,7 @@ describe('workspace manager extraction', () => {
       '@deepseek-ai/dsh-client-locale': '>=0.1.1-rc.2 <0.2.0',
       '@deepseek-ai/dsh-client-modules': '>=0.1.1-rc.2 <0.2.0',
       '@deepseek-ai/dsh-client-runtime': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/dsh-client-ui-slots': '>=0.1.1-rc.2 <0.2.0',
       '@deepseek-ai/dsh-client-ui-settings': '>=0.1.1-rc.2 <0.2.0',
     })
     expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-profile')
@@ -187,6 +189,20 @@ describe('workspace manager extraction', () => {
       '@deepseek-ai/cordis-plugin-include',
       '@deepseek-ai/cordis-plugin-loader',
     ])
+  })
+
+  it('bundles every non-public Host and client declaration owner', () => {
+    const declarationImports = filesUnder(join(hostBuild, 'types'))
+      .filter(path => path.endsWith('.d.ts'))
+      .flatMap(path => ts.preProcessFile(readFileSync(join(hostBuild, 'types', path), 'utf8'), true, true)
+        .importedFiles.map(({ fileName }) => fileName))
+
+    expect(filesUnder(join(hostBuild, 'types'))).toContain(join('client', 'index.d.ts'))
+    for (const packageName of WORKSPACE_MANAGER_FORBIDDEN_PUBLIC_IMPORTS) {
+      expect(declarationImports.some(
+        specifier => specifier === packageName || specifier.startsWith(`${packageName}/`),
+      )).toBe(false)
+    }
   })
 
   it('separates the rc.2 app-boot bridge import from manager-owned release dependencies', () => {

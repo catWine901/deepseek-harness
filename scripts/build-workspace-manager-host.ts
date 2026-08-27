@@ -25,6 +25,32 @@ export const WORKSPACE_MANAGER_EXTERNAL_SEAMS = [
   '@deepseek-ai/cordis-plugin-loader',
 ] as const
 
+/** Type-only packages folded into the standalone declaration surface. */
+export const WORKSPACE_MANAGER_DECLARATION_IMPORTS = [
+  ...WORKSPACE_MANAGER_BUNDLE_IMPORTS,
+  '@deepseek-ai/cordis-plugin-loader',
+  '@deepseek-ai/dsh-brand',
+] as const
+
+/** Client type owners that are not public dependencies of the standalone package. */
+export const WORKSPACE_MANAGER_CLIENT_DECLARATION_IMPORTS = [
+  '@deepseek-ai/dsh-page-app-manager',
+  '@deepseek-ai/dsh-page-app-manager/types',
+  '@deepseek-ai/dsh-page-app-profile',
+  '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-brand',
+  '@deepseek-ai/dsh-invariants',
+] as const
+
+/** Imports that must not escape through standalone JavaScript or declarations. */
+export const WORKSPACE_MANAGER_FORBIDDEN_PUBLIC_IMPORTS = [
+  ...WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES,
+  '@deepseek-ai/dsh-page-app-manager',
+  '@deepseek-ai/cordis-plugin-loader',
+  '@deepseek-ai/dsh-brand',
+  '@deepseek-ai/dsh-invariants',
+] as const
+
 /** Inputs for the standalone Workspace Manager Host build. */
 export interface WorkspaceManagerHostBuildOptions {
   /** DeepSeek Harness repository root. */
@@ -41,7 +67,7 @@ function artifactFiles(root: string, prefix = ''): string[] {
 }
 
 function isManagerInternalImport(specifier: string): boolean {
-  return WORKSPACE_MANAGER_BUNDLE_IMPORTS.some(
+  return WORKSPACE_MANAGER_FORBIDDEN_PUBLIC_IMPORTS.some(
     packageName => specifier === packageName || specifier.startsWith(`${packageName}/`),
   )
 }
@@ -60,7 +86,7 @@ export function assertWorkspaceManagerHostClosure(artifactRoot: string): void {
     const forbidden = imported.find(({ fileName }) => isManagerInternalImport(fileName))
     if (forbidden !== undefined) {
       throw new Error(
-        `workspace manager Host artifact ${path.replaceAll('\\', '/')} requires unpublished package ${forbidden.fileName}`,
+        `workspace manager standalone artifact ${path.replaceAll('\\', '/')} leaks non-public import ${forbidden.fileName}`,
       )
     }
   }
@@ -121,8 +147,46 @@ export async function buildWorkspaceManagerHost(
       alwaysBundle: [...WORKSPACE_MANAGER_BUNDLE_IMPORTS],
       neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
       dts: {
-        alwaysBundle: [...WORKSPACE_MANAGER_BUNDLE_IMPORTS],
-        neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
+        alwaysBundle: [...WORKSPACE_MANAGER_DECLARATION_IMPORTS],
+        neverBundle: WORKSPACE_MANAGER_EXTERNAL_SEAMS.filter(
+          packageName => !WORKSPACE_MANAGER_DECLARATION_IMPORTS.some(inlined => inlined === packageName),
+        ),
+      },
+    },
+  })
+
+  await build({
+    config: false,
+    cwd: join(repoRoot, 'packages/client/ui-page-app-manager'),
+    entry: ['lib/types/client/index.d.ts'],
+    outDir: join(outputDirectory, 'types/client'),
+    format: ['esm'],
+    platform: 'browser',
+    target: 'es2024',
+    fixedExtension: false,
+    sourcemap: false,
+    clean: false,
+    outputOptions: { codeSplitting: false },
+    dts: {
+      dtsInput: true,
+      emitDtsOnly: true,
+      resolver: 'tsc',
+      compilerOptions: { sourceMap: false, declarationMap: false },
+    },
+    deps: {
+      alwaysBundle: [...WORKSPACE_MANAGER_CLIENT_DECLARATION_IMPORTS],
+      neverBundle: [
+        '@deepseek-ai/cordis',
+        '@deepseek-ai/dsh-client-runtime',
+        'react',
+      ],
+      dts: {
+        alwaysBundle: [...WORKSPACE_MANAGER_CLIENT_DECLARATION_IMPORTS],
+        neverBundle: [
+          '@deepseek-ai/cordis',
+          '@deepseek-ai/dsh-client-runtime',
+          'react',
+        ],
       },
     },
   })

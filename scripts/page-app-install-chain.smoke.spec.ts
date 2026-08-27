@@ -17,11 +17,9 @@ function artifactFixture(
   const repoRoot = mkdtempSync(join(tmpdir(), 'dsh-workspace-manager-artifacts-'))
   temporaryRoots.push(repoRoot)
   const hostLib = join(repoRoot, 'packages/host/page-app-manager/lib')
-  const clientTypes = join(repoRoot, 'packages/client/ui-page-app-manager/lib/types/client')
   const clientBuildDirectory = join(repoRoot, 'client-build')
   const extracted = join(repoRoot, 'extracted')
   mkdirSync(hostLib, { recursive: true })
-  mkdirSync(clientTypes, { recursive: true })
   mkdirSync(clientBuildDirectory, { recursive: true })
   mkdirSync(extracted, { recursive: true })
   writeFileSync(join(hostLib, 'index.js'), host)
@@ -29,7 +27,8 @@ function artifactFixture(
   mkdirSync(join(hostLib, 'types'), { recursive: true })
   writeFileSync(join(hostLib, 'types/index.d.ts'), hostTypes)
   writeFileSync(join(hostLib, 'types/wrapper.d.ts'), 'export declare const wrapper: true\n')
-  writeFileSync(join(clientTypes, 'index.d.ts'), 'export declare const client: true\n')
+  mkdirSync(join(hostLib, 'types/client'), { recursive: true })
+  writeFileSync(join(hostLib, 'types/client/index.d.ts'), 'export declare const client: true\n')
   writeFileSync(join(clientBuildDirectory, 'client.js'), client)
   return { repoRoot, hostBuildDirectory: hostLib, clientBuildDirectory, extracted }
 }
@@ -63,6 +62,8 @@ describe('workspace manager install-chain packaging', () => {
     stageWorkspaceManagerArtifacts(fixture)
 
     expect(readFileSync(join(fixture.extracted, 'lib/client.js'), 'utf8')).toBe(bytes)
+    expect(readFileSync(join(fixture.extracted, 'lib/types/client/index.d.ts'), 'utf8'))
+      .toBe('export declare const client: true\n')
   })
 
   it('rejects a path-bearing client build instead of rewriting it', () => {

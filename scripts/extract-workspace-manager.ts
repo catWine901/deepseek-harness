@@ -343,6 +343,8 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
     ...asPeers(normalizedHost),
     ...asPeers(normalizedClient),
     '@deepseek-ai/cordis': '^4.0.1',
+    // The standalone client declaration augments this public DSH type owner.
+    '@deepseek-ai/dsh-client-ui-slots': `^${dshVersion}`,
   }
   const peerDependencies = Object.fromEntries(
     Object.entries(collectedPeers)
