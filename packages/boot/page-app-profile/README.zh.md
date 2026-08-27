@@ -50,6 +50,12 @@ await withPageAppProfileLock(profileDir, { kind: 'manager', token }, async () =>
 - **启动恢复绝不猜测** —— 与 journal token 匹配的死 `manager` 锁由恰好一个恢复者改名隔离：恢复 claim 构成按 token 追加的 `wx` 创建代际链（旧的固定路径 claim 视为第 0 代），每个恢复者在行动前先验证整条链——代际从 0 连续、claim 可读、每个祖先可证明已死；存活、活性不确定或不可读的链尾失败闭合，可证明已死的链尾被下一代取代，失败者直接失败退出。无 journal 的死 `manager` 锁可安全移除，因为任何变更都不得先于 journal 发布；其余一切状态——活进程、token 不匹配、payload 不可读、活性不确定，或任何死 `plugin-cli` 锁——都失败闭合交由人工修复。
 - **日志化事务在变更前即持久** —— journal 记录锁 owner token、相位（`prepared` → `staged` → `committing`）、变更前文件的 sha256 哈希，以及 0600 私有备份；快照路径为 manager 相对路径，无法逃逸档案目录。
 
+## 独立发布边界
+
+独立 Workspace Manager 发布包把本包与 `dsh-atomic-write` 作为 Manager 自有实现内联。它还只内联协调公开 DSH 0.1.1-rc.2 watcher 所需、以源码为权威的 `profile-runtime-bridge` helper 子图。该 helper 不是第二套通用 app-boot runtime：官方 `dsh-app-boot` 包仍是 Host 指纹与原生能力 seam，Cordis 与 Include 始终来自消费方的 DSH 安装。
+
+最终发布包只有 `js-yaml` 与 `zod` 两项普通运行时依赖。Cordis、Include、Typert、API Remotes 和浏览器 runtime 包保持为 peer，绝不打入 Manager bundle。
+
 ## Model Experience
 
 无。这是纯 Host 持久化原语，没有任何内容进入模型请求。

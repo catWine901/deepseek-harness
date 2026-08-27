@@ -2,7 +2,7 @@
 
 import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { execa } from 'execa'
 import { assertWorkspaceManagerHostClosure, buildWorkspaceManagerHost } from './build-workspace-manager-host.ts'
@@ -40,6 +40,23 @@ function requireArtifact(path: string): void {
   if (!existsSync(path)) {
     throw new Error(`workspace manager install-chain requires built artifact ${path}; run pnpm run build first`)
   }
+}
+
+/**
+ * Resolve the tarball named by pnpm's machine-readable pack report.
+ * @param stdout - stdout from `pnpm pack --json`.
+ * @param packedDirectory - destination supplied to pnpm pack.
+ * @returns the absolute tarball path reported by pnpm.
+ */
+export function resolvePackedTarball(stdout: string, packedDirectory: string): string {
+  const parsed: unknown = JSON.parse(stdout)
+  const report: unknown = Array.isArray(parsed) ? parsed[0] : parsed
+  if (report === null || typeof report !== 'object'
+    || typeof (report as { filename?: unknown }).filename !== 'string') {
+    throw new Error(`pnpm pack --json returned no filename: ${stdout}`)
+  }
+  const filename = (report as { filename: string }).filename
+  return isAbsolute(filename) ? resolve(filename) : resolve(packedDirectory, filename)
 }
 
 /**
@@ -182,11 +199,12 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
     await buildPathFreeClient(repoRoot, clientBuildDirectory)
     stageWorkspaceManagerArtifacts({ repoRoot, hostBuildDirectory, clientBuildDirectory, extracted })
     mkdirSync(packed, { recursive: true })
-    await execa('pnpm', ['pack', '--pack-destination', packed], {
+    const { stdout: packReport } = await execa('pnpm', ['pack', '--json', '--pack-destination', packed], {
       cwd: extracted,
       shell: process.platform === 'win32',
     })
-    const managerTarball = join(packed, 'tingyu9527-dsh-workspace-manager-1.0.0.tgz')
+    const managerTarball = resolvePackedTarball(packReport, packed)
+    requireArtifact(managerTarball)
     scanTarballContent(managerTarball, member => !member.endsWith('/'))
 
     const env = { ...process.env, DSH_HOME: home }

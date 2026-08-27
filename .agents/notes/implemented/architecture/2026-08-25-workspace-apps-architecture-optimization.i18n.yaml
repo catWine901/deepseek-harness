@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-25-workspace-apps-architecture-optimization.md
-2026-08-25-workspace-apps-architecture-optimization.md: 565e51eb0cbc283daf56b911e42aba48d012fd28
-2026-08-25-workspace-apps-architecture-optimization.zh.md: 78eca9b2f65c4468b178135884be189145c8571e
+2026-08-25-workspace-apps-architecture-optimization.md: 8dab45860b2dd25afe70ba69bb286aaec52e4d94
+2026-08-25-workspace-apps-architecture-optimization.zh.md: 61b84002829b8e7dd3081c5ab5c236583051b9d6

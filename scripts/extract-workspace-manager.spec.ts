@@ -4,13 +4,21 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:f
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import ts from 'typescript'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import {
+  buildWorkspaceManagerHost,
+  WORKSPACE_MANAGER_BUNDLE_IMPORTS,
+  WORKSPACE_MANAGER_EXTERNAL_SEAMS,
+  WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES,
+} from './build-workspace-manager-host.ts'
 import { scanTarballContent } from './publication-payload.ts'
 import { extractWorkspaceManager, resolveWorkspaceManagerDestination } from './extract-workspace-manager.ts'
 
 const repoRoot = fileURLToPath(new URL('../', import.meta.url))
 const temporaryRoot = mkdtempSync(join(tmpdir(), 'dsh-workspace-manager-extract-'))
 const output = join(temporaryRoot, 'dsh-workspace-manager')
+const hostBuild = join(temporaryRoot, 'host-build')
 
 function readJson(path: string): Record<string, unknown> {
   return JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
@@ -34,8 +42,9 @@ function treeDigest(root: string): string {
   return hash.digest('hex')
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   extractWorkspaceManager(repoRoot, output, temporaryRoot)
+  await buildWorkspaceManagerHost({ repoRoot, outputDirectory: hostBuild })
 })
 
 afterAll(() => {
@@ -63,11 +72,13 @@ describe('workspace manager extraction', () => {
 
   it('skeleton manifest is private false with normal semver and no workspace: references', () => {
     const manifest = readJson(join(output, 'package.json'))
-    expect(manifest.version).toBe('1.0.0')
+    expect(manifest.version).toBe('1.0.1')
     expect(manifest.private).toBe(false)
     expect(readFileSync(join(output, 'package.json'), 'utf8')).not.toContain('workspace:')
     for (const manifestPath of filesUnder(join(output, 'packages')).filter(path => path.endsWith('package.json'))) {
-      const packageManifest = readFileSync(join(output, 'packages', manifestPath), 'utf8')
+      const packageManifestPath = join(output, 'packages', manifestPath)
+      const packageManifest = readFileSync(packageManifestPath, 'utf8')
+      expect(readJson(packageManifestPath).version).toBe('1.0.1')
       expect(packageManifest).not.toContain('workspace:')
     }
   })
@@ -129,18 +140,103 @@ describe('workspace manager extraction', () => {
     expect(manifest.peerDependencies).toMatchObject({ '@deepseek-ai/cordis': '^4.0.1' })
   })
 
-  it('targets the 0.1.1-rc.2 DSH seam without depending on its own bundled manager', () => {
+  it('publishes only the runtime dependencies and official DSH/Cordis seams used by the artifact', () => {
     const manifest = readJson(join(output, 'package.json'))
+    expect(manifest.dependencies).toEqual({
+      'js-yaml': '^4.2.0',
+      zod: '^4.0.0',
+    })
     const peers = manifest.peerDependencies as Record<string, string>
+    expect(peers).toEqual({
+      '@deepseek-ai/dsh-app-boot': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/dsh-typert-protocol': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/cordis': '^4.0.1',
+      '@deepseek-ai/cordis-plugin-include': '^1.0.6',
+      '@deepseek-ai/dsh-api-remotes': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/dsh-client-locale': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/dsh-client-modules': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/dsh-client-runtime': '>=0.1.1-rc.2 <0.2.0',
+      '@deepseek-ai/dsh-client-ui-settings': '>=0.1.1-rc.2 <0.2.0',
+    })
     expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-profile')
-    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-app-boot')
-    expect(peers['@deepseek-ai/cordis-plugin-include']).toBe('^1.0.0')
-    expect(peers['@deepseek-ai/cordis-plugin-loader']).toBe('^1.0.0')
+    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-atomic-write')
+    expect(peers).not.toHaveProperty('@deepseek-ai/cordis-plugin-loader')
+    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-brand')
+    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-invariants')
     expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-manager')
 
     const readme = readFileSync(join(output, 'README.md'), 'utf8')
-    expect(readme).toContain('DeepSeek Harness 0.1.1-rc.2')
+    expect(readme).toContain('@deepseek-ai/dsh@0.1.1-rc.2')
     expect(readme).toContain('not compatible with the older 0.1.0-rc.6 public release')
+  })
+
+  it('derives removed framework peers from the emitted Host import graph', () => {
+    const hostImports = filesUnder(hostBuild)
+      .filter(path => path.endsWith('.js'))
+      .flatMap(path => ts.preProcessFile(readFileSync(join(hostBuild, path), 'utf8'), true, true)
+        .importedFiles.map(({ fileName }) => fileName))
+
+    expect(hostImports).toContain('@deepseek-ai/cordis')
+    expect(hostImports).toContain('@deepseek-ai/cordis-plugin-include')
+    expect(hostImports).not.toContain('@deepseek-ai/cordis-plugin-loader')
+    expect(hostImports).not.toContain('@deepseek-ai/dsh-brand')
+    expect(hostImports).not.toContain('@deepseek-ai/dsh-invariants')
+    expect(WORKSPACE_MANAGER_EXTERNAL_SEAMS).toEqual([
+      '@deepseek-ai/dsh-typert-protocol',
+      '@deepseek-ai/cordis',
+      '@deepseek-ai/cordis-plugin-include',
+      '@deepseek-ai/cordis-plugin-loader',
+    ])
+  })
+
+  it('separates the rc.2 app-boot bridge import from manager-owned release dependencies', () => {
+    expect(WORKSPACE_MANAGER_BUNDLE_IMPORTS).toContain('@deepseek-ai/dsh-app-boot/profile-runtime-bridge')
+    expect(WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES).toEqual([
+      '@deepseek-ai/dsh-page-app-profile',
+      '@deepseek-ai/dsh-atomic-write',
+    ])
+    expect(WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES).not.toContain('@deepseek-ai/dsh-app-boot')
+  })
+
+  it('documents direct npm-form rc.2 compatibility and the audited legacy bridge in both languages', () => {
+    const readme = readFileSync(join(output, 'README.md'), 'utf8')
+    const readmeZh = readFileSync(join(output, 'README.zh.md'), 'utf8')
+    const changelog = readFileSync(join(output, 'CHANGELOG.md'), 'utf8')
+    expect(readme).toContain('npm release `@deepseek-ai/dsh@0.1.1-rc.2`')
+    expect(readme).toContain('legacy rc.2 compatibility bridge')
+    expect(readme).toContain('automatically stays inactive')
+    expect(readme).not.toContain('source build')
+    expect(readme).toContain('@tingyu9527/dsh-workspace-manager@1.0.1')
+    expect(readmeZh).toContain('npm 发布包 `@deepseek-ai/dsh@0.1.1-rc.2`')
+    expect(readmeZh).toContain('旧版 rc.2 兼容桥')
+    expect(readmeZh).toContain('自动保持不激活')
+    expect(readmeZh).not.toContain('源码构建')
+    expect(readmeZh).toContain('@tingyu9527/dsh-workspace-manager@1.0.1')
+    expect(changelog).toContain('## 1.0.1')
+    expect(changelog).toContain('public npm-form DSH 0.1.1-rc.2')
+  })
+
+  it('keeps the source package docs and architecture note honest about the standalone boundary', () => {
+    const profileReadme = readFileSync(join(repoRoot, 'packages/boot/page-app-profile/README.md'), 'utf8')
+    const profileReadmeZh = readFileSync(join(repoRoot, 'packages/boot/page-app-profile/README.zh.md'), 'utf8')
+    const managerReadme = readFileSync(join(repoRoot, 'packages/host/page-app-manager/README.md'), 'utf8')
+    const managerReadmeZh = readFileSync(join(repoRoot, 'packages/host/page-app-manager/README.zh.md'), 'utf8')
+    const noteRoot = join(repoRoot, '.agents/notes/implemented/architecture')
+    const note = readFileSync(join(noteRoot, '2026-08-25-workspace-apps-architecture-optimization.md'), 'utf8')
+    const noteZh = readFileSync(join(noteRoot, '2026-08-25-workspace-apps-architecture-optimization.zh.md'), 'utf8')
+
+    expect(profileReadme).toContain('## Standalone release boundary')
+    expect(profileReadme).toContain('not a second general app-boot runtime')
+    expect(profileReadmeZh).toContain('## 独立发布边界')
+    expect(profileReadmeZh).toContain('不是第二套通用 app-boot runtime')
+    expect(managerReadme).toContain('## Cordis adapter and public rc.2 compatibility')
+    expect(managerReadme).toContain('does not require `cordis-plugin-loader` as a package peer')
+    expect(managerReadmeZh).toContain('## Cordis adapter 与公开 rc.2 兼容')
+    expect(managerReadmeZh).toContain('不要求把 `cordis-plugin-loader` 声明为包 peer')
+    expect(note).toContain('legacy rc.2 compatibility bridge')
+    expect(note).toContain('fresh npm consumer')
+    expect(noteZh).toContain('旧版 rc.2 兼容桥')
+    expect(noteZh).toContain('全新 npm consumer')
   })
 
   it('skeleton never declares dsh.workspace', () => {
@@ -172,7 +268,7 @@ describe('workspace manager extraction', () => {
       stdio: 'pipe',
       shell: process.platform === 'win32',
     })
-    const tarball = join(packed, 'tingyu9527-dsh-workspace-manager-1.0.0.tgz')
+    const tarball = join(packed, 'tingyu9527-dsh-workspace-manager-1.0.1.tgz')
     expect(() => { scanTarballContent(tarball, member => !member.endsWith('/')) }).not.toThrow()
   })
 })

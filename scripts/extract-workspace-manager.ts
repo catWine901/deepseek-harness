@@ -3,10 +3,10 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { WORKSPACE_MANAGER_INTERNAL_PACKAGES } from './build-workspace-manager-host.ts'
+import { WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES } from './build-workspace-manager-host.ts'
 import { isEntry } from './release/process.ts'
 
-const VERSION = '1.0.0'
+const VERSION = '1.0.1'
 const MANAGER_NAME = '@tingyu9527/dsh-workspace-manager'
 const REPOSITORY_URL = 'https://github.com/catWine901/dsh-workspace-manager'
 const SOURCE_PACKAGES = [
@@ -32,10 +32,10 @@ An out-of-tree Workspace Apps control plane for [DeepSeek Harness](https://githu
 
 ## Install
 
-Requirements: a DeepSeek Harness 0.1.1-rc.2 source build (or a later compatible 0.1.x release), Node.js 20 or newer, and pnpm 11.7.0 on \`PATH\`. This package uses seams introduced after 0.1.0-rc.6 and is not compatible with the older 0.1.0-rc.6 public release.
+Requirements: the npm release \`@deepseek-ai/dsh@0.1.1-rc.2\`, Node.js 20 or newer, and pnpm 11.7.0 on \`PATH\`. This package uses seams introduced after 0.1.0-rc.6 and is not compatible with the older 0.1.0-rc.6 public release.
 
 \`\`\`sh
-dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.0
+dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.1
 dsh --profile <profile>
 \`\`\`
 
@@ -75,7 +75,8 @@ Managed Features run below a Feature Runtime Wrapper. Provider loss parks the Fe
 
 ## Compatibility and limits
 
-- This 1.0.0 release targets the DSH 0.1.1-rc.2 seam packages and \`@deepseek-ai/cordis\` 4.0.x.
+- This 1.0.1 release targets the public npm-form DSH 0.1.1-rc.2 seam packages and \`@deepseek-ai/cordis\` 4.0.x.
+- Its explicitly named legacy rc.2 compatibility bridge coordinates the public rc.2 profile watcher with manager changes. On a future DSH Host that provides the native \`ProfileRuntime\` capability, the bridge automatically stays inactive.
 - Installation requires the Host client-module registry because activation must be acknowledged against an exact client-graph revision.
 - Packages that need install scripts may require an operator-managed pnpm build allowance; the manager will not grant it automatically.
 - Registry and user data are retained when the manager or an individual Workspace App is removed.
@@ -106,10 +107,10 @@ const README_ZH = `# DSH Workspace Manager
 
 ## 安装
 
-要求：DeepSeek Harness 0.1.1-rc.2 源码构建（或后续兼容的 0.1.x 版本）、Node.js 20 或更高版本，并确保 pnpm 11.7.0 位于 \`PATH\`。本包依赖 0.1.0-rc.6 之后新增的 seam，因此不兼容较旧的 0.1.0-rc.6 公共版本。
+要求：npm 发布包 \`@deepseek-ai/dsh@0.1.1-rc.2\`、Node.js 20 或更高版本，并确保 pnpm 11.7.0 位于 \`PATH\`。本包依赖 0.1.0-rc.6 之后新增的 seam，因此不兼容较旧的 0.1.0-rc.6 公共版本。
 
 \`\`\`sh
-dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.0
+dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.1
 dsh --profile <profile>
 \`\`\`
 
@@ -149,7 +150,8 @@ dsh plugin --profile <profile> add github:catWine901/dsh-workspace-manager
 
 ## 兼容性与限制
 
-- 1.0.0 面向 DSH 0.1.1-rc.2 seam 包与 \`@deepseek-ai/cordis\` 4.0.x。
+- 1.0.1 面向公开 npm 形态的 DSH 0.1.1-rc.2 seam 包与 \`@deepseek-ai/cordis\` 4.0.x。
+- 明确命名的旧版 rc.2 兼容桥负责协调公开 rc.2 profile watcher 与 Manager 变更；未来 DSH Host 提供原生 \`ProfileRuntime\` 能力时，该桥会自动保持不激活。
 - 安装依赖 Host client-module registry，因为激活必须对精确 client graph revision 完成确认。
 - 如果包需要执行安装脚本，操作者可能需要自行配置 pnpm build allowance；Manager 不会自动授权。
 - 移除 Manager 或单个 Workspace App 时，registry 与用户数据会被保留。
@@ -164,6 +166,11 @@ dsh plugin --profile <profile> add github:catWine901/dsh-workspace-manager
 `
 
 const CHANGELOG = `# Changelog
+
+## 1.0.1
+
+- Support the public npm-form DSH 0.1.1-rc.2 package through an audited legacy compatibility bridge that is a no-op when the native ProfileRuntime capability exists.
+- Publish the exact standalone dependency and peer boundary used by the Host and Client artifacts.
 
 ## 1.0.0
 
@@ -253,8 +260,7 @@ function asPeers(manifest: Manifest): Record<string, string> {
 
 function releasePeerSpecifier(name: string, dshVersion: string, current: string): string {
   if (name === '@deepseek-ai/cordis') return '^4.0.1'
-  if (name === '@deepseek-ai/cordis-plugin-include'
-    || name === '@deepseek-ai/cordis-plugin-loader') return '^1.0.0'
+  if (name === '@deepseek-ai/cordis-plugin-include') return '^1.0.6'
   if (name.startsWith('@deepseek-ai/dsh-')) return `>=${dshVersion} <0.2.0`
   return current
 }
@@ -332,7 +338,10 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
   const peerDependencies = Object.fromEntries(
     Object.entries(collectedPeers)
       .filter(([name]) => name !== '@deepseek-ai/dsh-page-app-manager'
-        && !WORKSPACE_MANAGER_INTERNAL_PACKAGES.some(packageName => name === packageName))
+        && !WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES.some(packageName => name === packageName)
+        && name !== '@deepseek-ai/cordis-plugin-loader'
+        && name !== '@deepseek-ai/dsh-brand'
+        && name !== '@deepseek-ai/dsh-invariants')
       .map(([name, version]) => [name, releasePeerSpecifier(name, dshVersion, version)]),
   )
   const clientDsh = clientManifest.dsh

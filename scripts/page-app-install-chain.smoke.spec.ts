@@ -1,8 +1,11 @@
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { stageWorkspaceManagerArtifacts } from './page-app-install-chain.smoke.ts'
+import {
+  resolvePackedTarball,
+  stageWorkspaceManagerArtifacts,
+} from './page-app-install-chain.smoke.ts'
 
 const temporaryRoots: string[] = []
 
@@ -36,6 +39,17 @@ afterEach(() => {
 })
 
 describe('workspace manager install-chain packaging', () => {
+  it('uses the filename reported by pnpm pack instead of a release-version literal', () => {
+    const packed = join(tmpdir(), 'packed')
+    expect(resolvePackedTarball('[{"filename":"tingyu9527-dsh-workspace-manager-1.0.1.tgz"}]', packed))
+      .toBe(resolve(packed, 'tingyu9527-dsh-workspace-manager-1.0.1.tgz'))
+  })
+
+  it('fails loudly when pnpm pack omits its output filename', () => {
+    expect(() => { resolvePackedTarball('[{}]', 'C:/packed') })
+      .toThrow('pnpm pack --json returned no filename')
+  })
+
   it('copies a path-free client build byte-for-byte into the extracted package', () => {
     const bytes = 'window.__ModuleLoader__.load({ id: "workspace-manager" })\n'
     const fixture = artifactFixture(bytes)

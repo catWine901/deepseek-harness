@@ -1,13 +1,13 @@
 /**
- * Cordis Compatibility Adapter — the sole runtime-import location for
- * `@deepseek-ai/cordis`, `@deepseek-ai/cordis-plugin-loader`, and
- * `@deepseek-ai/cordis-plugin-include` inside Manager product code. Every
- * Workbench concern that reads Cordis state (managed-root hashing, include
- * patch composition and parsing, Loader row lookup, fiber projection) is
- * delegated here, so a Cordis API change lands in one file. The adapter spec
- * pins each delegation against the vendored Cordis surface it wraps, and the
- * import gate keeps the rest of `src/` Cordis-free at runtime — only a
- * type-only `Context` import may leave the adapter.
+ * Cordis Compatibility Adapter — the audited ordinary Cordis boundary inside
+ * Manager product code. Include is a runtime import; Cordis Context and Loader
+ * entry shapes are type-only, while the live Loader service is obtained
+ * structurally from the Host context. Every Workbench concern that reads
+ * Cordis state (managed-root hashing, include patch composition and parsing,
+ * Loader row lookup, fiber projection) is delegated here, so an API change
+ * lands in one file. The explicitly named legacy rc.2 bridge is the only other
+ * audited framework boundary. The adapter spec pins each delegation against
+ * its vendored surface and keeps the rest of `src/` Cordis-free at runtime.
  * @module @deepseek-ai/dsh-page-app-manager/adapter
  */
 

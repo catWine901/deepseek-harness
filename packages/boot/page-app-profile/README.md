@@ -50,6 +50,12 @@ The contract, in the order the spec exploits it:
 - **Startup recovery never guesses** — a dead `manager` lock whose token matches the journal is quarantined by exactly one recoverer: recovery claims form an append-only chain of `wx`-created generations per token (the legacy fixed-path claim counts as generation 0), and every recoverer validates the whole chain before acting — contiguous generations from 0, readable claims, and provably dead ancestors; a live, indeterminate, or unreadable tail fails closed, a provably dead tail is superseded by the next generation, and losers fail rather than proceed. A dead `manager` lock without a journal is safe to remove because no mutation precedes journal publication, and every other state — live pid, token mismatch, unreadable payload, indeterminate liveness, or any dead `plugin-cli` lock — fails closed for operator repair.
 - **Journaled transactions are durable before mutation** — the journal records the lock owner token, the phase (`prepared` → `staged` → `committing`), and before-file sha256 hashes plus 0600 private backups; snapshot paths are manager-relative and cannot escape the profile directory.
 
+## Standalone release boundary
+
+The standalone Workspace Manager release inlines this package and `dsh-atomic-write` as manager-owned implementation. It also inlines only the source-authoritative `profile-runtime-bridge` helper subgraph needed to coordinate the public DSH 0.1.1-rc.2 watcher. That helper is not a second general app-boot runtime: the official `dsh-app-boot` package remains the Host fingerprint and native-capability seam, while Cordis and Include always come from the consuming DSH installation.
+
+The resulting release has only `js-yaml` and `zod` as ordinary runtime dependencies. Cordis, Include, Typert, API Remotes, and the browser runtime packages remain peers and are never bundled into the manager.
+
 ## Model Experience
 
 None, as this is a pure Host persistence primitive; nothing here reaches a model request.

@@ -5,25 +5,24 @@ import { join, resolve } from 'node:path'
 import { build } from 'tsdown'
 import ts from 'typescript'
 
-/** Manager-owned implementation packages included in the standalone Host artifact. */
-export const WORKSPACE_MANAGER_INTERNAL_PACKAGES = [
-  '@deepseek-ai/dsh-app-boot',
+/** Manager-owned implementation packages included in the standalone release. */
+export const WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES = [
   '@deepseek-ai/dsh-page-app-profile',
   '@deepseek-ai/dsh-atomic-write',
 ] as const
 
-const WORKSPACE_MANAGER_EXTERNAL_SEAMS = [
+/** Exact package imports bundled into the standalone Host artifact. */
+export const WORKSPACE_MANAGER_BUNDLE_IMPORTS = [
+  ...WORKSPACE_MANAGER_RELEASE_INLINED_PACKAGES,
+  '@deepseek-ai/dsh-app-boot/profile-runtime-bridge',
+] as const
+
+/** Framework packages that must always resolve from the consuming DSH Host. */
+export const WORKSPACE_MANAGER_EXTERNAL_SEAMS = [
   '@deepseek-ai/dsh-typert-protocol',
   '@deepseek-ai/cordis',
   '@deepseek-ai/cordis-plugin-include',
   '@deepseek-ai/cordis-plugin-loader',
-  '@deepseek-ai/dsh-brand',
-  '@deepseek-ai/dsh-invariants',
-] as const
-
-const WORKSPACE_MANAGER_INTERNAL_IMPORTS = [
-  ...WORKSPACE_MANAGER_INTERNAL_PACKAGES,
-  '@deepseek-ai/dsh-app-boot/profile-runtime-bridge',
 ] as const
 
 /** Inputs for the standalone Workspace Manager Host build. */
@@ -42,7 +41,7 @@ function artifactFiles(root: string, prefix = ''): string[] {
 }
 
 function isManagerInternalImport(specifier: string): boolean {
-  return WORKSPACE_MANAGER_INTERNAL_PACKAGES.some(
+  return WORKSPACE_MANAGER_BUNDLE_IMPORTS.some(
     packageName => specifier === packageName || specifier.startsWith(`${packageName}/`),
   )
 }
@@ -96,7 +95,7 @@ export async function buildWorkspaceManagerHost(
     clean: false,
     dts: false,
     deps: {
-      alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_IMPORTS],
+      alwaysBundle: [...WORKSPACE_MANAGER_BUNDLE_IMPORTS],
       neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
     },
   })
@@ -119,10 +118,10 @@ export async function buildWorkspaceManagerHost(
       compilerOptions: { sourceMap: false, declarationMap: false },
     },
     deps: {
-      alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_IMPORTS],
+      alwaysBundle: [...WORKSPACE_MANAGER_BUNDLE_IMPORTS],
       neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
       dts: {
-        alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_IMPORTS],
+        alwaysBundle: [...WORKSPACE_MANAGER_BUNDLE_IMPORTS],
         neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
       },
     },
