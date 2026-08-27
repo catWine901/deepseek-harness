@@ -22,8 +22,10 @@ function artifactFixture(
   mkdirSync(clientBuildDirectory, { recursive: true })
   mkdirSync(extracted, { recursive: true })
   writeFileSync(join(hostLib, 'index.js'), host)
+  writeFileSync(join(hostLib, 'wrapper.js'), 'export const wrapper = true\n')
   mkdirSync(join(hostLib, 'types'), { recursive: true })
   writeFileSync(join(hostLib, 'types/index.d.ts'), hostTypes)
+  writeFileSync(join(hostLib, 'types/wrapper.d.ts'), 'export declare const wrapper: true\n')
   writeFileSync(join(clientTypes, 'index.d.ts'), 'export declare const client: true\n')
   writeFileSync(join(clientBuildDirectory, 'client.js'), client)
   return { repoRoot, hostBuildDirectory: hostLib, clientBuildDirectory, extracted }

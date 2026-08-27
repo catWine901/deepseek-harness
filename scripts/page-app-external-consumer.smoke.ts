@@ -18,12 +18,13 @@ import { isEntry } from './release/process.ts'
 
 const DSH_PACKAGE = '@deepseek-ai/dsh@0.1.1-rc.2'
 const MANAGER_PACKAGE = '@tingyu9527/dsh-workspace-manager'
+const FIXTURE_PACKAGE = '@fixture/dsh-workspace-app'
 const PROFILE = 'web'
 const COMMAND_TIMEOUT_MS = 300_000
 const WEB_READY_TIMEOUT_MS = 90_000
 const STOP_TIMEOUT_MS = 10_000
 
-interface CommandDiagnostic {
+export interface CommandDiagnostic {
   readonly command: string
   readonly cwd: string
   readonly exitCode: number | null | undefined
@@ -46,6 +47,7 @@ export interface PageAppExternalConsumerResult {
   readonly publishedDshInstalled: true
   readonly consumerBinResolved: true
   readonly strictPeerClosure: true
+  readonly nonEmptyRegistryActive: true
   readonly managerServiceAndUiRegistered: true
   readonly disabledNativeBoot: true
   readonly reenabled: true
@@ -185,6 +187,77 @@ async function buildManagerTarball(
   if (!existsSync(tarball)) throw new Error(`pnpm pack reported missing tarball ${tarball}`)
   scanTarballContent(tarball, member => !member.endsWith('/'))
   return tarball
+}
+
+async function buildWorkspaceFixtureTarball(
+  temporaryRoot: string,
+  packedDirectory: string,
+  env: NodeJS.ProcessEnv,
+  diagnostics: CommandDiagnostic[],
+): Promise<string> {
+  const fixture = join(temporaryRoot, 'workspace-app-fixture')
+  mkdirSync(fixture, { recursive: true })
+  writeFileSync(join(fixture, 'package.json'), `${JSON.stringify({
+    name: FIXTURE_PACKAGE,
+    version: '1.0.0',
+    type: 'module',
+    main: './index.js',
+    files: ['index.js', 'cordis.patch.yml'],
+    dsh: {
+      workspace: {
+        schemaVersion: 1,
+        id: 'fixture-page',
+        name: 'Fixture Page',
+        description: 'External consumer restart fixture',
+        defaultOrder: 0,
+        rootEntryId: 'fixture-root',
+      },
+      bundle: { patch: './cordis.patch.yml' },
+    },
+  }, null, 2)}\n`)
+  writeFileSync(join(fixture, 'index.js'), [
+    "export const name = 'fixture-workspace-app'",
+    'export function apply() {}',
+    '',
+  ].join('\n'))
+  writeFileSync(join(fixture, 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: fixture-root',
+    `      name: '${FIXTURE_PACKAGE}'`,
+    '',
+  ].join('\n'))
+  const output = await runPnpm([
+    'pack', '--json', '--pack-destination', packedDirectory,
+  ], fixture, env, diagnostics)
+  const tarball = parsePackFilename(output, packedDirectory)
+  if (!existsSync(tarball)) throw new Error(`fixture pack reported missing tarball ${tarball}`)
+  return tarball
+}
+
+function writeFixtureRegistry(profileDirectory: string): void {
+  const managerDirectory = join(profileDirectory, '.workspace-manager')
+  mkdirSync(managerDirectory, { recursive: true })
+  writeFileSync(join(managerDirectory, 'registry.json'), `${JSON.stringify({
+    schemaVersion: 1,
+    revision: 1,
+    entries: [{
+      packageName: FIXTURE_PACKAGE,
+      source: { kind: 'registry', display: `${FIXTURE_PACKAGE}@1.0.0` },
+      resolvedVersion: '1.0.0',
+      page: {
+        id: 'fixture-page',
+        name: 'Fixture Page',
+        description: 'External consumer restart fixture',
+        defaultOrder: 0,
+        rootEntryId: 'fixture-root',
+      },
+      order: 0,
+      enabled: true,
+      hidden: false,
+      installedAt: '2026-08-27T00:00:00.000Z',
+      updatedAt: '2026-08-27T00:00:00.000Z',
+    }],
+  }, null, 2)}\n`)
 }
 
 function resolveConsumerDshBin(consumer: string): string {
@@ -361,7 +434,9 @@ async function assertManagerRegistered(page: Page): Promise<void> {
   const dialog = await openWorkspaceAppsTab(page)
   try {
     await dialog.getByText(`Current Profile: ${PROFILE}`, { exact: true }).waitFor({ timeout: 30_000 })
-    await dialog.getByText('No workspace plugins are installed yet.', { exact: true }).waitFor({ timeout: 30_000 })
+    const fixture = dialog.locator('[data-page-app-row="fixture-page"]')
+    await fixture.getByText('Fixture Page', { exact: true }).waitFor({ timeout: 30_000 })
+    await fixture.locator('[data-health="ready"]').waitFor({ timeout: 30_000 })
   } catch (error) {
     throw new Error(`external consumer Workspace Apps content did not become ready\ndialog:\n${await dialog.innerText()}`, {
       cause: error,
@@ -407,6 +482,26 @@ function formatDiagnostics(records: readonly CommandDiagnostic[]): string {
   ].join('\n')).join('\n\n')
 }
 
+/** Resolve the smoke result only after every cleanup outcome is known. */
+export function finishExternalConsumerSmoke(
+  result: PageAppExternalConsumerResult | undefined,
+  failure: unknown,
+  cleanupFailures: readonly unknown[],
+  diagnostics: readonly CommandDiagnostic[],
+): PageAppExternalConsumerResult {
+  const causes = failure === undefined ? [...cleanupFailures] : [failure, ...cleanupFailures]
+  if (causes.length > 0) {
+    throw new AggregateError(causes, `external consumer smoke failed\n\n${formatDiagnostics(diagnostics)}`)
+  }
+  if (result === undefined) {
+    throw new AggregateError(
+      [new Error('external consumer smoke ended without a result')],
+      `external consumer smoke failed\n\n${formatDiagnostics(diagnostics)}`,
+    )
+  }
+  return result
+}
+
 /** Run the complete fresh public-registry DSH external-consumer lifecycle. */
 export async function runPageAppExternalConsumer(repoRootInput = process.cwd()): Promise<PageAppExternalConsumerResult> {
   const repoRoot = resolve(repoRootInput)
@@ -417,6 +512,7 @@ export async function runPageAppExternalConsumer(repoRootInput = process.cwd()):
   const diagnostics: CommandDiagnostic[] = []
   const cleanupFailures: unknown[] = []
   let failure: unknown
+  let result: PageAppExternalConsumerResult | undefined
   let browser: Browser | undefined
   let running: RunningWeb | undefined
   try {
@@ -438,6 +534,9 @@ export async function runPageAppExternalConsumer(repoRootInput = process.cwd()):
       dshBin, 'plugin', '--profile', PROFILE, 'add', managerTarball,
     ], consumer, env, diagnostics)
     const profileDirectory = join(home, 'profiles', PROFILE)
+    const fixtureTarball = await buildWorkspaceFixtureTarball(temporaryRoot, packed, env, diagnostics)
+    await runPnpm(['add', '--save-exact', fixtureTarball], profileDirectory, env, diagnostics)
+    writeFixtureRegistry(profileDirectory)
     await runPnpm([
       'install', '--frozen-lockfile', '--strict-peer-dependencies',
     ], profileDirectory, env, diagnostics)
@@ -478,10 +577,11 @@ export async function runPageAppExternalConsumer(repoRootInput = process.cwd()):
     await assertManagerAbsent(page)
     await page.close()
 
-    return {
+    result = {
       publishedDshInstalled: true,
       consumerBinResolved: true,
       strictPeerClosure: true,
+      nonEmptyRegistryActive: true,
       managerServiceAndUiRegistered: true,
       disabledNativeBoot: true,
       reenabled: true,
@@ -503,8 +603,7 @@ export async function runPageAppExternalConsumer(repoRootInput = process.cwd()):
       cleanupFailures.push(error)
     }
   }
-  const causes = failure === undefined ? cleanupFailures : [failure, ...cleanupFailures]
-  throw new AggregateError(causes, `external consumer smoke failed\n\n${formatDiagnostics(diagnostics)}`)
+  return finishExternalConsumerSmoke(result, failure, cleanupFailures, diagnostics)
 }
 
 if (isEntry(import.meta.url)) {

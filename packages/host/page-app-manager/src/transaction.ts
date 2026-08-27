@@ -68,6 +68,8 @@ export interface PageAppTransactionDeps {
   readonly executor: PageAppPackageExecutor
   /** The launcher-owned acknowledged profile recomposition service. */
   readonly runtime: ProfileRuntime
+  /** Package identity that owns the wrapper export in this runtime. */
+  readonly managerPackageName?: string
   /** Absolute pnpm-workspace.yaml path (never edited; allowBuilds diagnostics read it). */
   readonly pnpmWorkspaceFile: string
   /** Host cap on the client activation acknowledgement wait, in milliseconds. */
@@ -457,6 +459,7 @@ export class PageAppLifecycle {
       // derivation shares (the layer, the transaction, and the health lookup
       // can never drift).
       const wrapper = managedRootWrapperRow({
+        ownerPackageName: this.deps.managerPackageName ?? this.deps.runtime.ownerPackageName,
         packageName: entry.packageName,
         pageId: entry.page.id,
         rootEntryId: row.rootEntryId,
@@ -596,7 +599,13 @@ export class PageAppLifecycle {
     await this.deps.runtime.restoreManagerLayer({
       registryRevision: registry?.revision ?? 0,
       runtimeLayer,
-      expectedRoots: registry === null ? [] : derivePageAppExpectedRoots(this.deps.profileDir, registry),
+      expectedRoots: registry === null
+        ? []
+        : derivePageAppExpectedRoots(
+          this.deps.profileDir,
+          registry,
+          this.deps.managerPackageName ?? this.deps.runtime.ownerPackageName,
+        ),
     })
   }
 
@@ -673,7 +682,11 @@ function composedManagedRow(
  * @param registry - the registry to derive enabled roots from.
  * @returns one expectation per enabled, statically valid row.
  */
-export function derivePageAppExpectedRoots(profileDir: string, registry: PageAppRegistryV1): ExpectedManagedRoot[] {
+export function derivePageAppExpectedRoots(
+  profileDir: string,
+  registry: PageAppRegistryV1,
+  managerPackageName = '@deepseek-ai/dsh-page-app-manager',
+): ExpectedManagedRoot[] {
   const profileDependencies = readProfileDependenciesFrom(profileDir)
   const expectedRoots: ExpectedManagedRoot[] = []
   for (const entry of registry.entries) {
@@ -681,6 +694,7 @@ export function derivePageAppExpectedRoots(profileDir: string, registry: PageApp
     const row = composedManagedRow(profileDir, entry, registry, profileDependencies)
     if (row === undefined) continue
     const wrapper = managedRootWrapperRow({
+      ownerPackageName: managerPackageName,
       packageName: entry.packageName,
       pageId: entry.page.id,
       rootEntryId: row.rootEntryId,

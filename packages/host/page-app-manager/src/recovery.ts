@@ -181,7 +181,9 @@ async function restoreLiveLayer(
     await runtime.restoreManagerLayer({
       registryRevision: registry?.revision ?? 0,
       runtimeLayer,
-      expectedRoots: registry === null ? [] : derivePageAppExpectedRoots(profileDir, registry),
+      expectedRoots: registry === null
+        ? []
+        : derivePageAppExpectedRoots(profileDir, registry, runtime.ownerPackageName),
     })
     return undefined
   } catch (error) {

@@ -24,13 +24,14 @@
     },
     "./profile-runtime-bridge": {
       "types": "./lib/types/profile-runtime-bridge.d.ts",
-      "default": "./src/profile-runtime-bridge.ts"
+      "default": "./lib/profile-runtime-bridge.js"
     },
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
     "lib/invariant.js",
+    "lib/profile-runtime-bridge.js",
     "lib/types/**/*.d.ts"
   ],
   "license": "MIT",

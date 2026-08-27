@@ -157,7 +157,9 @@ const packageFileExtras: Readonly<Record<string, readonly string[]>> = {
   '@deepseek-ai/dsh-sdk-jsonrpc-demo': ['lib/packaged-bin.js'],
   // The manager bundles its command runner into a content-hashed shared chunk;
   // the entry imports that relative file at runtime, so it is publishable payload.
-  '@deepseek-ai/dsh-page-app-manager': ['lib/execa-*.js'],
+  '@deepseek-ai/dsh-page-app-manager': ['lib/execa-*.js', 'lib/legacy-rc2-compat.js'],
+  // Stable source-authoritative bridge consumed by the standalone Manager build.
+  '@deepseek-ai/dsh-app-boot': ['lib/profile-runtime-bridge.js'],
   // The argv-prefix runner entry ships beside the lib as its own bundle;
   // sandbox-local resolves it through the package's ./runner export. tsdown
   // also shares its generated FFI code through a hashed runtime chunk.

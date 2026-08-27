@@ -86,7 +86,7 @@ export async function buildWorkspaceManagerHost(
   await build({
     config: false,
     cwd: join(repoRoot, 'packages/host/page-app-manager'),
-    entry: ['lib/types/index.js', 'lib/types/legacy-rc2-compat.js'],
+    entry: ['lib/types/index.js', 'lib/types/legacy-rc2-compat.js', 'lib/types/wrapper.js'],
     outDir: outputDirectory,
     format: ['esm'],
     platform: 'node',
@@ -104,7 +104,7 @@ export async function buildWorkspaceManagerHost(
   await build({
     config: false,
     cwd: join(repoRoot, 'packages/host/page-app-manager'),
-    entry: ['lib/types/index.d.ts', 'lib/types/legacy-rc2-compat.d.ts'],
+    entry: ['lib/types/index.d.ts', 'lib/types/legacy-rc2-compat.d.ts', 'lib/types/wrapper.d.ts'],
     outDir: join(outputDirectory, 'types'),
     format: ['esm'],
     platform: 'node',

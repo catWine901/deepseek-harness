@@ -78,11 +78,14 @@ export function managedRootWrapperId(pageId: string): string {
  * @returns true when the manager package.json exists in the profile's own
  * node_modules or its controlled `profiles` fallback.
  */
-export function managerWrapperResolvable(profileDir: string): boolean {
-  if (existsSync(join(profileDir, 'node_modules', PAGE_APP_MANAGER_PACKAGE_NAME, 'package.json'))) return true
+export function managerWrapperResolvable(
+  profileDir: string,
+  ownerPackageName = PAGE_APP_MANAGER_PACKAGE_NAME,
+): boolean {
+  if (existsSync(join(profileDir, 'node_modules', ownerPackageName, 'package.json'))) return true
   const profilesDir = dirname(profileDir)
   return basename(profilesDir) === 'profiles'
-    && existsSync(join(profilesDir, 'node_modules', PAGE_APP_MANAGER_PACKAGE_NAME, 'package.json'))
+    && existsSync(join(profilesDir, 'node_modules', ownerPackageName, 'package.json'))
 }
 
 /**
@@ -98,6 +101,7 @@ export function managerWrapperResolvable(profileDir: string): boolean {
  * @returns the wrapper parent row (a {@link PageAppRuntimeEntry}).
  */
 export function managedRootWrapperRow(input: {
+  readonly ownerPackageName?: string
   readonly packageName: string
   readonly pageId: string
   readonly rootEntryId: string
@@ -106,7 +110,7 @@ export function managedRootWrapperRow(input: {
 }): PageAppRuntimeEntry {
   return {
     id: managedRootWrapperId(input.pageId),
-    name: `${PAGE_APP_MANAGER_PACKAGE_NAME}/wrapper`,
+    name: `${input.ownerPackageName ?? PAGE_APP_MANAGER_PACKAGE_NAME}/wrapper`,
     inject: [WORKBENCH_RUNTIME_SERVICE],
     config: {
       packageName: input.packageName,
@@ -307,6 +311,7 @@ export interface DerivedRuntimeLayer {
 export async function deriveSafeRuntimeLayer(
   binName: string,
   profileDir: string,
+  ownerPackageName = PAGE_APP_MANAGER_PACKAGE_NAME,
 ): Promise<DerivedRuntimeLayer> {
   let registry: PageAppRegistryV1 | null
   try {
@@ -324,7 +329,7 @@ export async function deriveSafeRuntimeLayer(
   const omitted: OmittedManagedRoot[] = []
   for (const entry of registry.entries) {
     if (!entry.enabled) continue
-    const derived = deriveRoot(binName, profileDir, entry)
+    const derived = deriveRoot(binName, profileDir, entry, ownerPackageName)
     if ('reason' in derived) {
       omitted.push({ rootEntryId: entry.page.rootEntryId, reason: derived.reason })
       continue
@@ -368,6 +373,7 @@ export async function deriveSafeRuntimeLayer(
 export async function prepareManagerRuntimeLayer(
   binName: string,
   profileDir: string,
+  ownerPackageName = PAGE_APP_MANAGER_PACKAGE_NAME,
 ): Promise<ManagerLayerStartup> {
   const paths = resolvePageAppProfilePaths(profileDir)
   // Task 1 lock recovery first: a dead owner's lock must not stall boot; the
@@ -375,7 +381,7 @@ export async function prepareManagerRuntimeLayer(
   // the profile — booting again is the caller's retry decision).
   await recoverOrphanedPageAppLock(profileDir)
   return withPageAppProfileLock(profileDir, { kind: 'manager', token: randomUUID() }, async () => {
-    const derived = await deriveSafeRuntimeLayer(binName, profileDir)
+    const derived = await deriveSafeRuntimeLayer(binName, profileDir, ownerPackageName)
     if (derived.recoveryError !== undefined) {
       // Preserve the corrupt registry; drop the derived layer so a stale layer
       // from a previous good state cannot mount orphaned roots.
@@ -444,7 +450,12 @@ function resolveInstalledPackageDir(profileDir: string, packageName: string): st
  * @param entry - the enabled registry row.
  * @returns the validated wrapper root, or the omission reason.
  */
-function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryEntry): DerivedRoot {
+function deriveRoot(
+  binName: string,
+  profileDir: string,
+  entry: PageAppRegistryEntry,
+  ownerPackageName: string,
+): DerivedRoot {
   const packageDir = resolveInstalledPackageDir(profileDir, entry.packageName)
   if (packageDir === undefined) return { reason: 'missing-dependency' }
   let installed: { version?: unknown; dsh?: unknown }
@@ -463,7 +474,7 @@ function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryE
   // The Feature Runtime Wrapper lives in the manager package; an uninstalled
   // manager (boot-after-uninstall) must omit every root instead of failing
   // boot on an unresolvable wrapper module.
-  if (!managerWrapperResolvable(profileDir)) {
+  if (!managerWrapperResolvable(profileDir, ownerPackageName)) {
     return { reason: 'missing-manager' }
   }
   const bundle = (installed.dsh as { bundle?: { patch?: unknown } } | undefined)?.bundle
@@ -481,6 +492,7 @@ function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryE
   const rootRow = rows.find(row => row.id === entry.page.rootEntryId)
   if (rootRow === undefined) return { reason: 'invalid-manifest' }
   const wrapper = managedRootWrapperRow({
+    ownerPackageName,
     packageName: entry.packageName,
     pageId: entry.page.id,
     rootEntryId: entry.page.rootEntryId,
@@ -502,6 +514,8 @@ function deriveRoot(binName: string, profileDir: string, entry: PageAppRegistryE
 export interface ProfileRuntimeOptions {
   /** The immutable active-profile identity. */
   readonly identity: ActiveProfileIdentity
+  /** Package that owns the wrapper export (the official manager by default). */
+  readonly ownerPackageName?: string
   /**
    * Build one fresh full-generation patch list from the given manager layer
    * patches (bundles → manager → profile → home → overlays); every
@@ -549,6 +563,17 @@ export interface ProfileRuntimeControl {
    */
   bindRootInclude(entry: Entry | undefined): void
   /**
+   * Atomically replace the provisional boot snapshot before settlement. This
+   * exists for the public rc2 compatibility bootstrap, whose Include loader
+   * requires a synchronous service provider before asynchronous recovery can
+   * prepare and read the authoritative layer.
+   */
+  initializeManagerSnapshot(snapshot: {
+    readonly managerPatches: readonly PatchOptions[]
+    readonly recoveryError?: string
+    readonly omittedRoots: readonly OmittedManagedRoot[]
+  }): void
+  /**
    * Mark the initial tree as settled and register the launcher-owned watcher
    * paths. Called by `boot()` after the activation audit; the manager may not
    * mutate the profile before this, and the watchers only exist afterwards.
@@ -581,8 +606,9 @@ export interface ProfileRuntimeControl {
  */
 class ProfileRuntimeState {
   readonly identity: ActiveProfileIdentity
-  readonly recoveryError: string | undefined
-  readonly omittedRoots: readonly OmittedManagedRoot[]
+  readonly ownerPackageName: string
+  recoveryError: string | undefined
+  omittedRoots: readonly OmittedManagedRoot[]
   readonly compose: (managerPatches: readonly PatchOptions[]) => readonly PatchOptions[]
   /** Launcher-owned user-patch files watched through the serialized queue. */
   readonly watchPatches: readonly { binName: string; filename: string }[]
@@ -593,6 +619,7 @@ class ProfileRuntimeState {
   managerPatches: readonly PatchOptions[]
   entry: Entry | undefined
   settled = false
+  snapshotInitialized = false
   generation = 0
   queue: Promise<unknown> = Promise.resolve()
 
@@ -601,6 +628,7 @@ class ProfileRuntimeState {
     options: ProfileRuntimeOptions,
   ) {
     this.identity = Object.freeze({ ...options.identity })
+    this.ownerPackageName = options.ownerPackageName ?? PAGE_APP_MANAGER_PACKAGE_NAME
     this.recoveryError = options.recoveryError
     this.omittedRoots = Object.freeze([...options.omittedRoots ?? []])
     this.compose = options.compose
@@ -608,6 +636,17 @@ class ProfileRuntimeState {
     this.watchPatches = Object.freeze([...options.watchPatches ?? []].map(watch => Object.freeze({ ...watch })))
     this.control = {
       bindRootInclude: (entry): void => { this.entry = entry },
+      initializeManagerSnapshot: (snapshot): void => {
+        if (this.settled || this.snapshotInitialized || this.generation !== 0) {
+          throw new Error('page-app profile runtime: initial manager snapshot can be installed only once before settlement')
+        }
+        const managerPatches = structuredClone([...snapshot.managerPatches])
+        const omittedRoots = Object.freeze(structuredClone([...snapshot.omittedRoots]))
+        this.managerPatches = managerPatches
+        this.recoveryError = snapshot.recoveryError
+        this.omittedRoots = omittedRoots
+        this.snapshotInitialized = true
+      },
       markSettled: async (): Promise<void> => {
         // The mutation gate opens only after watcher setup fully succeeds: a
         // manager-layer call while registration is still pending rejects as
@@ -938,6 +977,11 @@ export class ProfileRuntime extends Service {
   /** The immutable active-profile identity; consumers cannot replace it. */
   public get identity(): ActiveProfileIdentity {
     return stateOf(this).identity
+  }
+
+  /** Package identity that owns the Feature Runtime Wrapper export. */
+  public get ownerPackageName(): string {
+    return stateOf(this).ownerPackageName
   }
 
   /** Startup recovery error when the registry is corrupt; managed roots failed closed. */

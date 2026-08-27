@@ -144,6 +144,7 @@ export class PageAppManager extends TypertRemoteService {
       profileDir: this.profileRuntime.identity.directory,
       executor: options.executor ?? createPnpmExecutor(),
       runtime: this.profileRuntime,
+      managerPackageName: this.profileRuntime.ownerPackageName,
       pnpmWorkspaceFile: join(this.profileRuntime.identity.directory, 'pnpm-workspace.yaml'),
       settlementTimeoutMs: options.config.settlementTimeoutMs,
       clientGraphRev: () => {
@@ -397,6 +398,7 @@ export class PageAppManager extends TypertRemoteService {
       // The runtime layer mounts the Feature Runtime Wrapper parent row; the
       // row's health follows the wrapper entry, not the bare feature row.
       const wrapper = managedRootWrapperRow({
+        ownerPackageName: this.profileRuntime.ownerPackageName,
         packageName: row.packageName,
         pageId: row.page.id,
         rootEntryId: row.page.rootEntryId,
@@ -423,7 +425,10 @@ export class PageAppManager extends TypertRemoteService {
       installedVersion,
       manifestValid,
       bundleValid,
-      wrapperResolvable: managerWrapperResolvable(this.profileRuntime.identity.directory),
+      wrapperResolvable: managerWrapperResolvable(
+        this.profileRuntime.identity.directory,
+        this.profileRuntime.ownerPackageName,
+      ),
       expectedRootHash,
       loaderRow,
     }

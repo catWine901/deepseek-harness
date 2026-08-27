@@ -94,6 +94,10 @@ describe('workspace manager extraction', () => {
   it('skeleton exports contain no ./src/* subpath', () => {
     const manifest = readJson(join(output, 'package.json'))
     expect(Object.keys(manifest.exports as Record<string, unknown>)).not.toContain('./src/*')
+    expect((manifest.exports as Record<string, unknown>)['./wrapper']).toEqual({
+      types: './lib/types/wrapper.d.ts',
+      default: './lib/wrapper.js',
+    })
     for (const manifestPath of filesUnder(join(output, 'packages')).filter(path => path.endsWith('package.json'))) {
       const packageManifest = readJson(join(output, 'packages', manifestPath))
       expect(Object.keys(packageManifest.exports as Record<string, unknown>)).not.toContain('./src/*')

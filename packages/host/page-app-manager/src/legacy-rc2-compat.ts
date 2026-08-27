@@ -13,8 +13,8 @@ import { createRequire } from 'node:module'
 import { dirname, join, parse, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
-import type { Context, Fiber } from '@deepseek-ai/cordis'
-import { entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
+import { FiberState, type Context, type Fiber } from '@deepseek-ai/cordis'
+import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import type { Entry } from '@deepseek-ai/cordis-plugin-loader'
 import { load } from 'js-yaml'
 import {
@@ -55,10 +55,26 @@ function compatibleNativeRuntime(value: unknown): boolean {
   const runtime = value as Record<string, unknown>
   const identity = runtime.identity
   return identity !== null && typeof identity === 'object'
+    && Object.isFrozen(identity)
     && typeof (identity as Record<string, unknown>).name === 'string'
     && typeof (identity as Record<string, unknown>).directory === 'string'
     && typeof runtime.applyManagerLayer === 'function'
     && typeof runtime.restoreManagerLayer === 'function'
+}
+
+function terminalFiberState(state: FiberState): boolean {
+  return state === FiberState.FAILED
+    || state === FiberState.DISPOSED
+    || state === FiberState.UNLOADING
+}
+
+function explicitlyDisablesCompat(layer: readonly PatchOptions[]): boolean {
+  const rows = applyEntryPatches(
+    [{ id: LEGACY_RC2_COMPAT_ENTRY_ID, name: `${MANAGER_PACKAGE}/legacy-rc2-compat` }],
+    structuredClone([...layer]),
+    () => {},
+  )
+  return rows.find(row => row.id === LEGACY_RC2_COMPAT_ENTRY_ID)?.disabled === true
 }
 
 function insertedRows(patch: unknown): unknown[] {
@@ -157,10 +173,15 @@ export class LegacyRc2UpdateCoordinator {
   }
 
   /** Run a complete manager apply/audit/promotion as one FIFO operation. */
-  async runManager<T>(task: () => Promise<T>, promoted?: readonly PatchOptions[]): Promise<T> {
+  async runManager<T>(
+    task: () => Promise<T>,
+    promoted?: readonly PatchOptions[] | (() => readonly PatchOptions[]),
+  ): Promise<T> {
     return await this.enqueue(async () => await this.managerOperation.run(true, async () => {
       const result = await task()
-      if (promoted !== undefined) this.managerPatches = structuredClone(promoted)
+      if (promoted !== undefined) {
+        this.managerPatches = structuredClone(typeof promoted === 'function' ? promoted() : promoted)
+      }
       return result
     }))
   }
@@ -188,6 +209,16 @@ export class LegacyRc2UpdateCoordinator {
     }
     const boundary = locateLegacyRc2BundleBoundary(patches as PatchOptions[], [this.bundlePatches])
     await this.enqueue(async () => {
+      if (explicitlyDisablesCompat(boundary.suffix)) {
+        this.disposed = true
+        dispose()
+        config.patches = structuredClone([
+          ...boundary.bundlePatches,
+          ...boundary.suffix,
+        ])
+        await next()
+        return
+      }
       config.patches = structuredClone([
         ...boundary.bundlePatches,
         ...this.managerPatches,
@@ -198,7 +229,7 @@ export class LegacyRc2UpdateCoordinator {
   }
 }
 
-class LegacyRc2ProfileRuntime extends ProfileRuntime {
+export class LegacyRc2ProfileRuntime extends ProfileRuntime {
   constructor(
     ctx: Context,
     options: ConstructorParameters<typeof ProfileRuntime>[1],
@@ -219,6 +250,95 @@ class LegacyRc2ProfileRuntime extends ProfileRuntime {
     const patches = parseManagerPatches(request.runtimeLayer)
     return await this.coordinator.runManager(async () => await super.restoreManagerLayer(request), patches)
   }
+}
+
+/**
+ * Tear down the exact compatibility owner after an asynchronous post-bootstrap
+ * failure.  The original error remains the primary diagnostic; a disposal
+ * failure is retained alongside it instead of leaving a half-live service.
+ */
+export async function disposeLegacyRc2FiberAfterReadyFailure(
+  ctx: Context,
+  error: unknown,
+  activeTimeoutMs = 10_000,
+): Promise<void> {
+  ctx.logger.error(error)
+  if (ctx.fiber.state === FiberState.PENDING || ctx.fiber.state === FiberState.LOADING) {
+    try {
+      await awaitLegacyRc2FiberActive(ctx, activeTimeoutMs)
+    } catch {
+      // A terminal fiber already releases its owned service/effects. A mere
+      // watchdog timeout is different: still attempt exact-owner disposal.
+      if (terminalFiberState(ctx.fiber.state)) return
+    }
+  }
+  try {
+    await ctx.fiber.dispose()
+  } catch (disposeError) {
+    ctx.logger.error(new AggregateError(
+      [error, disposeError],
+      `${NAME}: post-bootstrap failure and compatibility-fiber disposal failure`,
+    ))
+  }
+}
+
+/** Wait until Cordis commits the bootstrap provider, without polling or awaiting this same fiber. */
+export function awaitLegacyRc2FiberActive(ctx: Context, timeoutMs = 10_000): Promise<void> {
+  const stateError = (): Error | undefined => {
+    if (ctx.fiber.state === FiberState.ACTIVE) return
+    if (ctx.fiber.state === FiberState.FAILED
+      || ctx.fiber.state === FiberState.DISPOSED
+      || ctx.fiber.state === FiberState.UNLOADING) {
+      return new Error(`${NAME}: compatibility fiber exited before becoming active`)
+    }
+  }
+  const initialError = stateError()
+  if (ctx.fiber.state === FiberState.ACTIVE) return Promise.resolve()
+  if (initialError !== undefined) return Promise.reject(initialError)
+
+  return new Promise<void>((resolveBarrier, rejectBarrier) => {
+    let settled = false
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    let stopListening = (): void => {}
+    const finish = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      stopListening()
+      if (watchdog !== undefined) clearTimeout(watchdog)
+      if (error === undefined) resolveBarrier()
+      else rejectBarrier(error)
+    }
+    const inspect = (): void => {
+      if (ctx.fiber.state === FiberState.ACTIVE) finish()
+      else {
+        const error = stateError()
+        if (error !== undefined) finish(error)
+      }
+    }
+    stopListening = ctx.on('internal/status', (fiber) => {
+      if (fiber === ctx.fiber) inspect()
+    })
+    // Close the check→subscribe lost-wakeup window.
+    inspect()
+    if (ctx.fiber.state !== FiberState.ACTIVE && !terminalFiberState(ctx.fiber.state)) {
+      watchdog = setTimeout(() => {
+        finish(new Error(`${NAME}: compatibility fiber did not become active within ${timeoutMs}ms`))
+      }, timeoutMs)
+    }
+  })
+}
+
+/** Prepare the derived layer before capturing the exact restart snapshot. */
+export async function prepareLegacyRc2ManagerSnapshot(
+  binName: string,
+  profileDirectory: string,
+): Promise<{
+  startup: Awaited<ReturnType<typeof prepareManagerRuntimeLayer>>
+  managerPatches: PatchOptions[]
+}> {
+  const startup = await prepareManagerRuntimeLayer(binName, profileDirectory, MANAGER_PACKAGE)
+  const managerPatches = readManagerLayerPatches(binName, profileDirectory)
+  return { startup, managerPatches }
 }
 
 function resolvePackageManifest(requireFromProfile: NodeJS.Require, packageName: string): string {
@@ -262,7 +382,33 @@ function readBundleLayers(profileDirectory: string): PatchOptions[][] {
   })
 }
 
-function strictRootInclude(ctx: Context): { entry: Entry; profileDirectory: string; patches: PatchOptions[] } {
+interface LegacyRc2ProfileIdentity {
+  readonly name: string
+  readonly directory: string
+  readonly homeDirectory: string
+}
+
+/** Validate the public launcher root against its authoritative DSH home helper. */
+export function resolveLegacyRc2ProfileIdentity(
+  dshHomePath: (...segments: string[]) => string,
+  rootConfig: string,
+): LegacyRc2ProfileIdentity {
+  const homeDirectory = resolve(dshHomePath())
+  const config = resolve(rootConfig)
+  const profileDirectory = dirname(config)
+  const name = profileDirectory.split(/[\\/]/u).at(-1) ?? ''
+  const expected = resolve(dshHomePath('profiles', name, PROFILE_ROOT_FILENAME))
+  if (name.length === 0 || config !== expected) {
+    throw new Error(`${NAME}: root Include must target DSH_HOME/profiles/<name>/${PROFILE_ROOT_FILENAME}`)
+  }
+  return Object.freeze({ name, directory: profileDirectory, homeDirectory })
+}
+
+function strictRootInclude(ctx: Context): {
+  entry: Entry
+  profile: LegacyRc2ProfileIdentity
+  patches: PatchOptions[]
+} {
   const loader = ctx.root.get('loader')
   if (loader === undefined) throw new Error(`${NAME}: root Loader is unavailable`)
   const entry = loader.resolve('include')
@@ -272,10 +418,15 @@ function strictRootInclude(ctx: Context): { entry: Entry; profileDirectory: stri
     throw new Error(`${NAME}: root Include fingerprint failed`)
   }
   const rootConfig = fileURLToPath(new URL(config.path, entry.ctx.baseUrl))
-  if (rootConfig !== resolve(dirname(rootConfig), PROFILE_ROOT_FILENAME)) {
-    throw new Error(`${NAME}: root Include does not target the profile root config`)
+  const dshHomePath: unknown = ctx.root.get('dshHomePath')
+  if (typeof dshHomePath !== 'function') {
+    throw new Error(`${NAME}: root dshHomePath service is unavailable`)
   }
-  return { entry, profileDirectory: dirname(rootConfig), patches: config.patches as PatchOptions[] }
+  const profile = resolveLegacyRc2ProfileIdentity(
+    dshHomePath as (...segments: string[]) => string,
+    rootConfig,
+  )
+  return { entry, profile, patches: config.patches as PatchOptions[] }
 }
 
 /** Cordis plugin bootstrap. The native launcher path returns before any structural change. */
@@ -288,7 +439,8 @@ export function apply(ctx: Context): void {
     return
   }
 
-  const { entry, profileDirectory, patches } = strictRootInclude(ctx)
+  const { entry, profile, patches } = strictRootInclude(ctx)
+  const profileDirectory = profile.directory
   const requireFromProfile = createRequire(join(profileDirectory, 'package.json'))
   const appBootManifest = JSON.parse(readFileSync(
     resolvePackageManifest(requireFromProfile, '@deepseek-ai/dsh-app-boot'),
@@ -300,31 +452,14 @@ export function apply(ctx: Context): void {
   const bundleLayers = readBundleLayers(profileDirectory)
   const boundary = locateLegacyRc2BundleBoundary(patches, bundleLayers)
   const profilePatches = loadOptionalPatches(NAME, join(profileDirectory, PROFILE_PATCH_FILENAME)) ?? []
-  const homeDirectory = dirname(dirname(profileDirectory))
+  const homeDirectory = profile.homeDirectory
   const homePatches = loadOptionalPatches(NAME, join(homeDirectory, PROFILE_PATCH_FILENAME)) ?? []
   const userPrefix = [...profilePatches, ...homePatches]
   if (!isDeepStrictEqual(boundary.suffix.slice(0, userPrefix.length), userPrefix)) {
     throw new Error(`${NAME}: root Include user-layer boundary does not match profile and home patches`)
   }
   const overlays = structuredClone(boundary.suffix.slice(userPrefix.length))
-  const initialManagerPatches = readManagerLayerPatches(NAME, profileDirectory)
-  const coordinator = new LegacyRc2UpdateCoordinator(boundary.bundlePatches, initialManagerPatches)
-
-  let ready: Promise<void> = Promise.resolve()
-  const runtime = new LegacyRc2ProfileRuntime(ctx.root, {
-    identity: { name: profileDirectory.split(/[\\/]/u).at(-1) ?? '', directory: profileDirectory },
-    compose: managerPatches => composeProfilePatches({
-      bundlePatches: boundary.bundlePatches,
-      managerPatches,
-      profilePatches: loadOptionalPatches(NAME, join(profileDirectory, PROFILE_PATCH_FILENAME)) ?? [],
-      homePatches: loadOptionalPatches(NAME, join(homeDirectory, PROFILE_PATCH_FILENAME)) ?? [],
-      overlays,
-    }),
-    initialManagerPatches,
-  }, coordinator, async () => { await ready })
-  const control = profileRuntimeControl(runtime)
-  if (control === undefined) throw new Error(`${NAME}: constructed runtime has no boot control`)
-  control.bindRootInclude(entry)
+  const coordinator = new LegacyRc2UpdateCoordinator(boundary.bundlePatches, [])
 
   const rootFiber = entry.fiber
   const rootPath = (entry.options.config as { path: string }).path
@@ -338,11 +473,53 @@ export function apply(ctx: Context): void {
     await coordinator.intercept(candidate, next, dispose)
   }, { global: true, prepend: true })
 
-  ready = (async () => {
-    await prepareManagerRuntimeLayer(NAME, profileDirectory)
-    await ctx.root.get('loader')?.await()
+  let preparedManagerPatches: readonly PatchOptions[] = []
+  let postReady: Promise<void> = Promise.resolve()
+  const runtime = new LegacyRc2ProfileRuntime(ctx, {
+    identity: { name: profile.name, directory: profileDirectory },
+    ownerPackageName: MANAGER_PACKAGE,
+    compose: managerPatches => composeProfilePatches({
+      bundlePatches: boundary.bundlePatches,
+      managerPatches,
+      profilePatches: loadOptionalPatches(NAME, join(profileDirectory, PROFILE_PATCH_FILENAME)) ?? [],
+      homePatches: loadOptionalPatches(NAME, join(homeDirectory, PROFILE_PATCH_FILENAME)) ?? [],
+      overlays,
+    }),
+    // Public rc2 does not await an asynchronous Include child apply. Provide
+    // synchronously with an unusable provisional snapshot; every mutation
+    // waits postReady, and the boot-only control atomically replaces this
+    // snapshot only after prepare→read succeeds.
+    initialManagerPatches: [],
+  }, coordinator, async () => { await postReady })
+  const control = profileRuntimeControl(runtime)
+  if (control === undefined) throw new Error(`${NAME}: constructed runtime has no boot control`)
+  control.bindRootInclude(entry)
+
+  postReady = coordinator.runManager(async () => {
+    const snapshot = await prepareLegacyRc2ManagerSnapshot(NAME, profileDirectory)
+    preparedManagerPatches = snapshot.managerPatches
+    control.initializeManagerSnapshot({
+      managerPatches: preparedManagerPatches,
+      ...snapshot.startup.recoveryError === undefined
+        ? {}
+        : { recoveryError: snapshot.startup.recoveryError },
+      omittedRoots: snapshot.startup.omitted,
+    })
+    await awaitLegacyRc2FiberActive(ctx)
+    await ctx.get('loader')?.await()
     await control.markSettled()
-    await coordinator.runManager(async () => { await control.recompose() })
-  })()
-  void ready.catch((error: unknown) => { ctx.logger.error(error) })
+    // Recompose exactly the snapshot committed and read above. The manager
+    // token bypasses this interposer's own listener while all external watcher
+    // generations remain behind the same FIFO.
+    await control.recompose()
+  }, () => preparedManagerPatches)
+  void postReady.catch(async (error: unknown) => {
+    // The async initialization is detached from rc2's non-awaiting Include
+    // apply, so every failure explicitly releases this exact owning fiber.
+    await disposeLegacyRc2FiberAfterReadyFailure(ctx, error)
+  })
+  // The compatibility fiber must become ACTIVE before Loader settlement can
+  // observe it. Post-bootstrap readiness is exposed through the runtime's
+  // mutation methods and is also monitored above for fail-closed teardown.
+  return
 }
