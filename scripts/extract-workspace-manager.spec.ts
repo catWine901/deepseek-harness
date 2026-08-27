@@ -128,7 +128,7 @@ describe('workspace manager extraction', () => {
   it('targets the 0.1.1-rc.2 DSH seam without depending on its own bundled manager', () => {
     const manifest = readJson(join(output, 'package.json'))
     const peers = manifest.peerDependencies as Record<string, string>
-    expect(peers['@deepseek-ai/dsh-page-app-profile']).toBe('>=0.1.1-rc.2 <0.2.0')
+    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-profile')
     expect(peers['@deepseek-ai/dsh-app-boot']).toBe('>=0.1.1-rc.2 <0.2.0')
     expect(peers['@deepseek-ai/cordis-plugin-include']).toBe('^1.0.0')
     expect(peers['@deepseek-ai/cordis-plugin-loader']).toBe('^1.0.0')
