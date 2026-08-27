@@ -97,7 +97,7 @@ describe('workspace manager extraction', () => {
     })
 
     const readme = readFileSync(join(output, 'README.md'), 'utf8')
-    expect(readme).toContain('dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager')
+    expect(readme).toContain('dsh plugin --profile web add @tingyu9527/dsh-workspace-manager')
     expect(readme).toContain('## What it does')
     expect(readme).toContain('## Security and lifecycle guarantees')
   })
@@ -202,18 +202,30 @@ describe('workspace manager extraction', () => {
     const readme = readFileSync(join(output, 'README.md'), 'utf8')
     const readmeZh = readFileSync(join(output, 'README.zh.md'), 'utf8')
     const changelog = readFileSync(join(output, 'CHANGELOG.md'), 'utf8')
+    const installCommands = [
+      '```sh',
+      'dsh plugin --profile web add @tingyu9527/dsh-workspace-manager',
+      'dsh web',
+      '```',
+    ].join('\n')
     expect(readme).toContain('npm release `@deepseek-ai/dsh@0.1.1-rc.2`')
+    expect(readme).toContain('fixes external-consumer installation')
+    expect(readme).toContain('inlines the unpublished `dsh-page-app-profile` implementation')
+    expect(readme).toContain('does not require a DSH source build')
     expect(readme).toContain('legacy rc.2 compatibility bridge')
     expect(readme).toContain('automatically stays inactive')
-    expect(readme).not.toContain('source build')
-    expect(readme).toContain('@tingyu9527/dsh-workspace-manager@1.0.1')
+    expect(readme).toContain(installCommands)
     expect(readmeZh).toContain('npm 发布包 `@deepseek-ai/dsh@0.1.1-rc.2`')
+    expect(readmeZh).toContain('修复 external consumer 安装')
+    expect(readmeZh).toContain('内联未发布的 `dsh-page-app-profile` 实现')
+    expect(readmeZh).toContain('不再要求 DSH source build')
     expect(readmeZh).toContain('旧版 rc.2 兼容桥')
     expect(readmeZh).toContain('自动保持不激活')
-    expect(readmeZh).not.toContain('源码构建')
-    expect(readmeZh).toContain('@tingyu9527/dsh-workspace-manager@1.0.1')
+    expect(readmeZh).toContain(installCommands)
     expect(changelog).toContain('## 1.0.1')
     expect(changelog).toContain('public npm-form DSH 0.1.1-rc.2')
+    expect(changelog).toContain('Fix external-consumer installation')
+    expect(changelog).toContain('without a DSH source build')
   })
 
   it('keeps the source package docs and architecture note honest about the standalone boundary', () => {

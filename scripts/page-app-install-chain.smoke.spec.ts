@@ -45,6 +45,12 @@ describe('workspace manager install-chain packaging', () => {
       .toBe(resolve(packed, 'tingyu9527-dsh-workspace-manager-1.0.1.tgz'))
   })
 
+  it('accepts pnpm pack object reports as well as array reports', () => {
+    const packed = join(tmpdir(), 'packed')
+    expect(resolvePackedTarball('{"filename":"manager-object-report.tgz"}', packed))
+      .toBe(resolve(packed, 'manager-object-report.tgz'))
+  })
+
   it('fails loudly when pnpm pack omits its output filename', () => {
     expect(() => { resolvePackedTarball('[{}]', 'C:/packed') })
       .toThrow('pnpm pack --json returned no filename')

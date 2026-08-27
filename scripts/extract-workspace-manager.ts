@@ -34,10 +34,14 @@ An out-of-tree Workspace Apps control plane for [DeepSeek Harness](https://githu
 
 Requirements: the npm release \`@deepseek-ai/dsh@0.1.1-rc.2\`, Node.js 20 or newer, and pnpm 11.7.0 on \`PATH\`. This package uses seams introduced after 0.1.0-rc.6 and is not compatible with the older 0.1.0-rc.6 public release.
 
+Version 1.0.1 fixes external-consumer installation: it inlines the unpublished \`dsh-page-app-profile\` implementation, so an ordinary npm DSH user does not require a DSH source build.
+
 \`\`\`sh
-dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.1
-dsh --profile <profile>
+dsh plugin --profile web add @tingyu9527/dsh-workspace-manager
+dsh web
 \`\`\`
+
+For a reproducible install, append the optional \`@1.0.1\` version pin to the package name.
 
 Open **Plugins → Workspace Apps** to manage compatible Workspace App packages.
 
@@ -109,10 +113,14 @@ const README_ZH = `# DSH Workspace Manager
 
 要求：npm 发布包 \`@deepseek-ai/dsh@0.1.1-rc.2\`、Node.js 20 或更高版本，并确保 pnpm 11.7.0 位于 \`PATH\`。本包依赖 0.1.0-rc.6 之后新增的 seam，因此不兼容较旧的 0.1.0-rc.6 公共版本。
 
+1.0.1 修复 external consumer 安装：它内联未发布的 \`dsh-page-app-profile\` 实现，因此普通 npm DSH 用户不再要求 DSH source build。
+
 \`\`\`sh
-dsh plugin --profile <profile> add @tingyu9527/dsh-workspace-manager@1.0.1
-dsh --profile <profile>
+dsh plugin --profile web add @tingyu9527/dsh-workspace-manager
+dsh web
 \`\`\`
+
+如需可复现安装，可在包名后追加可选的 \`@1.0.1\` 版本锁定。
 
 打开 **Plugins → Workspace Apps** 管理兼容的 Workspace App 包。
 
@@ -169,7 +177,8 @@ const CHANGELOG = `# Changelog
 
 ## 1.0.1
 
-- Support the public npm-form DSH 0.1.1-rc.2 package through an audited legacy compatibility bridge that is a no-op when the native ProfileRuntime capability exists.
+- Fix external-consumer installation for public npm-form DSH 0.1.1-rc.2 by inlining the unpublished profile implementation, so ordinary npm users can install without a DSH source build.
+- Provide an audited legacy compatibility bridge that is a no-op when the native ProfileRuntime capability exists.
 - Publish the exact standalone dependency and peer boundary used by the Host and Client artifacts.
 
 ## 1.0.0
