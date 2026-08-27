@@ -106,7 +106,7 @@ function urlShape(spec: string): URL | null {
  * carry no URL credentials and pass through. Any absolute URL form — with or
  * without the `//` host separator — is inspected; only specs that actually
  * parse as URLs are checked, so package specs like `npm:pkg` and Windows
- * paths like `C:\dev\pkg` are never misclassified.
+ * drive-letter paths are never misclassified.
  * @param spec - the exact install source spec.
  */
 export function assertPageAppSourceNoCredentials(spec: string): void {

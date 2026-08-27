@@ -3,6 +3,7 @@
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
+import { WORKSPACE_MANAGER_INTERNAL_PACKAGES } from './build-workspace-manager-host.ts'
 import { isEntry } from './release/process.ts'
 
 const VERSION = '1.0.0'
@@ -328,7 +329,8 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
   }
   const peerDependencies = Object.fromEntries(
     Object.entries(collectedPeers)
-      .filter(([name]) => name !== '@deepseek-ai/dsh-page-app-manager')
+      .filter(([name]) => name !== '@deepseek-ai/dsh-page-app-manager'
+        && !WORKSPACE_MANAGER_INTERNAL_PACKAGES.some(packageName => name === packageName))
       .map(([name, version]) => [name, releasePeerSpecifier(name, dshVersion, version)]),
   )
   const clientDsh = clientManifest.dsh

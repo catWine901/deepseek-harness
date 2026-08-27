@@ -9,7 +9,8 @@ const temporaryRoots: string[] = []
 function artifactFixture(
   client: string,
   host = 'export const host = true\n',
-): { repoRoot: string; clientBuildDirectory: string; extracted: string } {
+  hostTypes = 'export declare const host: true\n',
+): { repoRoot: string; hostBuildDirectory: string; clientBuildDirectory: string; extracted: string } {
   const repoRoot = mkdtempSync(join(tmpdir(), 'dsh-workspace-manager-artifacts-'))
   temporaryRoots.push(repoRoot)
   const hostLib = join(repoRoot, 'packages/host/page-app-manager/lib')
@@ -21,9 +22,11 @@ function artifactFixture(
   mkdirSync(clientBuildDirectory, { recursive: true })
   mkdirSync(extracted, { recursive: true })
   writeFileSync(join(hostLib, 'index.js'), host)
+  mkdirSync(join(hostLib, 'types'), { recursive: true })
+  writeFileSync(join(hostLib, 'types/index.d.ts'), hostTypes)
   writeFileSync(join(clientTypes, 'index.d.ts'), 'export declare const client: true\n')
   writeFileSync(join(clientBuildDirectory, 'client.js'), client)
-  return { repoRoot, clientBuildDirectory, extracted }
+  return { repoRoot, hostBuildDirectory: hostLib, clientBuildDirectory, extracted }
 }
 
 afterEach(() => {
@@ -52,6 +55,21 @@ describe('workspace manager install-chain packaging', () => {
       [
         "import { parsePageAppRegistry } from '@deepseek-ai/dsh-page-app-profile'",
         'export const host = parsePageAppRegistry',
+        '',
+      ].join('\n'),
+    )
+
+    expect(() => { stageWorkspaceManagerArtifacts(fixture) })
+      .toThrow('@deepseek-ai/dsh-page-app-profile')
+  })
+
+  it('rejects a public Host declaration that still requires the unpublished profile-core package', () => {
+    const fixture = artifactFixture(
+      'export const client = true\n',
+      'export const host = true\n',
+      [
+        "import type { PageAppRegistryV1 } from '@deepseek-ai/dsh-page-app-profile'",
+        'export declare function readRegistry(): PageAppRegistryV1',
         '',
       ].join('\n'),
     )

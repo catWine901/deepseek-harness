@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { execa } from 'execa'
+import { assertWorkspaceManagerHostClosure, buildWorkspaceManagerHost } from './build-workspace-manager-host.ts'
 import { extractWorkspaceManager } from './extract-workspace-manager.ts'
 import { scanTarballContent, validateTarballPayloadContent } from './publication-payload.ts'
 import { isEntry } from './release/process.ts'
@@ -30,6 +31,7 @@ export interface PageAppInstallChainResult {
 /** Inputs whose build output is staged into the extracted package. */
 export interface WorkspaceManagerArtifactStagingOptions {
   readonly repoRoot: string
+  readonly hostBuildDirectory: string
   readonly clientBuildDirectory: string
   readonly extracted: string
 }
@@ -47,10 +49,12 @@ function requireArtifact(path: string): void {
 export function stageWorkspaceManagerArtifacts(options: WorkspaceManagerArtifactStagingOptions): void {
   const repoRoot = resolve(options.repoRoot)
   const extracted = resolve(options.extracted)
-  const hostLib = join(repoRoot, 'packages/host/page-app-manager/lib')
+  const hostLib = resolve(options.hostBuildDirectory)
   const clientArtifact = join(resolve(options.clientBuildDirectory), 'client.js')
   requireArtifact(join(hostLib, 'index.js'))
+  requireArtifact(join(hostLib, 'types/index.d.ts'))
   requireArtifact(clientArtifact)
+  assertWorkspaceManagerHostClosure(hostLib)
   const clientBytes = readFileSync(clientArtifact)
   validateTarballPayloadContent(['lib/client.js'], () => clientBytes, 'workspace manager client build')
 
@@ -158,6 +162,7 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'dsh-workspace-manager-chain-'))
   try {
     const extracted = join(temporaryRoot, 'dsh-workspace-manager')
+    const hostBuildDirectory = join(temporaryRoot, 'host-build')
     const clientBuildDirectory = join(temporaryRoot, 'client-build')
     const packed = join(temporaryRoot, 'packed')
     const home = join(temporaryRoot, 'home')
@@ -167,8 +172,9 @@ export async function runPageAppInstallChain(options: PageAppInstallChainOptions
     const managerProbe = join(temporaryRoot, 'manager-probe.mjs')
     const nativeProbe = join(temporaryRoot, 'native-probe.mjs')
     extractWorkspaceManager(repoRoot, extracted, temporaryRoot)
+    await buildWorkspaceManagerHost({ repoRoot, outputDirectory: hostBuildDirectory })
     await buildPathFreeClient(repoRoot, clientBuildDirectory)
-    stageWorkspaceManagerArtifacts({ repoRoot, clientBuildDirectory, extracted })
+    stageWorkspaceManagerArtifacts({ repoRoot, hostBuildDirectory, clientBuildDirectory, extracted })
     mkdirSync(packed, { recursive: true })
     await execa('pnpm', ['pack', '--pack-destination', packed], {
       cwd: extracted,
