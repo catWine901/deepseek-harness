@@ -1,6 +1,7 @@
 /**
  * Cordis Compatibility Adapter: Manager product code touches Cordis only
- * through `src/adapter.ts`. These tests pin each adapter delegation against
+ * through `src/adapter.ts` or the explicit removable rc2 bootstrap. These
+ * tests pin each adapter delegation against
  * the vendored Cordis surface it wraps — canonical managed-root hash, Include
  * patch composition, Loader row lookup, fiber-state projection — and pin the
  * import gate that keeps every other Manager product file Cordis-free at
@@ -33,8 +34,8 @@ const FORBIDDEN_SPECIFIERS = [
   '@deepseek-ai/cordis-plugin-include',
 ] as const
 
-/** The one file allowed to runtime-import Cordis. */
-const ADAPTER_FILE = 'src/adapter.ts'
+/** Auditable framework-boundary files allowed to runtime-import Cordis. */
+const ADAPTER_FILES = new Set(['src/adapter.ts', 'src/legacy-rc2-compat.ts'])
 
 function isForbidden(specifier: string): boolean {
   return (FORBIDDEN_SPECIFIERS as readonly string[]).includes(specifier)
@@ -70,7 +71,7 @@ function isPermittedContextExport(specifier: string, clause: ts.NamedExportBindi
 function collectCordisImportViolations(files: ReadonlyArray<{ file: string; content: string }>): string[] {
   const violations: string[] = []
   for (const { file, content } of files) {
-    if (file === ADAPTER_FILE) continue
+    if (ADAPTER_FILES.has(file)) continue
     const source = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
     const visit = (node: ts.Node): void => {
       if (ts.isImportDeclaration(node)) {
@@ -200,7 +201,7 @@ describe('fiberStateOf', () => {
 })
 
 describe('Cordis import gate', () => {
-  it('keeps every Manager product file Cordis-free at runtime outside adapter.ts', () => {
+  it('keeps every Manager product file Cordis-free outside audited framework boundaries', () => {
     expect(collectCordisImportViolations(managerProductFiles())).toEqual([])
   })
 

@@ -20,8 +20,11 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { managedRootWrapperRow, type ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
-import { type ExpectedManagedRoot } from '@deepseek-ai/dsh-app-boot'
+import {
+  managedRootWrapperRow,
+  type ExpectedManagedRoot,
+  type ProfileRuntime,
+} from '@deepseek-ai/dsh-app-boot/profile-runtime-bridge'
 import { managedRootHash, type EntryOptions } from './adapter.ts'
 import {
   advancePageAppJournalPhase,

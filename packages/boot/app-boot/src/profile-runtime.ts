@@ -22,7 +22,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { basename, dirname, join } from 'node:path'
-import { Context, FiberState, Service, symbols } from '@deepseek-ai/cordis'
+import { Context, Service, symbols, type FiberState } from '@deepseek-ai/cordis'
 import type { Entry, EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import {
@@ -39,7 +39,11 @@ import {
 } from '@deepseek-ai/dsh-page-app-profile'
 import { writeFileAtomic } from '@deepseek-ai/dsh-atomic-write'
 import { dump, load } from 'js-yaml'
-import { loadOptionalPatches, loadOverlayPatches } from './index.ts'
+import { loadOptionalPatches, loadOverlayPatches } from './patches.ts'
+
+// Cordis exposes FiberState as a const enum in declarations, not a runtime
+// export in the public rc.2 package consumed by the standalone manager.
+const FIBER_ACTIVE = 2 as FiberState.ACTIVE
 
 /** The service name the launcher provides `ProfileRuntime` under. */
 export const PROFILE_RUNTIME_SERVICE = 'profileRuntime'
@@ -623,7 +627,7 @@ class ProfileRuntimeState {
    * @returns true when the tree is disposing or disposed.
    */
   private treeExited(): boolean {
-    return this.ctx.get('loader') === undefined || this.ctx.fiber.state !== FiberState.ACTIVE
+    return this.ctx.get('loader') === undefined || this.ctx.fiber.state !== FIBER_ACTIVE
   }
 
   /**
@@ -829,7 +833,7 @@ class ProfileRuntimeState {
         failures.push(`managed root ${expected.rootEntryId} has no active fiber`)
         continue
       }
-      if (fiber.state === FiberState.ACTIVE) {
+      if (fiber.state === FIBER_ACTIVE) {
         activeRoots.push(expected.rootEntryId)
         continue
       }

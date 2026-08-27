@@ -79,6 +79,10 @@ async function buildPathFreeClient(repoRoot: string, destination: string): Promi
     '--no-sourcemap',
   ], {
     cwd: join(repoRoot, 'packages/client/ui-page-app-manager'),
+    env: {
+      ...process.env,
+      DSH_PAGE_APP_MANAGER_CLIENT_MODULE_ID: '@tingyu9527/dsh-workspace-manager',
+    },
   })
   requireArtifact(join(destination, 'client.js'))
 }

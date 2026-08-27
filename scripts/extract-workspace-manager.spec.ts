@@ -129,7 +129,7 @@ describe('workspace manager extraction', () => {
     const manifest = readJson(join(output, 'package.json'))
     const peers = manifest.peerDependencies as Record<string, string>
     expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-profile')
-    expect(peers['@deepseek-ai/dsh-app-boot']).toBe('>=0.1.1-rc.2 <0.2.0')
+    expect(peers).not.toHaveProperty('@deepseek-ai/dsh-app-boot')
     expect(peers['@deepseek-ai/cordis-plugin-include']).toBe('^1.0.0')
     expect(peers['@deepseek-ai/cordis-plugin-loader']).toBe('^1.0.0')
     expect(peers).not.toHaveProperty('@deepseek-ai/dsh-page-app-manager')
@@ -142,6 +142,16 @@ describe('workspace manager extraction', () => {
   it('skeleton never declares dsh.workspace', () => {
     const manifest = readJson(join(output, 'package.json'))
     expect(manifest.dsh).toMatchObject({ bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } })
+    expect(readFileSync(join(output, 'cordis.patch.yml'), 'utf8')).toBe([
+      '- insert:',
+      '    - id: page-app-manager-legacy-rc2-compat',
+      "      name: '@tingyu9527/dsh-workspace-manager/legacy-rc2-compat'",
+      '    - id: page-app-manager',
+      "      name: '@tingyu9527/dsh-workspace-manager'",
+      '      config:',
+      '        settlementTimeoutMs: 60000',
+      '',
+    ].join('\n'))
     expect(manifest.dsh as Record<string, unknown>).not.toHaveProperty('workspace')
   })
 

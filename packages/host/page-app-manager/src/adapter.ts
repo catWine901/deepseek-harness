@@ -11,7 +11,7 @@
  * @module @deepseek-ai/dsh-page-app-manager/adapter
  */
 
-import { canonicalManagedRootHash } from '@deepseek-ai/dsh-app-boot'
+import { canonicalManagedRootHash } from '@deepseek-ai/dsh-app-boot/profile-runtime-bridge'
 import { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
 import type { Context } from '@deepseek-ai/cordis'

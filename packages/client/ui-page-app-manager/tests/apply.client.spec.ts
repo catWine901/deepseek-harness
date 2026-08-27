@@ -14,6 +14,7 @@ import type { PageAppManagerRemoteMethods, PageAppRemoteEvents } from '../src/cl
 import { FakeRemote, fakeEntry } from './fake-page-app.client.ts'
 
 beforeEach(() => {
+  vi.unstubAllEnvs()
   document.head.querySelectorAll('meta[name="theme-color"]').forEach((node) => { node.remove() })
 })
 
@@ -55,6 +56,9 @@ async function benchWithRemote(): Promise<{ ctx: Context; slots: SlotRegistry; r
         const namespace = this.serviceCtx.get('remote.pageAppManager') as PageAppManagerRemoteMethods & PageAppRemoteEvents
         return namespace.$on(event as never, listener as never)
       }
+      public async $mount(): Promise<() => Promise<void>> {
+        return async () => {}
+      }
     }
     new RemoteService(providerCtx)
     providerCtx.reflect.provide('remote.pageAppManager', remote)
@@ -94,6 +98,20 @@ describe('ui-page-app-manager client apply', () => {
     expect(slots.spec('page-app.shell.surface')).toEqual({ kind: 'keyed', scope: 'root' })
     await fiber.dispose()
     expect(slots.entries('root')).toHaveLength(0)
+  })
+
+  it('keeps the public rc2 Native root and contributes settings without claiming its legacy seat', async () => {
+    vi.stubEnv('DSH_CLIENT_PAGE_APP_MANAGER_LEGACY_RC2', 'true')
+    const { ctx, slots } = await benchWithRemote()
+    const NativeRoot = (): null => null
+    const disposeNative = slots.register({ name: 'root' }, NativeRoot)
+    const fiber = ctx.plugin({ inject: [...inject], apply })
+    await fiber.await()
+    expect(slots.entries('root')).toHaveLength(1)
+    expect(slots.entries('root')[0]!.component).toBe(NativeRoot)
+    await fiber.dispose()
+    expect(slots.entries('root')).toHaveLength(1)
+    disposeNative()
   })
 
   it('hands the controller observable and select action through the inject face', async () => {

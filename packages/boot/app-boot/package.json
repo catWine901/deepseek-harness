@@ -22,6 +22,10 @@
       "types": "./lib/types/invariant.d.ts",
       "default": "./lib/invariant.js"
     },
+    "./profile-runtime-bridge": {
+      "types": "./lib/types/profile-runtime-bridge.d.ts",
+      "default": "./src/profile-runtime-bridge.ts"
+    },
     "./package.json": "./package.json"
   },
   "files": [

@@ -424,6 +424,11 @@ function ciConsumerGates(): Gate[] {
     }),
     pnpmScript('publint', 'publint', { needs: builtTree }),
     builtPackageInvariantsGate(builtTree),
+    pnpmScript('page-app-external-consumer', 'test:page-app-external-consumer', {
+      label: 'Workspace Manager external consumer',
+      needs: validatedBuild,
+      streamOutput: true,
+    }),
     pnpmScript('lint-and-duplication', 'check:ci:lint:contracts-ready', {
       label: 'lint and duplication',
       needs: validatedBuild,

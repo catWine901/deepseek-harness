@@ -33,6 +33,22 @@ describe('client bundle build faces', () => {
     expect(development?.entry).toEqual({ client: 'src/client/index.ts' })
     expect(artifact?.entry).toEqual({ client: 'lib/types/client/index.js' })
   })
+
+  it('can stamp an extracted package identity without changing the workspace dependency subject', () => {
+    const configs = clientBundle(
+      '@deepseek-ai/dsh-client-ui-page-app-manager',
+      ['lib/types/index.js', 'lib/types/invariant.js'],
+      {
+        moduleId: '@tingyu9527/dsh-workspace-manager',
+        clientDefines: { 'process.env.LEGACY_FIXTURE': 'true' },
+      },
+    )({ env: { DSH_BUILD_FACE: 'client' } })
+    const client = configs.find(config => config.platform === 'browser')
+    expect(client?.name).toBe('@tingyu9527/dsh-workspace-manager/client')
+    expect((client?.outputOptions as { banner?: string }).banner)
+      .toContain('"@tingyu9527/dsh-workspace-manager"')
+    expect(client?.define).toMatchObject({ 'process.env.LEGACY_FIXTURE': 'true' })
+  })
 })
 
 function clientSourceMapPath(packagePath: string): string {

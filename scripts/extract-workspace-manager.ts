@@ -171,6 +171,8 @@ const CHANGELOG = `# Changelog
 `
 
 const PATCH = `- insert:
+    - id: page-app-manager-legacy-rc2-compat
+      name: '${MANAGER_NAME}/legacy-rc2-compat'
     - id: page-app-manager
       name: '${MANAGER_NAME}'
       config:
@@ -348,6 +350,10 @@ export function extractWorkspaceManager(sourceRoot: string, destination: string,
     types: './lib/types/index.d.ts',
     exports: {
       '.': { types: './lib/types/index.d.ts', default: './lib/index.js' },
+      './legacy-rc2-compat': {
+        types: './lib/types/legacy-rc2-compat.d.ts',
+        default: './lib/legacy-rc2-compat.js',
+      },
       './client': { types: './lib/types/client/index.d.ts', default: './lib/client.js' },
       './package.json': './package.json',
     },

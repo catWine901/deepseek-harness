@@ -26,7 +26,7 @@ import {
   PROFILE_RUNTIME_SERVICE,
   WORKBENCH_RUNTIME_SERVICE,
   type ProfileRuntime,
-} from '@deepseek-ai/dsh-app-boot'
+} from '@deepseek-ai/dsh-app-boot/profile-runtime-bridge'
 import {
   parsePageAppJournal,
   parsePageAppManifest,

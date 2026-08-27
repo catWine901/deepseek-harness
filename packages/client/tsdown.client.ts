@@ -117,7 +117,7 @@ export function clientBundle(
   return ({ env }) => {
     const face = buildFace(env?.DSH_BUILD_FACE)
     const clientEntry = face === undefined ? 'src/client/index.ts' : 'lib/types/client/index.js'
-    const client = clientConfig(id, clientEntry)
+    const client = clientConfig(id, clientEntry, options.moduleId ?? id, options.clientDefines)
     const node = [lib, ...(options.companions ?? [])]
     if (face === 'host') return options.hostPhase === true ? node : [SKIP_WORKSPACE_BUILD]
     if (face === 'client') {
@@ -206,6 +206,10 @@ interface ClientBundleOptions {
   readonly companions?: readonly UserConfig[]
   /** Overrides for the package's primary Node-side library config. */
   readonly lib?: UserConfig
+  /** Runtime loader identity when an extracted package is published under another name. */
+  readonly moduleId?: string
+  /** Package-local compile-time constants for the browser artifact. */
+  readonly clientDefines?: Readonly<Record<string, string>>
 }
 
 type BuildFace = 'host' | 'client' | undefined
@@ -439,10 +443,15 @@ function matchesSpecifier(patterns: readonly RegExp[], specifier: string): boole
   return patterns.some(pattern => pattern.test(specifier))
 }
 
-function clientConfig(id: string, entry: string): UserConfig {
-  const isRequested = (specifier: string): boolean => clientExternals(id).has(specifier)
+function clientConfig(
+  subject: string,
+  entry: string,
+  moduleId: string,
+  clientDefines: Readonly<Record<string, string>> = {},
+): UserConfig {
+  const isRequested = (specifier: string): boolean => clientExternals(subject).has(specifier)
   return {
-    name: `${id}/client`,
+    name: `${moduleId}/client`,
     entry: { client: entry },
     // Browser bundle lands next to the node half (single lib/ artifact dir;
     // the entryFileNames pin keeps it exactly lib/client.js). clean must stay
@@ -480,6 +489,7 @@ function clientConfig(id: string, entry: string): UserConfig {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
       'import.meta.env.MODE': JSON.stringify(process.env.NODE_ENV ?? 'production'),
       'import.meta.env': JSON.stringify({ MODE: process.env.NODE_ENV ?? 'production' }),
+      ...clientDefines,
     },
     plugins: [{
       // Bundle purity gate (build-time mirror of the module-edge rules): the
@@ -495,7 +505,7 @@ function clientConfig(id: string, entry: string): UserConfig {
         if (VENDORED_LIBRARY.test(source)) return null // vendored library: inline, no shared identity
         if (INLINE_SAFE.test(source) || GENERATED_REMOTE.test(source)) return null // wire contribution: inline is the point
         throw new Error(
-          `client bundle purity: "${source}" is not in the default client externals or ${id}'s dsh.client.external, an inline-safe wire layer, or a generated /remote contribution — `
+          `client bundle purity: "${source}" is not in the default client externals or ${subject}'s dsh.client.external, an inline-safe wire layer, or a generated /remote contribution — `
           + 'cross-plugin value imports are forbidden; declare a non-default module request or collaborate through cordis services '
           + '(type-only imports are erased and never reach this gate)',
         )
@@ -523,7 +533,7 @@ function clientConfig(id: string, entry: string): UserConfig {
         const exportEntries = Object.entries(cssExports ?? {})
           .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
         for (const [local, exp] of exportEntries) classMap[local] = exp.name
-        return styleInjectionModule(id, fileId, code.toString(), classMap)
+        return styleInjectionModule(moduleId, fileId, code.toString(), classMap)
       },
     }, {
       name: 'dsh-css-text-inline',
@@ -554,7 +564,7 @@ function clientConfig(id: string, entry: string): UserConfig {
         this.addWatchFile(fileId)
         const source = await readFile(fileId)
         const { code } = transform({ filename: fileId, code: source, minify: true })
-        return styleInjectionModule(id, fileId, code.toString())
+        return styleInjectionModule(moduleId, fileId, code.toString())
       },
     }],
     outputOptions: {
@@ -564,7 +574,7 @@ function clientConfig(id: string, entry: string): UserConfig {
       // /packages/<group>/<package>/src directories; sourcesContent keeps them usable
       // without exposing that tree as an HTTP route.
       sourcemapPathTransform: browserSourcePath,
-      banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(id)}, factory: (require) => {`,
+      banner: `window.__ModuleLoader__.load({ id: ${JSON.stringify(moduleId)}, factory: (require) => {`,
       footer: 'return module.exports; } });',
       intro: 'var module = { exports: {} }; var exports = module.exports;',
     },

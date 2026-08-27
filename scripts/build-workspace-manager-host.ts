@@ -7,18 +7,23 @@ import ts from 'typescript'
 
 /** Manager-owned implementation packages included in the standalone Host artifact. */
 export const WORKSPACE_MANAGER_INTERNAL_PACKAGES = [
+  '@deepseek-ai/dsh-app-boot',
   '@deepseek-ai/dsh-page-app-profile',
   '@deepseek-ai/dsh-atomic-write',
 ] as const
 
 const WORKSPACE_MANAGER_EXTERNAL_SEAMS = [
-  '@deepseek-ai/dsh-app-boot',
   '@deepseek-ai/dsh-typert-protocol',
   '@deepseek-ai/cordis',
   '@deepseek-ai/cordis-plugin-include',
   '@deepseek-ai/cordis-plugin-loader',
   '@deepseek-ai/dsh-brand',
   '@deepseek-ai/dsh-invariants',
+] as const
+
+const WORKSPACE_MANAGER_INTERNAL_IMPORTS = [
+  ...WORKSPACE_MANAGER_INTERNAL_PACKAGES,
+  '@deepseek-ai/dsh-app-boot/profile-runtime-bridge',
 ] as const
 
 /** Inputs for the standalone Workspace Manager Host build. */
@@ -81,7 +86,7 @@ export async function buildWorkspaceManagerHost(
   await build({
     config: false,
     cwd: join(repoRoot, 'packages/host/page-app-manager'),
-    entry: ['lib/types/index.js'],
+    entry: ['lib/types/index.js', 'lib/types/legacy-rc2-compat.js'],
     outDir: outputDirectory,
     format: ['esm'],
     platform: 'node',
@@ -91,7 +96,7 @@ export async function buildWorkspaceManagerHost(
     clean: false,
     dts: false,
     deps: {
-      alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_PACKAGES],
+      alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_IMPORTS],
       neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
     },
   })
@@ -99,7 +104,7 @@ export async function buildWorkspaceManagerHost(
   await build({
     config: false,
     cwd: join(repoRoot, 'packages/host/page-app-manager'),
-    entry: ['lib/types/index.d.ts'],
+    entry: ['lib/types/index.d.ts', 'lib/types/legacy-rc2-compat.d.ts'],
     outDir: join(outputDirectory, 'types'),
     format: ['esm'],
     platform: 'node',
@@ -114,10 +119,10 @@ export async function buildWorkspaceManagerHost(
       compilerOptions: { sourceMap: false, declarationMap: false },
     },
     deps: {
-      alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_PACKAGES],
+      alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_IMPORTS],
       neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
       dts: {
-        alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_PACKAGES],
+        alwaysBundle: [...WORKSPACE_MANAGER_INTERNAL_IMPORTS],
         neverBundle: [...WORKSPACE_MANAGER_EXTERNAL_SEAMS],
       },
     },

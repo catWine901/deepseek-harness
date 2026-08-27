@@ -22,7 +22,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { ProfileRuntime } from '@deepseek-ai/dsh-app-boot'
+import type { ProfileRuntime } from '@deepseek-ai/dsh-app-boot/profile-runtime-bridge'
 import {
   parsePageAppRegistry,
   readPageAppJournal,

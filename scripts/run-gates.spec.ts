@@ -371,7 +371,7 @@ describe('Node 24 lane ownership', () => {
     const subject = withPnpmEntrypoint(() => gatesForMode('ci-consumers'))
 
     expect(defaultConcurrency('ci-consumers', subject.length, 4)).toEqual({
-      workers: 10,
+      workers: 11,
       source: 'ci-consumers gate count',
     })
     expect(subject.map(item => item.id)).toEqual([
@@ -379,6 +379,7 @@ describe('Node 24 lane ownership', () => {
       'node-compat',
       'publint',
       'built-package-invariants',
+      'page-app-external-consumer',
       'lint-and-duplication',
       'snapshot',
       'web-snapshot',
@@ -394,6 +395,10 @@ describe('Node 24 lane ownership', () => {
       DSH_BUILD_CLIENT_PROFILE: 'official',
     })
     expect(subject.find(item => item.id === 'built-package-invariants')?.needs).toEqual(['build'])
+    expect(subject.find(item => item.id === 'page-app-external-consumer')).toMatchObject({
+      displayCommand: 'pnpm run test:page-app-external-consumer',
+      needs: ['built-package-invariants'],
+    })
     expect(subject.find(item => item.id === 'lint-and-duplication')?.needs).toEqual(['built-package-invariants'])
     for (const id of [
       'snapshot',

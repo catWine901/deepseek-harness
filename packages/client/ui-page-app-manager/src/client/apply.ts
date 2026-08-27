@@ -22,6 +22,7 @@ import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {
   PageAppClientInstanceId, PageAppInstallSource, PageAppManagerSnapshot,
 } from '@deepseek-ai/dsh-page-app-manager/types'
+import pageAppManagerRemote from '@deepseek-ai/dsh-page-app-manager/remote'
 import { PageAppController, type PageAppControllerDeps } from './controller.ts'
 import { PAGE_APP_SURFACE_SLOT } from './contracts.ts'
 import type {
@@ -181,6 +182,13 @@ function settingsInjected(controller: PageAppController): PageAppSettingsTabInje
 /** Required services: the slot registry and the locale face (remote/modules are read defensively). */
 export const inject = ['slots', 'locale']
 
+// The public rc.2 shell predates the priority-1/child-seat handoff. Its
+// extracted manager build contributes Settings only so Native DSH keeps the
+// sole root registration. Remove with the pinned rc.2 compatibility build.
+function isLegacyRc2Client(): boolean {
+  return process.env.DSH_CLIENT_PAGE_APP_MANAGER_LEGACY_RC2 === 'true'
+}
+
 /**
  * Register the Workspace App shell into the built-in `root` seat and declare
  * both child seats, and contribute the Workspace Apps tab to Settings →
@@ -191,7 +199,16 @@ export const inject = ['slots', 'locale']
  * stay consistent across both surfaces.
  * @param ctx - client root context.
  */
-export function apply(ctx: ClientContext): void {
+export async function apply(ctx: ClientContext): Promise<void> {
+  // Public rc.2's static api-remotes roster predates this manager. Its generic
+  // gateway already exposes the public contribution seam, so the extracted
+  // client mounts only its own generated descriptor before reading the service.
+  let disposeLegacyRemote: (() => Promise<void>) | undefined
+  if (isLegacyRc2Client()) {
+    const remote = ctx.get('remote')
+    if (remote === undefined) throw new Error('legacy rc2 manager client requires the Remote gateway')
+    disposeLegacyRemote = await remote.$mount(pageAppManagerRemote)
+  }
   // The manager owns the service provider; Cordis binds each getter access to
   // the Feature caller, so a Feature receives the narrow workbench contract
   // instead of the raw slot ledger.
@@ -210,7 +227,7 @@ export function apply(ctx: ClientContext): void {
           controller.recordEntryError(entry.options.key)
         }
       }),
-      ctx.slots.register({
+      ...(isLegacyRc2Client() ? [] : [ctx.slots.register({
         name: 'root',
         children: {
           'page-app.shell.builtin': { kind: 'single', scope: 'root' },
@@ -218,7 +235,7 @@ export function apply(ctx: ClientContext): void {
         },
         locale: NS,
         inject: () => shellInjected(controller),
-      }, PageAppShell),
+      }, PageAppShell)]),
       // The Workspace tab registers after the read-only `all` tab (order 10).
       ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
         name: 'settings.plugins.tab',
@@ -229,9 +246,10 @@ export function apply(ctx: ClientContext): void {
         inject: () => settingsInjected(controller),
       }, PageAppSettingsTab)),
     ]
-    return () => {
+    return async () => {
       for (const dispose of disposers.reverse()) dispose()
       stopController()
+      await disposeLegacyRemote?.()
     }
   }, 'ui-page-app-manager: shell + seats + settings tab')
 }
